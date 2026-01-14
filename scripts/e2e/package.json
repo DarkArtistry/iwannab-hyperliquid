@@ -1,0 +1,19 @@
+{
+  "name": "hypercore-e2e-tests",
+  "version": "1.0.0",
+  "description": "End-to-end integration tests for HyperCore",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "tsx runner.ts",
+    "test:verbose": "VERBOSE=true tsx runner.ts"
+  },
+  "dependencies": {
+    "viem": "^2.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.3.0"
+  }
+}

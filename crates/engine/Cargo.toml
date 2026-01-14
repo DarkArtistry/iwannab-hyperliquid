@@ -1,0 +1,26 @@
+[package]
+name = "hypercore-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hypercore-primitives = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+alloy-primitives = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+criterion = { workspace = true }
+rstest = { workspace = true }
+
+[[bench]]
+name = "matching"
+harness = false

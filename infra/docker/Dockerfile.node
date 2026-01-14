@@ -1,0 +1,58 @@
+# HyperCore Node Dockerfile
+# Multi-stage build for minimal image size
+
+# Build stage
+FROM rust:1.85-bookworm AS builder
+
+WORKDIR /app
+
+# Install dependencies
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy workspace files
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+
+# Build release binary
+RUN cargo build --release -p hypercore-node
+
+# Runtime stage
+FROM debian:bookworm-slim
+
+WORKDIR /app
+
+# Install runtime dependencies (curl needed for healthcheck)
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy binary from builder
+COPY --from=builder /app/target/release/hypercore /usr/local/bin/hypercore-node
+
+# Create data directory
+RUN mkdir -p /data
+
+# Expose ports:
+# - 26658: ABCI (CometBFT communication)
+# - 8545: EVM JSON-RPC
+# - 8546: EVM WebSocket
+# - 3000: Gateway HTTP API (Phase 2A: shared process for unified state)
+EXPOSE 26658 8545 8546 3000
+
+# Set environment variables
+ENV RUST_LOG=info
+ENV DATA_DIR=/data
+
+# Health check - check gateway endpoint (shares process with EVM RPC)
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=5 \
+    CMD curl -f http://localhost:3000/health || exit 1
+
+# Run node with gateway on port 3000
+# Note: Environment variables HTTP_ADDR, EVM_RPC_ADDR can override these
+ENTRYPOINT ["hypercore-node"]
+CMD ["start"]

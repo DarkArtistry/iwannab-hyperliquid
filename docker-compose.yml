@@ -1,0 +1,169 @@
+services:
+  # PostgreSQL database for indexer
+  postgres:
+    image: postgres:16-alpine
+    container_name: hypercore-postgres
+    environment:
+      POSTGRES_USER: hypercore
+      POSTGRES_PASSWORD: hypercore
+      POSTGRES_DB: hypercore
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Migrations are handled by the indexer service via sqlx
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hypercore"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - hypercore
+
+  # CometBFT consensus engine
+  cometbft:
+    image: cometbft/cometbft:v0.38.5
+    container_name: hypercore-cometbft
+    ports:
+      - "26656:26656"  # P2P
+      - "26657:26657"  # RPC
+    volumes:
+      - cometbft_data:/cometbft
+      - ./infra/cometbft/config.toml:/cometbft/config/config.toml:ro
+      - ./infra/cometbft/genesis.json:/cometbft/config/genesis.json:ro
+    command: start --proxy_app=tcp://node:26658
+    depends_on:
+      - node
+    networks:
+      - hypercore
+
+  # HyperCore node (ABCI app + EVM + Gateway)
+  # NOTE: The node runs both the EVM RPC AND the Gateway in the same process
+  # to ensure they share the unified state. This is critical for Phase 2A.
+  node:
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile.node
+    container_name: hypercore-node
+    ports:
+      - "26658:26658"  # ABCI
+      - "8545:8545"    # EVM JSON-RPC
+      - "8546:8546"    # EVM WebSocket
+      - "3000:3000"    # HTTP API (Gateway) - shared process for unified state
+    environment:
+      RUST_LOG: info,hypercore=debug
+      DATABASE_URL: postgres://hypercore:hypercore@postgres:5432/hypercore
+      ABCI_ADDR: 0.0.0.0:26658
+      EVM_RPC_ADDR: 0.0.0.0:8545
+      EVM_WS_ADDR: 0.0.0.0:8546
+      HTTP_ADDR: 0.0.0.0:3000
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - hypercore
+
+  # API Gateway (standalone - for production use with separate scaling)
+  # NOTE: For E2E tests, we use the node's embedded gateway instead to ensure
+  # shared unified state between Gateway and EVM RPC.
+  gateway:
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile.gateway
+    container_name: hypercore-gateway
+    ports:
+      - "3001:3000"    # HTTP API (mapped to 3001 to avoid conflict with node)
+      - "3002:3001"    # WebSocket
+    environment:
+      RUST_LOG: info,hypercore=debug
+      NODE_RPC: http://node:8545
+      COMETBFT_RPC: http://cometbft:26657
+      DATABASE_URL: postgres://hypercore:hypercore@postgres:5432/hypercore
+      HTTP_ADDR: 0.0.0.0:3000
+      WS_ADDR: 0.0.0.0:3001
+    depends_on:
+      - node
+      - cometbft
+    networks:
+      - hypercore
+    profiles:
+      - standalone-gateway  # Only start with explicit profile
+
+  # Indexer service
+  indexer:
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile.indexer
+    container_name: hypercore-indexer
+    environment:
+      RUST_LOG: info,hypercore=debug
+      DATABASE_URL: postgres://hypercore:hypercore@postgres:5432/hypercore
+      NODE_RPC: http://node:8545
+      COMETBFT_RPC: http://cometbft:26657
+    depends_on:
+      postgres:
+        condition: service_healthy
+      node:
+        condition: service_started
+    networks:
+      - hypercore
+
+  # Redis for caching (optional)
+  redis:
+    image: redis:7-alpine
+    container_name: hypercore-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - hypercore
+    profiles:
+      - full
+
+  # Grafana for monitoring (optional)
+  grafana:
+    image: grafana/grafana:latest
+    container_name: hypercore-grafana
+    ports:
+      - "3002:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./infra/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./infra/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    networks:
+      - hypercore
+    profiles:
+      - monitoring
+
+  # Prometheus for metrics (optional)
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: hypercore-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    networks:
+      - hypercore
+    profiles:
+      - monitoring
+
+networks:
+  hypercore:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  cometbft_data:
+  redis_data:
+  grafana_data:
+  prometheus_data:

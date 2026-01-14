@@ -1,0 +1,30 @@
+[package]
+name = "hypercore-chain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Workspace dependencies
+hypercore-primitives = { workspace = true }
+hypercore-engine = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true, features = ["sync", "time"] }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Cryptography
+sha3 = { workspace = true }
+k256 = { version = "0.13", features = ["ecdsa"] }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

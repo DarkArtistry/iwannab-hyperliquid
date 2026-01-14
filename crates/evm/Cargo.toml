@@ -1,0 +1,40 @@
+[package]
+name = "hypercore-evm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Workspace dependencies
+hypercore-primitives = { workspace = true }
+hypercore-engine = { workspace = true }
+
+# EVM
+revm = { workspace = true }
+alloy-primitives = { workspace = true }
+alloy-rlp = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true, features = ["sync"] }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+
+# JSON-RPC server
+jsonrpsee = { workspace = true }
+
+# Cryptography
+sha3 = { workspace = true }
+k256 = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
