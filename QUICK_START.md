@@ -303,7 +303,7 @@ forge script script/Deploy.s.sol --rpc-url http://localhost:8545 --broadcast
 ┌───────▼───────┐
 │   CometBFT    │
 │  (Consensus)  │
-│  [Phase 2B]   │
+│  [Phase 2B ✅] │
 └───────────────┘
 ```
 
@@ -333,8 +333,10 @@ forge script script/Deploy.s.sol --rpc-url http://localhost:8545 --broadcast
 6. **Gateway API**: REST-like API for trading operations. Exchange actions require EIP-712 signatures.
    - Source: `crates/gateway/src/handlers.rs`
 
-7. **CometBFT**: BFT consensus via ABCI (Phase 2B - pending integration).
-   - Stub: `crates/chain/src/abci.rs`
+7. **CometBFT**: BFT consensus via ABCI (Phase 2B - COMPLETE ✅).
+   - ABCI Server: `crates/chain/src/cometbft/server.rs`
+   - Application: `crates/chain/src/cometbft/app.rs`
+   - Validators: `crates/chain/src/cometbft/validators.rs`
 
 ## Configuration
 
@@ -355,10 +357,24 @@ forge script script/Deploy.s.sol --rpc-url http://localhost:8545 --broadcast
 cargo run -p hypercore-node -- start --help
 
 Options:
-  --abci-addr <ADDR>      CometBFT ABCI listen address [default: 0.0.0.0:26658]
-  --http-addr <ADDR>      Node HTTP listen address [default: 0.0.0.0:4000]
-  --chain-id <ID>         Chain ID [default: 1337]
+  --abci-addr <ADDR>         CometBFT ABCI listen address [default: 0.0.0.0:26658]
+  --http-addr <ADDR>         Node HTTP listen address [default: 0.0.0.0:4000]
+  --chain-id <ID>            Chain ID [default: 1337]
+  --consensus-mode <MODE>    Consensus mode: single-node or cometbft [default: single-node]
+  --block-time-ms <MS>       Block production interval in ms (single-node mode) [default: 100]
+  --enable-persistence       Enable state persistence to RocksDB (requires --features persistence)
+  --data-dir <PATH>          Directory for persistent state storage [default: ./data]
 ```
+
+**Consensus Modes:**
+- `single-node`: Uses BlockProducer for local development (default)
+- `cometbft`: Connects to CometBFT network via ABCI (requires `--features cometbft`)
+
+**Persistence Mode:**
+- By default, state is in-memory only (lost on restart)
+- Enable persistence with `--enable-persistence` (requires building with `--features persistence`)
+- State is automatically saved after each block commit
+- State is restored on node startup if persisted data exists
 
 **Gateway:**
 ```bash
@@ -432,18 +448,29 @@ See `docs/IMPLEMENTATION_STATUS.md` for detailed implementation status. Key limi
 - ✅ ~~Separate state systems~~ - Now uses unified state model
 - ✅ ~~Gateway and EVM have different views~~ - Now share same process/state
 
+**Resolved in Phase 2B:**
+- ✅ ~~ABCI server is a stub~~ - CometBFT integration now complete with dual consensus modes
+
+**Resolved in Phase 3A (Genesis State):**
+- ✅ ~~Runtime creditBalance() calls~~ - Initial balances now set via genesis configuration
+- ✅ ~~Empty genesis state~~ - Genesis includes markets, tokens, and account balances
+
+**Resolved in Phase 3B (Gas Fees):**
+- ✅ ~~No gas fee infrastructure~~ - Gas fee system implemented (disabled by default for dev)
+
+**Resolved in Phase 4 (Persistence):**
+- ✅ ~~No state persistence~~ - RocksDB-based persistence with auto-save on block commit (Phase 4A/4B)
+
 **Still Pending:**
-1. **ABCI server is a stub** - Not actually connected to CometBFT (Phase 2B)
-2. **Signature verification is simplified** - Production needs full EIP-712 (Phase 3)
-3. **No state persistence** - State is in-memory only (Phase 4)
-4. **Some perpetual API endpoints stubbed** - Focus was on spot trading (Phase 3)
+1. **EIP-712 production mode** - Dev workarounds in place, production needs exact hash matching (Phase 3D)
+2. **State commitment hardening** - Simple hash, needs Merkle proofs for light clients (Phase 3C)
 
 ## Running Tests
 
 ### Rust Tests
 
 ```bash
-# Run all Rust unit tests (85 tests)
+# Run all Rust unit tests (160 tests)
 cargo test
 
 # Run tests for specific crate
@@ -517,24 +544,150 @@ A comprehensive E2E test script that manages the entire test lifecycle:
 ./scripts/e2e-test.sh --verbose
 ```
 
-**E2E Test Coverage (38 tests):**
+**E2E Test Coverage (122 tests):**
 | Category | Tests | Description |
 |----------|-------|-------------|
 | Connection | 4 | Gateway health, endpoints, EVM RPC |
 | Market Data | 7 | Orderbook, prices, trades, funding |
 | Account | 5 | State, orders, fills, history |
-| Orders | 7 | Place, cancel, batch, modify |
+| Orders | 10 | Place, cancel, batch, USD transfer, leverage |
 | Matching | 4 | Cross orders, price improvement |
 | Positions | 3 | Tracking, leverage, margin |
-| EVM | 5 | Blocks, balances, transactions |
+| EVM | 24 | All eth_* methods, blocks, transactions |
+| EVM Advanced | 9 | Contract deployment, storage, nonces |
+| Token Standards | 8 | ERC20, ERC721, ERC1155 |
+| Spot Trading | 12 | Spot orders, balances, cancellation |
+| Unified State | 18 | View transfers, balance invariants |
 | Stress | 3 | Rapid orders, concurrent requests |
+| Advanced | 15 | Withdraw, reduce-only, error handling, position lifecycle |
 
 See `scripts/e2e/README.md` for detailed E2E test documentation.
 
 ## Next Steps
 
-1. Review `docs/CODE_AUDIT.md` for implementation gaps
-2. Complete missing engine methods in `crates/engine/src/state.rs`
-3. Implement proper signature verification
-4. Wire up ABCI server with tendermint-abci crate
-5. Add state persistence (RocksDB or similar)
+**Completed:**
+- ✅ EVM Integration with revm (Phase 1)
+- ✅ HIP-1 Spot Token Trading (Phase 1c)
+- ✅ Unified state model (Phase 2A)
+- ✅ CometBFT consensus integration (Phase 2B)
+- ✅ Genesis state initialization (Phase 3A)
+- ✅ Gas fee infrastructure (Phase 3B)
+- ✅ Persistence infrastructure with RocksDB (Phase 4A)
+- ✅ State save/restore on block commit (Phase 4B)
+
+**Remaining Work:**
+1. Review `docs/IMPLEMENTATION_STATUS.md` for detailed status
+2. Production EIP-712 signature verification (Phase 3D)
+3. State commitment with Merkle proofs (Phase 3C)
+4. Production indexer integration (Phase 5)
+
+## Genesis State Configuration
+
+The blockchain initializes from a genesis configuration that includes:
+
+**Genesis Structure (`crates/node/src/main.rs:create_genesis()`):**
+```json
+{
+  "chain_id": "hypercore-1337",
+  "app_state": {
+    "markets": [
+      { "id": 0, "symbol": "BTC-PERP", "max_leverage": 50 },
+      { "id": 1, "symbol": "ETH-PERP", "max_leverage": 50 }
+    ],
+    "spot_tokens": [
+      { "index": 1, "symbol": "TEST", "wei_decimals": 18 }
+    ],
+    "balances": [
+      { "address": "0xf39F...", "token": 0, "amount": "100000", "view": "core" },
+      { "address": "0xf39F...", "token": 1, "amount": "10000", "view": "core" }
+    ]
+  }
+}
+```
+
+**Key Concepts:**
+- **Token Index 0** = USDC (6 decimals)
+- **Token Index 1+** = Custom tokens (configurable decimals)
+- **View "core"** = Available for trading (SpotEngine reads this)
+- **View "evm"** = Available for smart contracts (EvmExecutor reads this)
+
+**Generating Genesis:**
+```bash
+# Generate genesis.json file
+cargo run -p hypercore-node -- init --output genesis.json --chain-id 1337
+
+# Start node (uses create_genesis() internally for single-node mode)
+cargo run -p hypercore-node -- start --http-addr 0.0.0.0:3000
+```
+
+**Test Accounts (Standard Anvil/Hardhat):**
+| Name | Address | USDC | TEST |
+|------|---------|------|------|
+| Alice | `0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266` | 100,000 | 10,000 |
+| Bob | `0x70997970C51812dc3A010C7d01b50e0d17dc79C8` | 100,000 | 10,000 |
+| Charlie | `0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC` | 100,000 | 10,000 |
+
+## State Persistence (Phase 4)
+
+HyperCore supports durable state persistence using RocksDB. This allows the node to survive restarts without losing state.
+
+### Enabling Persistence
+
+```bash
+# Build with persistence feature
+cargo build -p hypercore-node --features persistence
+
+# Start with persistence enabled
+cargo run -p hypercore-node --features persistence -- start \
+    --enable-persistence \
+    --data-dir ./data/chain \
+    --http-addr 0.0.0.0:3000
+
+# Or use release build for production
+cargo build -p hypercore-node --features persistence --release
+./target/release/hypercore-node start \
+    --enable-persistence \
+    --data-dir /var/lib/hypercore/data
+```
+
+### How It Works
+
+1. **Automatic State Save**: After each block is committed, the `PostCommitHandler` callback triggers state extraction and persistence to RocksDB.
+
+2. **State Restore on Startup**: When the node starts with `--enable-persistence`, it checks if persisted state exists in the data directory. If found, it restores the state instead of initializing from genesis.
+
+3. **Column Families**: State is organized into 24 RocksDB column families:
+   - `balances`, `positions`, `orders`, `accounts` (trading state)
+   - `spot_tokens`, `spot_markets`, `spot_reserved` (spot state)
+   - `evm_accounts`, `evm_storage`, `evm_code` (EVM state)
+   - `nonces`, `block_meta`, `block_hashes` (chain state)
+   - `fills`, `funding_payments`, `trades` (history)
+
+4. **WAL (Write-Ahead Log)**: RocksDB's WAL ensures crash recovery - incomplete writes are replayed on startup.
+
+### Data Directory Structure
+
+```
+./data/chain/
+├── hypercore.db/          # RocksDB database
+│   ├── 000001.log         # WAL files
+│   ├── 000002.sst         # SST data files
+│   ├── CURRENT            # Current manifest
+│   ├── MANIFEST-000001    # Database manifest
+│   └── OPTIONS-000001     # Database options
+└── genesis.json           # Genesis configuration (if exported)
+```
+
+### Switching Between Modes
+
+```bash
+# In-memory mode (default, for development)
+cargo run -p hypercore-node -- start
+
+# Persistent mode (for production)
+cargo run -p hypercore-node --features persistence -- start \
+    --enable-persistence \
+    --data-dir ./data/chain
+```
+
+**Note**: If you switch from persistent to in-memory mode, the persisted state is NOT loaded. Use persistent mode consistently for production deployments.

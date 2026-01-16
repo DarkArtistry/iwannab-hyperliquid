@@ -22,7 +22,7 @@ pub use matching::MatchingEngine;
 pub use orderbook::OrderBook;
 pub use risk::RiskEngine;
 pub use spot_engine::{SpotEngine, SpotEngineState};
-pub use state::EngineState;
+pub use state::{BlockMetadata, EngineState};
 
 use hypercore_primitives::{
     AccountAddress, Decimal, Error, Fill, Market, MarketConfig, MarketId, Order, OrderId,

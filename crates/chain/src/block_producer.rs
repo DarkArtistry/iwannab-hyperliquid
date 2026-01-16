@@ -52,6 +52,9 @@ impl Default for BlockProducerConfig {
     }
 }
 
+/// Post-commit handler type for persistence or other operations
+pub type PostCommitHandler = Arc<dyn Fn(&BlockResult, &HyperCoreApp) + Send + Sync>;
+
 /// Block producer for single-node consensus
 pub struct BlockProducer {
     /// Application state
@@ -62,6 +65,8 @@ pub struct BlockProducer {
     config: BlockProducerConfig,
     /// Whether the producer is running
     running: Arc<std::sync::atomic::AtomicBool>,
+    /// Optional post-commit handler (e.g., for persistence)
+    on_commit: Option<PostCommitHandler>,
 }
 
 impl BlockProducer {
@@ -76,6 +81,7 @@ impl BlockProducer {
             mempool,
             config,
             running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            on_commit: None,
         }
     }
 
@@ -93,6 +99,13 @@ impl BlockProducer {
                 ..Default::default()
             },
         )
+    }
+
+    /// Set a post-commit handler that runs after each block is committed.
+    /// Useful for state persistence, metrics, or other post-commit operations.
+    pub fn with_post_commit_handler(mut self, handler: PostCommitHandler) -> Self {
+        self.on_commit = Some(handler);
+        self
     }
 
     /// Start block production loop
@@ -187,6 +200,16 @@ impl BlockProducer {
 
         let duration = start.elapsed();
 
+        let result = BlockResult {
+            height,
+            timestamp,
+            app_hash,
+            tx_count,
+            succeeded,
+            failed,
+            duration,
+        };
+
         tracing::info!(
             "Block {} produced: {} txs ({} ok, {} failed) in {:?}, hash: {:02x?}",
             height,
@@ -197,15 +220,12 @@ impl BlockProducer {
             &app_hash[..8]
         );
 
-        Ok(BlockResult {
-            height,
-            timestamp,
-            app_hash,
-            tx_count,
-            succeeded,
-            failed,
-            duration,
-        })
+        // Call post-commit handler if set (e.g., for persistence)
+        if let Some(ref handler) = self.on_commit {
+            handler(&result, &app);
+        }
+
+        Ok(result)
     }
 
     /// Submit a transaction to the mempool

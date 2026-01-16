@@ -1,23 +1,50 @@
 //! HyperCore Node - Main binary entry point
 //!
 //! This binary runs the complete HyperCore node including:
-//! - CometBFT ABCI application
+//! - CometBFT ABCI application (multi-node mode) or BlockProducer (single-node mode)
 //! - HyperEVM execution environment with JSON-RPC server
 //! - Gateway API server
 //! - Indexer (optional)
+//!
+//! ## Consensus Modes
+//!
+//! The node supports two consensus modes:
+//!
+//! ### Single-Node Mode (default)
+//! Uses the built-in BlockProducer for fast development and testing.
+//! No external CometBFT process is required.
+//!
+//! ### CometBFT Mode (requires `cometbft` feature)
+//! Connects to an external CometBFT process via ABCI for Byzantine fault-tolerant
+//! consensus in a multi-node network.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use tokio::sync::RwLock;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use hypercore_chain::{AbciService, HyperCoreApp};
+#[cfg(feature = "persistence")]
+use hypercore_chain::{extract_state, restore_state, restore_chain_state};
 use hypercore_engine::{EngineState, SpotEngine};
 use hypercore_evm::{EvmExecutor, EvmRpcServer};
 use hypercore_gateway::{GatewayConfig, GatewayServer};
 use hypercore_primitives::new_shared_unified_state;
+
+#[cfg(feature = "persistence")]
+use hypercore_persistence::{PersistenceBackend, PersistenceConfig, RocksDbBackend, StatePersister};
+
+/// Consensus mode for the node
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ConsensusMode {
+    /// Single-node mode using BlockProducer (default, for development)
+    SingleNode,
+    /// Multi-node mode using CometBFT ABCI (requires cometbft feature)
+    #[cfg(feature = "cometbft")]
+    CometBft,
+}
 
 /// HyperCore Node CLI
 #[derive(Parser)]
@@ -49,6 +76,14 @@ enum Commands {
         #[arg(long, default_value = "1337", env = "CHAIN_ID")]
         chain_id: u64,
 
+        /// Consensus mode: single-node (BlockProducer) or cometbft (ABCI server)
+        #[arg(long, default_value = "single-node", env = "CONSENSUS_MODE")]
+        consensus_mode: ConsensusMode,
+
+        /// Block time in milliseconds (only used in single-node mode)
+        #[arg(long, default_value = "500", env = "BLOCK_TIME_MS")]
+        block_time_ms: u64,
+
         /// Enable indexer
         #[arg(long)]
         enable_indexer: bool,
@@ -60,6 +95,16 @@ enum Commands {
         /// Log level
         #[arg(long, default_value = "info", env = "RUST_LOG")]
         log_level: String,
+
+        /// Enable state persistence (requires 'persistence' feature)
+        #[cfg(feature = "persistence")]
+        #[arg(long)]
+        enable_persistence: bool,
+
+        /// Data directory for persistent storage
+        #[cfg(feature = "persistence")]
+        #[arg(long, default_value = "./data/chain", env = "DATA_DIR")]
+        data_dir: String,
     },
 
     /// Initialize genesis state
@@ -102,18 +147,51 @@ async fn main() -> anyhow::Result<()> {
             abci_addr,
             evm_rpc_addr,
             chain_id,
+            consensus_mode,
+            block_time_ms,
             enable_indexer,
             database_url,
             log_level,
+            #[cfg(feature = "persistence")]
+            enable_persistence,
+            #[cfg(feature = "persistence")]
+            data_dir,
         } => {
             // Initialize logging
             init_logging(&log_level);
 
             tracing::info!("Starting HyperCore node");
             tracing::info!("Chain ID: {}", chain_id);
+            tracing::info!("Consensus mode: {:?}", consensus_mode);
             tracing::info!("Gateway HTTP: {}", http_addr);
             tracing::info!("EVM RPC: {}", evm_rpc_addr);
             tracing::info!("ABCI: {}", abci_addr);
+
+            // === Phase 4: State Persistence (optional) ===
+            #[cfg(feature = "persistence")]
+            let persistence = if enable_persistence {
+                tracing::info!("Persistence enabled, data directory: {}", data_dir);
+                let config = PersistenceConfig {
+                    data_dir: data_dir.clone(),
+                    create_if_missing: true,
+                    ..Default::default()
+                };
+                match RocksDbBackend::open(&config) {
+                    Ok(db) => {
+                        let height = db.get_height().unwrap_or(0);
+                        tracing::info!("Opened persistence at height {}", height);
+                        Some(Arc::new(db))
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to open persistence: {}", e);
+                        tracing::warn!("Continuing without persistence");
+                        None
+                    }
+                }
+            } else {
+                tracing::info!("Persistence disabled (in-memory mode)");
+                None
+            };
 
             // === Phase 2A: Shared Unified State ===
             // Create a single unified state that is shared between SpotEngine and EVM.
@@ -129,20 +207,84 @@ async fn main() -> anyhow::Result<()> {
                 SpotEngine::with_unified_state(Arc::clone(&unified_state))
             ));
 
-            // Initialize with default markets
-            {
-                let mut eng = engine.write().await;
-                initialize_default_markets(&mut eng)?;
+            // Track if state was restored from persistence
+            #[cfg(feature = "persistence")]
+            let mut state_restored = false;
+
+            // === Phase 4B: State Restore from Persistence ===
+            #[cfg(feature = "persistence")]
+            if let Some(ref db) = persistence {
+                let persister = StatePersister::new(db.as_ref());
+                match persister.load_state() {
+                    Ok(Some(persisted_state)) => {
+                        tracing::info!("Found persisted state at height {}, restoring...", persisted_state.height);
+
+                        // Restore state
+                        match restore_state(
+                            &persisted_state,
+                            &unified_state,
+                            &engine,
+                            Some(&spot_engine),
+                        ) {
+                            Ok((height, timestamp, app_hash)) => {
+                                tracing::info!(
+                                    "State restored: height={}, timestamp={}, app_hash={:?}",
+                                    height, timestamp, &app_hash[..8]
+                                );
+                                state_restored = true;
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to restore state: {}", e);
+                                tracing::warn!("Falling back to genesis initialization");
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        tracing::info!("No persisted state found, initializing from genesis");
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to load persisted state: {}", e);
+                        tracing::warn!("Falling back to genesis initialization");
+                    }
+                }
             }
 
-            // Initialize spot engine with default tokens
-            {
-                let mut spot_eng = spot_engine.write().await;
-                initialize_spot_markets(&mut spot_eng)?;
+            // Initialize from genesis if state was not restored
+            #[cfg(feature = "persistence")]
+            let should_init_genesis = !state_restored;
+            #[cfg(not(feature = "persistence"))]
+            let should_init_genesis = true;
+
+            if should_init_genesis {
+                // Initialize with default markets
+                {
+                    let mut eng = engine.write().await;
+                    initialize_default_markets(&mut eng)?;
+                }
+
+                // Initialize spot engine with default tokens
+                {
+                    let mut spot_eng = spot_engine.write().await;
+                    initialize_spot_markets(&mut spot_eng)?;
+                }
+
+                // Initialize balances from genesis state
+                // This replaces the runtime creditBalance() approach
+                {
+                    let genesis = create_genesis(chain_id)?;
+                    initialize_genesis_balances(&unified_state, &genesis)?;
+                }
             }
 
-            // Create HyperCore application
-            let app = Arc::new(RwLock::new(HyperCoreApp::new()));
+            // Create HyperCore application with SHARED unified state
+            // This ensures all layers (SpotEngine, EVM, HyperCoreApp) use the same balance sheet.
+            // Without this, USD transfers and other app-layer operations would fail due to
+            // seeing different balances than what was initialized in genesis.
+            let app = Arc::new(RwLock::new(HyperCoreApp::with_shared_state(
+                Arc::clone(&unified_state),
+                Arc::clone(&engine),
+                Some(Arc::clone(&spot_engine)),
+            )));
 
             // Create EVM executor with shared unified state
             let evm = Arc::new(RwLock::new(
@@ -207,30 +349,135 @@ async fn main() -> anyhow::Result<()> {
                 }
             });
 
-            // Start BlockProducer for single-node consensus
-            // In production, this would be replaced with CometBFT integration via ABCI
-            let block_producer = hypercore_chain::BlockProducer::new(
-                Arc::clone(&app),
-                mempool,
-                hypercore_chain::BlockProducerConfig {
-                    block_time_ms: 500,
-                    ..Default::default()
-                },
-            );
-            let _abci_service = AbciService::new(Arc::clone(&app)); // Keep for future ABCI integration
-            let abci_handle = tokio::spawn(async move {
-                tracing::info!("BlockProducer started with 500ms block time");
-                block_producer.start().await;
-            });
+            // Start consensus engine based on mode
+            let abci_handle = match consensus_mode {
+                ConsensusMode::SingleNode => {
+                    // Start BlockProducer for single-node consensus
+                    let mut block_producer = hypercore_chain::BlockProducer::new(
+                        Arc::clone(&app),
+                        mempool,
+                        hypercore_chain::BlockProducerConfig {
+                            block_time_ms,
+                            ..Default::default()
+                        },
+                    );
+
+                    // Add persistence handler if enabled
+                    #[cfg(feature = "persistence")]
+                    if let Some(ref db) = persistence {
+                        let persistence_db = Arc::clone(db);
+                        let state_unified = Arc::clone(&unified_state);
+                        let state_engine = Arc::clone(&engine);
+                        let state_spot = Arc::clone(&spot_engine);
+
+                        block_producer = block_producer.with_post_commit_handler(Arc::new(
+                            move |result: &hypercore_chain::BlockResult, app: &HyperCoreApp| {
+                                // Extract state from runtime components
+                                let persisted_state = extract_state(
+                                    result.height,
+                                    result.timestamp,
+                                    result.app_hash,
+                                    &state_unified,
+                                    &state_engine,
+                                    Some(&state_spot),
+                                    &app.get_nonces(),
+                                    &app.get_cloid_index(),
+                                    &app.get_block_metadata(),
+                                );
+
+                                // Persist state
+                                let persister = StatePersister::new(persistence_db.as_ref());
+                                match persister.persist_state(&persisted_state) {
+                                    Ok(()) => {
+                                        tracing::debug!(
+                                            "Persisted state at height {} ({} balances)",
+                                            result.height,
+                                            persisted_state.core.balances.len()
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("Failed to persist state: {}", e);
+                                    }
+                                }
+                            },
+                        ));
+                        tracing::info!("State persistence handler enabled");
+                    }
+
+                    let _abci_service = AbciService::new(Arc::clone(&app));
+                    tokio::spawn(async move {
+                        tracing::info!("BlockProducer started with {}ms block time", block_time_ms);
+                        block_producer.start().await;
+                    })
+                }
+
+                #[cfg(feature = "cometbft")]
+                ConsensusMode::CometBft => {
+                    // Start CometBFT ABCI server for multi-node consensus
+                    use hypercore_chain::{CometBftApp, CometBftServer};
+
+                    // Create a new HyperCoreApp for CometBFT (it needs ownership)
+                    let cometbft_hypercore_app = HyperCoreApp::new();
+                    let cometbft_app = CometBftApp::new(cometbft_hypercore_app);
+                    let server = CometBftServer::new(cometbft_app);
+
+                    tokio::task::spawn_blocking(move || {
+                        tracing::info!("Starting CometBFT ABCI server on {}", abci_addr);
+                        if let Err(e) = server.start(abci_addr) {
+                            tracing::error!("CometBFT ABCI server error: {}", e);
+                        }
+                    })
+                }
+            };
 
             // Start indexer if enabled
-            if enable_indexer {
+            #[cfg(feature = "indexer")]
+            let _indexer_handle = if enable_indexer {
                 if let Some(db_url) = database_url {
                     tracing::info!("Starting indexer with database: {}", db_url);
-                    // In production, start the indexer service
+
+                    // Connect to database and start indexer
+                    let indexer_engine = Arc::clone(&engine);
+                    let db_url_clone = db_url.clone();
+
+                    Some(tokio::spawn(async move {
+                        match hypercore_indexer::Database::connect(&db_url_clone).await {
+                            Ok(db) => {
+                                // Run migrations
+                                if let Err(e) = db.run_migrations().await {
+                                    tracing::error!("Failed to run indexer migrations: {}", e);
+                                    return;
+                                }
+
+                                // Create and run indexer
+                                match hypercore_indexer::Indexer::new(db, indexer_engine).await {
+                                    Ok(mut indexer) => {
+                                        tracing::info!("Indexer started successfully");
+                                        if let Err(e) = indexer.run().await {
+                                            tracing::error!("Indexer error: {}", e);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("Failed to create indexer: {}", e);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to connect to indexer database: {}", e);
+                            }
+                        }
+                    }))
                 } else {
                     tracing::warn!("Indexer enabled but no DATABASE_URL provided");
+                    None
                 }
+            } else {
+                None
+            };
+
+            #[cfg(not(feature = "indexer"))]
+            if enable_indexer {
+                tracing::warn!("Indexer requested but 'indexer' feature is not enabled. Recompile with --features indexer");
             }
 
             // Start price feed updater (mock for devnet)
@@ -256,6 +503,19 @@ async fn main() -> anyhow::Result<()> {
                 _ = abci_handle => {
                     tracing::info!("ABCI server stopped");
                 }
+            }
+
+            // Graceful shutdown: flush and close persistence
+            #[cfg(feature = "persistence")]
+            if let Some(db) = persistence {
+                tracing::info!("Flushing persistence to disk...");
+                if let Err(e) = db.flush() {
+                    tracing::error!("Failed to flush persistence: {}", e);
+                }
+                if let Err(e) = db.close() {
+                    tracing::error!("Failed to close persistence: {}", e);
+                }
+                tracing::info!("Persistence shutdown complete");
             }
 
             tracing::info!("HyperCore node shutdown complete");
@@ -331,6 +591,11 @@ fn initialize_default_markets(engine: &mut EngineState) -> anyhow::Result<()> {
 }
 
 /// Initialize spot markets (HIP-1 tokens)
+///
+/// This function deploys the TEST token and creates the TEST-USDC market.
+/// Initial balances are NOT credited here - they come from genesis state.
+///
+/// For genesis-based initialization, balances are set in `init_from_genesis()`.
 fn initialize_spot_markets(spot_engine: &mut SpotEngine) -> anyhow::Result<()> {
     use hypercore_primitives::{Decimal, SpotTokenDeployParams, AccountAddress};
 
@@ -366,48 +631,122 @@ fn initialize_spot_markets(spot_engine: &mut SpotEngine) -> anyhow::Result<()> {
         }
     }
 
-    // Credit test accounts with USDC and TEST for E2E testing
-    // These are the standard Anvil/Hardhat test accounts
-    let test_accounts: [(AccountAddress, &str); 3] = [
-        // Alice - 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266
-        (AccountAddress::from([
-            0xf3, 0x9F, 0xd6, 0xe5, 0x1a, 0xad, 0x88, 0xF6, 0xF4, 0xce,
-            0x6a, 0xB8, 0x82, 0x72, 0x79, 0xcf, 0xfF, 0xb9, 0x22, 0x66
-        ]), "Alice"),
-        // Bob - 0x70997970C51812dc3A010C7d01b50e0d17dc79C8
-        (AccountAddress::from([
-            0x70, 0x99, 0x79, 0x70, 0xC5, 0x18, 0x12, 0xdc, 0x3A, 0x01,
-            0x0C, 0x7d, 0x01, 0xb5, 0x0e, 0x0d, 0x17, 0xdc, 0x79, 0xC8
-        ]), "Bob"),
-        // Charlie - 0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC
-        (AccountAddress::from([
-            0x3C, 0x44, 0xCd, 0xDd, 0xB6, 0xa9, 0x00, 0xfa, 0x2b, 0x58,
-            0x5d, 0xd2, 0x99, 0xe0, 0x3d, 0x12, 0xFA, 0x42, 0x93, 0xBC
-        ]), "Charlie"),
-    ];
-
-    let usdc_amount = Decimal::from_str_exact("100000", 6).unwrap(); // 100,000 USDC
-    let test_token_amount = Decimal::from_str_exact("10000", 18).unwrap(); // 10,000 TEST
-
-    for (account, name) in test_accounts {
-        // Credit USDC (token index 0)
-        spot_engine.state.credit_balance(account, 0, usdc_amount);
-        // Credit TEST tokens (token index 1)
-        spot_engine.state.credit_balance(account, 1, test_token_amount);
-        tracing::info!("Credited {} ({:?}) with {} USDC and {} TEST",
-                      name, account, usdc_amount.to_string_trimmed(), test_token_amount.to_string_trimmed());
-    }
-
-    tracing::info!("Initialized spot engine with test balances");
+    tracing::info!("Initialized spot engine (balances from genesis)");
     Ok(())
 }
 
-/// Create genesis state
-fn create_genesis(chain_id: u64) -> anyhow::Result<serde_json::Value> {
+/// Initialize balances from genesis state for single-node mode
+///
+/// This function parses the genesis JSON and credits initial balances.
+/// In CometBFT mode, this is handled by `HyperCoreApp::init_from_genesis()`.
+fn initialize_genesis_balances(
+    unified_state: &hypercore_primitives::SharedUnifiedState,
+    genesis_json: &serde_json::Value,
+) -> anyhow::Result<()> {
     use hypercore_primitives::Decimal;
 
+    let app_state = genesis_json.get("app_state")
+        .ok_or_else(|| anyhow::anyhow!("Missing app_state in genesis"))?;
+
+    let empty_vec = vec![];
+    let balances = app_state.get("balances")
+        .and_then(|b| b.as_array())
+        .unwrap_or(&empty_vec);
+
+    if balances.is_empty() {
+        tracing::warn!("No balances in genesis state");
+        return Ok(());
+    }
+
+    let mut unified = unified_state.write().unwrap();
+
+    for balance_entry in balances {
+        // Parse address
+        let address_str = balance_entry.get("address")
+            .and_then(|a| a.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing address in balance entry"))?;
+
+        let address = parse_address(address_str)?;
+
+        // Parse token index
+        let token = balance_entry.get("token")
+            .and_then(|t| t.as_u64())
+            .unwrap_or(0) as u8;
+
+        // Parse amount
+        let amount_str = balance_entry.get("amount")
+            .and_then(|a| a.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing amount in balance entry"))?;
+
+        let decimals = if token == 0 { 6 } else { 18 };
+        // IMPORTANT: Use from_str_exact with correct decimals, NOT from_str (which uses 8 decimals)
+        let amount = Decimal::from_str_exact(amount_str, decimals)
+            .unwrap_or_else(|| Decimal::from_raw(0, decimals));
+
+        if amount.raw() == 0 {
+            continue;
+        }
+
+        // Parse view (default to "core")
+        let view = balance_entry.get("view")
+            .and_then(|v| v.as_str())
+            .unwrap_or("core");
+
+        match view {
+            "core" => {
+                unified.credit(address, token, amount);
+                tracing::info!(
+                    "Genesis: Credited {:?} token {} amount {} to core_view",
+                    address, token, amount.to_string_trimmed()
+                );
+            }
+            "evm" => {
+                unified.credit_evm(address, token, amount);
+                tracing::info!(
+                    "Genesis: Credited {:?} token {} amount {} to evm_view",
+                    address, token, amount.to_string_trimmed()
+                );
+            }
+            _ => {
+                tracing::warn!("Unknown view '{}', defaulting to core", view);
+                unified.credit(address, token, amount);
+            }
+        }
+    }
+
+    tracing::info!("Initialized {} balance entries from genesis", balances.len());
+    Ok(())
+}
+
+/// Parse hex address string to AccountAddress
+fn parse_address(hex_str: &str) -> anyhow::Result<hypercore_primitives::AccountAddress> {
+    let hex_str = hex_str.strip_prefix("0x").unwrap_or(hex_str);
+    if hex_str.len() != 40 {
+        return Err(anyhow::anyhow!("Invalid address length: {}", hex_str.len()));
+    }
+
+    let bytes = hex::decode(hex_str)?;
+    let mut addr = [0u8; 20];
+    addr.copy_from_slice(&bytes);
+    Ok(hypercore_primitives::AccountAddress::from(addr))
+}
+
+/// Create genesis state with proper initial balances
+///
+/// This generates a genesis configuration that includes:
+/// - Perpetual markets (BTC-PERP, ETH-PERP)
+/// - Spot tokens (TEST token)
+/// - Initial balances for test accounts (Alice, Bob, Charlie)
+///
+/// All validators must use identical genesis to reach consensus.
+fn create_genesis(chain_id: u64) -> anyhow::Result<serde_json::Value> {
+    // Test accounts (standard Anvil/Hardhat accounts)
+    let alice = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+    let bob = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
+    let charlie = "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC";
+
     Ok(serde_json::json!({
-        "chain_id": chain_id,
+        "chain_id": format!("hypercore-{}", chain_id),
         "initial_height": 1,
         "consensus_params": {
             "block": {
@@ -424,39 +763,42 @@ fn create_genesis(chain_id: u64) -> anyhow::Result<serde_json::Value> {
             }
         },
         "app_state": {
+            "chain_id": format!("hypercore-{}", chain_id),
             "markets": [
                 {
                     "id": 0,
-                    "config": {
-                        "name": "BTC-PERP",
-                        "tick_size": "0.1",
-                        "lot_size": "0.001",
-                        "max_leverage": 50,
-                        "initial_margin_fraction": "0.02",
-                        "maintenance_margin_fraction": "0.01",
-                        "maker_fee": "0.0002",
-                        "taker_fee": "0.0005",
-                        "funding_interval": 28800,
-                        "max_funding_rate": "0.0005"
-                    }
+                    "symbol": "BTC-PERP",
+                    "max_leverage": 50,
+                    "initial_mark_price": "65000"
                 },
                 {
                     "id": 1,
-                    "config": {
-                        "name": "ETH-PERP",
-                        "tick_size": "0.01",
-                        "lot_size": "0.01",
-                        "max_leverage": 50,
-                        "initial_margin_fraction": "0.02",
-                        "maintenance_margin_fraction": "0.01",
-                        "maker_fee": "0.0002",
-                        "taker_fee": "0.0005",
-                        "funding_interval": 28800,
-                        "max_funding_rate": "0.0005"
-                    }
+                    "symbol": "ETH-PERP",
+                    "max_leverage": 50,
+                    "initial_mark_price": "3500"
                 }
             ],
-            "balances": {}
+            "spot_tokens": [
+                {
+                    "index": 1,
+                    "name": "Test Token",
+                    "symbol": "TEST",
+                    "wei_decimals": 18,
+                    "sz_decimals": 4,
+                    "max_supply": "1000000000"
+                }
+            ],
+            "balances": [
+                // Alice: 100,000 USDC (core) + 10,000 TEST (core)
+                { "address": alice, "token": 0, "amount": "100000", "view": "core" },
+                { "address": alice, "token": 1, "amount": "10000", "view": "core" },
+                // Bob: 100,000 USDC (core) + 10,000 TEST (core)
+                { "address": bob, "token": 0, "amount": "100000", "view": "core" },
+                { "address": bob, "token": 1, "amount": "10000", "view": "core" },
+                // Charlie: 100,000 USDC (core) + 10,000 TEST (core)
+                { "address": charlie, "token": 0, "amount": "100000", "view": "core" },
+                { "address": charlie, "token": 1, "amount": "10000", "view": "core" }
+            ]
         }
     }))
 }
@@ -505,16 +847,109 @@ async fn mock_price_feed(engine: Arc<RwLock<EngineState>>) {
 }
 
 /// Funding rate processor
-async fn funding_processor(_engine: Arc<RwLock<EngineState>>) {
+async fn funding_processor(engine: Arc<RwLock<EngineState>>) {
+    use hypercore_engine::FundingEngine;
+    use hypercore_primitives::FundingPayment;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     // Check funding every minute
     let interval = tokio::time::Duration::from_secs(60);
+    let funding_engine = FundingEngine::default();
 
     loop {
         tokio::time::sleep(interval).await;
 
-        // TODO: Implement funding rate application
-        // For now, just log that we would apply funding
-        tracing::debug!("Funding check triggered (not implemented)");
+        let current_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        // Get all markets that need funding settlement
+        let mut engine_guard = engine.write().await;
+        let market_ids = engine_guard.get_market_ids();
+
+        for market_id in market_ids {
+            if let Some(market) = engine_guard.get_market_mut(market_id) {
+                // Check if funding should be settled
+                if !funding_engine.should_settle(&market.state, current_time) {
+                    continue;
+                }
+
+                // Calculate funding rate (using mark price as index for now)
+                let index_price = market.state.mark_price;
+                let funding_rate = funding_engine.calculate_funding_rate(&market.state, index_price);
+
+                tracing::debug!(
+                    "Settling funding for market {}: rate={}, mark={}",
+                    market.config.symbol,
+                    funding_rate.to_string_trimmed(),
+                    market.state.mark_price.to_string_trimmed()
+                );
+
+                // Apply funding to the market
+                funding_engine.settle_funding(market, funding_rate, current_time);
+
+                // Record market funding history
+                engine_guard.record_market_funding(
+                    market_id,
+                    current_time,
+                    funding_rate.raw(),
+                );
+            }
+        }
+
+        // Apply funding payments to positions
+        // For each account with positions, calculate and apply funding payment
+        let accounts: Vec<_> = engine_guard.accounts.keys().cloned().collect();
+        for account in accounts {
+            for market_id in engine_guard.get_market_ids() {
+                if let Some(position) = engine_guard.get_position(account, market_id) {
+                    if position.size.is_zero() {
+                        continue;
+                    }
+
+                    if let Some(market) = engine_guard.get_market(market_id) {
+                        // Calculate funding payment
+                        let payment = funding_engine.calculate_funding_payment(
+                            position.size,
+                            position.last_funding_index,
+                            market.state.funding_accumulator,
+                        );
+
+                        if !payment.is_zero() {
+                            // Record funding payment
+                            let funding_payment = FundingPayment {
+                                market_id,
+                                account,
+                                payment: payment.raw(),
+                                position_size: position.size.raw(),
+                                funding_rate: market.state.funding_rate.raw(),
+                                timestamp: current_time,
+                            };
+                            engine_guard.record_funding_payment(funding_payment);
+
+                            tracing::debug!(
+                                "Applied funding {} to {} for market {}",
+                                payment.to_string_trimmed(),
+                                account,
+                                market_id
+                            );
+                        }
+                    }
+                }
+
+                // Update position's last funding index
+                let funding_accumulator = engine_guard
+                    .get_market(market_id)
+                    .map(|m| m.state.funding_accumulator);
+                if let (Some(position), Some(accumulator)) = (
+                    engine_guard.get_position_mut(account, market_id),
+                    funding_accumulator,
+                ) {
+                    position.last_funding_index = accumulator;
+                }
+            }
+        }
     }
 }
 
@@ -525,7 +960,7 @@ mod tests {
     #[test]
     fn test_create_genesis() {
         let genesis = create_genesis(1337).unwrap();
-        assert_eq!(genesis["chain_id"], 1337);
+        assert_eq!(genesis["chain_id"], "hypercore-1337");
         assert!(genesis["app_state"]["markets"].as_array().unwrap().len() == 2);
     }
 }

@@ -52,7 +52,9 @@ impl Transaction {
         recover_address(&typed_hash, &self.signature)
     }
 
-    /// Get sender address (alias for recover_signer)
+    /// Get sender address using EIP-712 signature recovery
+    ///
+    /// Cryptographically verifies the signature and recovers the sender address.
     pub fn sender(&self) -> Result<AccountAddress, TransactionError> {
         self.recover_signer()
     }
@@ -108,29 +110,82 @@ pub enum TransactionType {
     },
 }
 
+// ============================================================================
+// EIP-712 Encoding Helpers (must match gateway/src/eip712.rs exactly)
+// ============================================================================
+
+/// Encode a string as keccak256 hash (EIP-712 string encoding)
+fn encode_string(s: &str) -> [u8; 32] {
+    use sha3::{Digest, Keccak256};
+    let result = Keccak256::digest(s.as_bytes());
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&result);
+    hash
+}
+
+/// Encode a uint8 as 32-byte big-endian
+fn encode_uint8(v: u8) -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    bytes[31] = v;
+    bytes
+}
+
+/// Encode a uint64 as 32-byte big-endian
+fn encode_uint64(v: u64) -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    bytes[24..32].copy_from_slice(&v.to_be_bytes());
+    bytes
+}
+
+/// Encode a bool as 32-byte (0 or 1)
+fn encode_bool(v: bool) -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    bytes[31] = if v { 1 } else { 0 };
+    bytes
+}
+
+/// Encode an address as 32-byte (left-padded with zeros)
+fn encode_address(addr: &AccountAddress) -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    bytes[12..32].copy_from_slice(addr.as_slice());
+    bytes
+}
+
+/// Encode an array of struct hashes as keccak256 of concatenated hashes
+fn encode_array(hashes: &[[u8; 32]]) -> [u8; 32] {
+    use sha3::{Digest, Keccak256};
+    let mut hasher = Keccak256::new();
+    for hash in hashes {
+        hasher.update(hash);
+    }
+    let result = hasher.finalize();
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&result);
+    hash
+}
+
 impl TransactionType {
     /// Compute EIP-712 struct hash for this action
+    ///
+    /// IMPORTANT: This must produce identical hashes to gateway/src/eip712.rs
+    /// All values must be properly encoded according to EIP-712:
+    /// - Addresses: 32 bytes, left-padded with zeros
+    /// - uint8/uint64: 32 bytes, left-padded with zeros
+    /// - Strings: keccak256 of string bytes
+    /// - Bools: 32 bytes, 0 or 1 in last byte
     pub fn compute_struct_hash(&self, nonce: u64) -> Result<[u8; 32], TransactionError> {
         use sha3::{Digest, Keccak256};
 
         match self {
             TransactionType::Order { orders, grouping } => {
-                // Hash each order
+                // Hash each order (properly padded)
                 let mut order_hashes = Vec::with_capacity(orders.len());
                 for order in orders {
-                    order_hashes.push(order.compute_hash());
+                    order_hashes.push(order.compute_hash_eip712());
                 }
 
                 // Hash the orders array
-                let orders_hash: [u8; 32] = if order_hashes.is_empty() {
-                    Keccak256::digest(b"").into()
-                } else {
-                    let mut combined = Vec::new();
-                    for h in order_hashes {
-                        combined.extend_from_slice(&h);
-                    }
-                    Keccak256::digest(&combined).into()
-                };
+                let orders_hash = encode_array(&order_hashes);
 
                 // Type hash
                 let type_hash = Keccak256::digest(
@@ -139,10 +194,10 @@ impl TransactionType {
 
                 let mut hasher = Keccak256::new();
                 hasher.update(type_hash);
-                hasher.update(Keccak256::digest(b"order"));
+                hasher.update(encode_string("order"));
                 hasher.update(orders_hash);
-                hasher.update(Keccak256::digest(grouping.as_str().as_bytes()));
-                hasher.update(&nonce.to_be_bytes());
+                hasher.update(encode_string(grouping.as_str()));
+                hasher.update(encode_uint64(nonce));
                 Ok(hasher.finalize().into())
             }
             TransactionType::Cancel { cancels } => {
@@ -150,19 +205,46 @@ impl TransactionType {
                     b"Action(string type,Cancel[] cancels,uint64 nonce)Cancel(uint8 a,uint64 o)"
                 );
 
-                let cancels_hash = {
-                    let mut combined = Vec::new();
-                    for c in cancels {
-                        combined.extend_from_slice(&c.compute_hash());
-                    }
-                    Keccak256::digest(&combined)
-                };
+                // Hash each cancel (properly padded)
+                let cancel_hashes: Vec<[u8; 32]> = cancels.iter()
+                    .map(|c| c.compute_hash_eip712())
+                    .collect();
+                let cancels_hash = encode_array(&cancel_hashes);
 
                 let mut hasher = Keccak256::new();
                 hasher.update(type_hash);
-                hasher.update(Keccak256::digest(b"cancel"));
+                hasher.update(encode_string("cancel"));
                 hasher.update(cancels_hash);
-                hasher.update(&nonce.to_be_bytes());
+                hasher.update(encode_uint64(nonce));
+                Ok(hasher.finalize().into())
+            }
+            TransactionType::CancelByCloid { cancels } => {
+                let type_hash = Keccak256::digest(
+                    b"Action(string type,CancelByCloid[] cancels,uint64 nonce)CancelByCloid(uint8 asset,string cloid)"
+                );
+
+                // Hash each cancel by cloid (properly padded)
+                let cancel_hashes: Vec<[u8; 32]> = cancels.iter()
+                    .map(|c| c.compute_hash_eip712())
+                    .collect();
+                let cancels_hash = encode_array(&cancel_hashes);
+
+                let mut hasher = Keccak256::new();
+                hasher.update(type_hash);
+                hasher.update(encode_string("cancelByCloid"));
+                hasher.update(cancels_hash);
+                hasher.update(encode_uint64(nonce));
+                Ok(hasher.finalize().into())
+            }
+            TransactionType::CancelAll => {
+                let type_hash = Keccak256::digest(
+                    b"Action(string type,uint64 nonce)"
+                );
+
+                let mut hasher = Keccak256::new();
+                hasher.update(type_hash);
+                hasher.update(encode_string("cancelAll"));
+                hasher.update(encode_uint64(nonce));
                 Ok(hasher.finalize().into())
             }
             TransactionType::UpdateLeverage { asset, is_cross, leverage } => {
@@ -172,18 +254,18 @@ impl TransactionType {
 
                 let mut hasher = Keccak256::new();
                 hasher.update(type_hash);
-                hasher.update(Keccak256::digest(b"updateLeverage"));
-                hasher.update([*asset]);
-                hasher.update([if *is_cross { 1u8 } else { 0u8 }]);
-                hasher.update([*leverage]);
-                hasher.update(&nonce.to_be_bytes());
+                hasher.update(encode_string("updateLeverage"));
+                hasher.update(encode_uint8(*asset));
+                hasher.update(encode_bool(*is_cross));
+                hasher.update(encode_uint8(*leverage));
+                hasher.update(encode_uint64(nonce));
                 Ok(hasher.finalize().into())
             }
             TransactionType::UsdTransfer { destination, amount } |
             TransactionType::Withdraw { destination, amount } => {
-                let type_name: &[u8] = match self {
-                    TransactionType::UsdTransfer { .. } => b"usdTransfer",
-                    TransactionType::Withdraw { .. } => b"withdraw",
+                let type_name = match self {
+                    TransactionType::UsdTransfer { .. } => "usdTransfer",
+                    TransactionType::Withdraw { .. } => "withdraw",
                     _ => unreachable!(),
                 };
 
@@ -193,19 +275,18 @@ impl TransactionType {
 
                 let mut hasher = Keccak256::new();
                 hasher.update(type_hash);
-                hasher.update(Keccak256::digest(type_name));
-                hasher.update(destination.as_slice());
-                hasher.update(Keccak256::digest(amount.as_bytes()));
-                hasher.update(&nonce.to_be_bytes());
+                hasher.update(encode_string(type_name));
+                hasher.update(encode_address(destination));  // Properly padded to 32 bytes
+                hasher.update(encode_string(amount));
+                hasher.update(encode_uint64(nonce));         // Properly padded to 32 bytes
                 Ok(hasher.finalize().into())
             }
-            _ => {
-                // Generic hash for other types
-                let encoded = serde_json::to_vec(self)
-                    .map_err(|_| TransactionError::SerializationError)?;
+            TransactionType::EvmAction { action_type, data } => {
+                // EVM actions use a simple hash for now
                 let mut hasher = Keccak256::new();
-                hasher.update(&encoded);
-                hasher.update(&nonce.to_be_bytes());
+                hasher.update(encode_uint8(*action_type));
+                hasher.update(data);
+                hasher.update(encode_uint64(nonce));
                 Ok(hasher.finalize().into())
             }
         }
@@ -233,20 +314,27 @@ pub struct OrderWire {
 }
 
 impl OrderWire {
-    pub fn compute_hash(&self) -> [u8; 32] {
+    /// Compute properly padded EIP-712 struct hash
+    pub fn compute_hash_eip712(&self) -> [u8; 32] {
         use sha3::{Digest, Keccak256};
         let type_hash = Keccak256::digest(
             b"Order(uint8 a,bool b,string p,string s,bool r,string t)"
         );
         let mut hasher = Keccak256::new();
         hasher.update(type_hash);
-        hasher.update([self.a]);
-        hasher.update([if self.b { 1u8 } else { 0u8 }]);
-        hasher.update(Keccak256::digest(self.p.as_bytes()));
-        hasher.update(Keccak256::digest(self.s.as_bytes()));
-        hasher.update([if self.r { 1u8 } else { 0u8 }]);
-        hasher.update(Keccak256::digest(self.t.to_string().as_bytes()));
+        hasher.update(encode_uint8(self.a));
+        hasher.update(encode_bool(self.b));
+        hasher.update(encode_string(&self.p));
+        hasher.update(encode_string(&self.s));
+        hasher.update(encode_bool(self.r));
+        hasher.update(encode_string(&self.t.to_tif_string()));
         hasher.finalize().into()
+    }
+
+    /// Legacy hash method (deprecated, use compute_hash_eip712)
+    #[deprecated(note = "Use compute_hash_eip712 for proper EIP-712 encoding")]
+    pub fn compute_hash(&self) -> [u8; 32] {
+        self.compute_hash_eip712()
     }
 
     /// Convert to internal order request
@@ -278,6 +366,16 @@ pub enum OrderTypeWire {
 }
 
 impl OrderTypeWire {
+    /// Convert to TIF string for EIP-712 hashing (lowercase)
+    /// This must match the TypeScript SDK's transformation
+    pub fn to_tif_string(&self) -> String {
+        match self {
+            OrderTypeWire::Limit { limit } => limit.tif.to_lowercase(),
+            OrderTypeWire::Trigger { .. } => "trigger".to_string(),
+        }
+    }
+
+    /// Legacy method for serialization display
     pub fn to_string(&self) -> String {
         match self {
             OrderTypeWire::Limit { limit } => format!("limit:{}", limit.tif),
@@ -356,14 +454,21 @@ pub struct CancelWire {
 }
 
 impl CancelWire {
-    pub fn compute_hash(&self) -> [u8; 32] {
+    /// Compute properly padded EIP-712 struct hash
+    pub fn compute_hash_eip712(&self) -> [u8; 32] {
         use sha3::{Digest, Keccak256};
         let type_hash = Keccak256::digest(b"Cancel(uint8 a,uint64 o)");
         let mut hasher = Keccak256::new();
         hasher.update(type_hash);
-        hasher.update([self.a]);
-        hasher.update(&self.o.to_be_bytes());
+        hasher.update(encode_uint8(self.a));
+        hasher.update(encode_uint64(self.o));
         hasher.finalize().into()
+    }
+
+    /// Legacy hash method (deprecated)
+    #[deprecated(note = "Use compute_hash_eip712 for proper EIP-712 encoding")]
+    pub fn compute_hash(&self) -> [u8; 32] {
+        self.compute_hash_eip712()
     }
 }
 
@@ -372,6 +477,19 @@ impl CancelWire {
 pub struct CancelByCloidWire {
     pub asset: MarketId,
     pub cloid: String,
+}
+
+impl CancelByCloidWire {
+    /// Compute properly padded EIP-712 struct hash
+    pub fn compute_hash_eip712(&self) -> [u8; 32] {
+        use sha3::{Digest, Keccak256};
+        let type_hash = Keccak256::digest(b"CancelByCloid(uint8 asset,string cloid)");
+        let mut hasher = Keccak256::new();
+        hasher.update(type_hash);
+        hasher.update(encode_uint8(self.asset));
+        hasher.update(encode_string(&self.cloid));
+        hasher.finalize().into()
+    }
 }
 
 /// Transaction errors

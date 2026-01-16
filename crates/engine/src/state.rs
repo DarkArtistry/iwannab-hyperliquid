@@ -2,10 +2,20 @@
 
 use crate::orderbook::OrderBook;
 use hypercore_primitives::{
-    AccountAddress, AccountState, Decimal, Market, MarketId, MarketState, Order, OrderId,
-    Position, SignedAmount,
+    AccountAddress, AccountState, Decimal, Fill, FundingPayment, Market, MarketId, MarketState,
+    Order, OrderId, Position, SignedAmount, Timestamp,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+/// Block metadata for history queries
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockMetadata {
+    pub hash: [u8; 32],
+    pub timestamp: u64,
+    pub tx_count: u32,
+    pub events: Vec<serde_json::Value>,
+}
 
 /// Engine state containing all runtime data
 pub struct EngineState {
@@ -27,6 +37,18 @@ pub struct EngineState {
     pub insurance_fund: SignedAmount,
     /// Next order ID
     next_order_id: OrderId,
+    /// Fill history per account (recent fills)
+    account_fills: HashMap<AccountAddress, Vec<Fill>>,
+    /// Recent trades per market (for public trade feed)
+    recent_trades: HashMap<MarketId, Vec<Fill>>,
+    /// Funding payments per account
+    funding_history: HashMap<AccountAddress, Vec<FundingPayment>>,
+    /// Funding rate history per market
+    market_funding_history: HashMap<MarketId, Vec<(Timestamp, SignedAmount)>>,
+    /// Current block height
+    block_height: u64,
+    /// Block metadata (hash, timestamp, tx_count)
+    block_metadata: HashMap<u64, BlockMetadata>,
 }
 
 impl EngineState {
@@ -42,6 +64,12 @@ impl EngineState {
             account_orders: HashMap::new(),
             insurance_fund: 0,
             next_order_id: 1,
+            account_fills: HashMap::new(),
+            recent_trades: HashMap::new(),
+            funding_history: HashMap::new(),
+            market_funding_history: HashMap::new(),
+            block_height: 0,
+            block_metadata: HashMap::new(),
         }
     }
 
@@ -304,29 +332,200 @@ impl EngineState {
         Decimal::from_raw(raw, Decimal::USDC_DECIMALS)
     }
 
-    /// Current block height (stub - in production would track actual height)
+    /// Current block height
     pub fn current_height(&self) -> u64 {
-        0 // TODO: Track actual block height
+        self.block_height
     }
 
-    /// Get block hash (stub)
-    pub fn get_block_hash(&self, _height: u64) -> Option<[u8; 32]> {
-        None // TODO: Implement block storage
+    /// Set current block height
+    pub fn set_block_height(&mut self, height: u64) {
+        self.block_height = height;
     }
 
-    /// Get block timestamp (stub)
-    pub fn get_block_timestamp(&self, _height: u64) -> Option<u64> {
-        None // TODO: Implement block storage
+    /// Get block hash
+    pub fn get_block_hash(&self, height: u64) -> Option<[u8; 32]> {
+        self.block_metadata.get(&height).map(|m| m.hash)
     }
 
-    /// Get block transaction count (stub)
-    pub fn get_block_tx_count(&self, _height: u64) -> Option<u32> {
-        None // TODO: Implement block storage
+    /// Get block timestamp
+    pub fn get_block_timestamp(&self, height: u64) -> Option<u64> {
+        self.block_metadata.get(&height).map(|m| m.timestamp)
     }
 
-    /// Get block events (stub)
-    pub fn get_block_events(&self, _height: u64) -> Vec<serde_json::Value> {
-        Vec::new() // TODO: Implement event storage
+    /// Get block transaction count
+    pub fn get_block_tx_count(&self, height: u64) -> Option<u32> {
+        self.block_metadata.get(&height).map(|m| m.tx_count)
+    }
+
+    /// Get block events
+    pub fn get_block_events(&self, height: u64) -> Vec<serde_json::Value> {
+        self.block_metadata
+            .get(&height)
+            .map(|m| m.events.clone())
+            .unwrap_or_default()
+    }
+
+    /// Store block metadata
+    pub fn store_block_metadata(&mut self, height: u64, metadata: BlockMetadata) {
+        self.block_metadata.insert(height, metadata);
+        self.block_height = height;
+    }
+
+    // Fill and trade history methods
+
+    /// Record a fill for both maker and taker
+    pub fn record_fill(&mut self, fill: Fill) {
+        const MAX_FILLS_PER_USER: usize = 1000;
+        const MAX_TRADES_PER_MARKET: usize = 500;
+
+        // Record for maker
+        let maker_fills = self.account_fills.entry(fill.maker).or_insert_with(Vec::new);
+        maker_fills.push(fill.clone());
+        if maker_fills.len() > MAX_FILLS_PER_USER {
+            maker_fills.remove(0);
+        }
+
+        // Record for taker
+        let taker_fills = self.account_fills.entry(fill.taker).or_insert_with(Vec::new);
+        taker_fills.push(fill.clone());
+        if taker_fills.len() > MAX_FILLS_PER_USER {
+            taker_fills.remove(0);
+        }
+
+        // Record in recent trades
+        let trades = self.recent_trades.entry(fill.market_id).or_insert_with(Vec::new);
+        trades.push(fill);
+        if trades.len() > MAX_TRADES_PER_MARKET {
+            trades.remove(0);
+        }
+    }
+
+    /// Get fills for a user
+    pub fn get_user_fills(&self, address: AccountAddress, limit: Option<usize>) -> Vec<&Fill> {
+        self.account_fills
+            .get(&address)
+            .map(|fills| {
+                let limit = limit.unwrap_or(100).min(fills.len());
+                fills.iter().rev().take(limit).collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Get recent trades for a market
+    pub fn get_recent_trades(&self, market_id: MarketId, limit: Option<usize>) -> Vec<&Fill> {
+        self.recent_trades
+            .get(&market_id)
+            .map(|trades| {
+                let limit = limit.unwrap_or(50).min(trades.len());
+                trades.iter().rev().take(limit).collect()
+            })
+            .unwrap_or_default()
+    }
+
+    // Funding history methods
+
+    /// Record a funding payment
+    pub fn record_funding_payment(&mut self, payment: FundingPayment) {
+        const MAX_FUNDING_PER_USER: usize = 500;
+
+        let history = self.funding_history.entry(payment.account).or_insert_with(Vec::new);
+        history.push(payment);
+        if history.len() > MAX_FUNDING_PER_USER {
+            history.remove(0);
+        }
+    }
+
+    /// Record market funding rate
+    pub fn record_market_funding(&mut self, market_id: MarketId, timestamp: Timestamp, rate: SignedAmount) {
+        const MAX_FUNDING_PER_MARKET: usize = 1000;
+
+        let history = self.market_funding_history.entry(market_id).or_insert_with(Vec::new);
+        history.push((timestamp, rate));
+        if history.len() > MAX_FUNDING_PER_MARKET {
+            history.remove(0);
+        }
+    }
+
+    /// Get funding history for a user
+    pub fn get_user_funding_history(&self, address: AccountAddress, limit: Option<usize>) -> Vec<&FundingPayment> {
+        self.funding_history
+            .get(&address)
+            .map(|history| {
+                let limit = limit.unwrap_or(100).min(history.len());
+                history.iter().rev().take(limit).collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Get funding history for a market
+    pub fn get_market_funding_history(&self, market_id: MarketId, limit: Option<usize>) -> Vec<(Timestamp, SignedAmount)> {
+        self.market_funding_history
+            .get(&market_id)
+            .map(|history| {
+                let limit = limit.unwrap_or(100).min(history.len());
+                history.iter().rev().take(limit).cloned().collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Get all open orders for a user across all markets
+    pub fn get_all_user_orders(&self, address: AccountAddress) -> Vec<&Order> {
+        self.account_orders
+            .get(&address)
+            .map(|market_orders| {
+                market_orders
+                    .iter()
+                    .flat_map(|(market_id, order_ids)| {
+                        order_ids.iter().filter_map(|id| self.get_order(*market_id, *id))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Get list of all market IDs
+    pub fn get_market_ids(&self) -> Vec<MarketId> {
+        self.markets.keys().copied().collect()
+    }
+
+    // === Persistence helper methods ===
+
+    /// Get all positions across all accounts (for persistence)
+    pub fn get_all_positions_global(&self) -> &HashMap<AccountAddress, HashMap<MarketId, Position>> {
+        &self.positions
+    }
+
+    /// Get all leverage settings across all accounts (for persistence)
+    pub fn get_all_leverage_global(&self) -> &HashMap<AccountAddress, HashMap<MarketId, u8>> {
+        &self.leverage
+    }
+
+    /// Set a position directly (for state restore)
+    pub fn set_position(&mut self, address: AccountAddress, market_id: MarketId, position: Position) {
+        self.positions
+            .entry(address)
+            .or_default()
+            .insert(market_id, position);
+    }
+
+    /// Get next order ID without incrementing (for persistence)
+    pub fn peek_next_order_id(&self) -> OrderId {
+        self.next_order_id
+    }
+
+    /// Set next order ID (for state restore)
+    pub fn set_next_order_id(&mut self, id: OrderId) {
+        self.next_order_id = id;
+    }
+
+    /// Get insurance fund as Decimal (for persistence)
+    pub fn get_insurance_fund(&self) -> Decimal {
+        Decimal::from_raw(self.insurance_fund, Decimal::USDC_DECIMALS)
+    }
+
+    /// Set insurance fund (for state restore)
+    pub fn set_insurance_fund(&mut self, amount: Decimal) {
+        self.insurance_fund = amount.raw();
     }
 }
 

@@ -356,6 +356,99 @@ impl SpotEngineState {
             .filter_map(|id| self.get_order(market_id, *id).cloned())
             .collect()
     }
+
+    // === Persistence helper methods ===
+
+    /// Get all reserved balances (for persistence)
+    pub fn get_all_reserved(&self) -> &HashMap<(AccountAddress, TokenIndex), Decimal> {
+        &self.reserved
+    }
+
+    /// Get all orders for a market (for persistence)
+    pub fn get_all_orders(&self, market_id: SpotMarketId) -> Vec<&Order> {
+        self.orders
+            .get(&market_id)
+            .map(|orders| orders.values().collect())
+            .unwrap_or_default()
+    }
+
+    /// Get next token index without incrementing (for persistence)
+    pub fn next_token_index(&self) -> TokenIndex {
+        self.next_token_index
+    }
+
+    /// Get next market ID without incrementing (for persistence)
+    pub fn next_market_id(&self) -> SpotMarketId {
+        self.next_market_id
+    }
+
+    /// Get next order ID without incrementing (for persistence)
+    pub fn peek_next_order_id(&self) -> OrderId {
+        self.next_order_id
+    }
+
+    /// Set next token index (for state restore)
+    pub fn set_next_token_index(&mut self, index: TokenIndex) {
+        self.next_token_index = index;
+    }
+
+    /// Set next market ID (for state restore)
+    pub fn set_next_market_id(&mut self, id: SpotMarketId) {
+        self.next_market_id = id;
+    }
+
+    /// Set next order ID (for state restore)
+    pub fn set_next_order_id(&mut self, id: OrderId) {
+        self.next_order_id = id;
+    }
+
+    /// Set reserved balance (for state restore)
+    pub fn set_reserved(&mut self, account: AccountAddress, token: TokenIndex, amount: Decimal) {
+        if amount.is_zero() {
+            self.reserved.remove(&(account, token));
+        } else {
+            self.reserved.insert((account, token), amount);
+        }
+    }
+
+    /// Restore a token directly (for state restore)
+    pub fn restore_token(&mut self, token: SpotToken) {
+        self.tokens.insert(token.index, token);
+    }
+
+    /// Restore a market directly (for state restore)
+    pub fn restore_market(&mut self, config: SpotMarketConfig) {
+        let market_id = config.id;
+        let market = SpotMarket::new(config);
+        self.markets.insert(market_id, market);
+        self.orderbooks.entry(market_id).or_insert_with(OrderBook::new);
+        self.orders.entry(market_id).or_insert_with(HashMap::new);
+    }
+
+    /// Restore an order directly (for state restore)
+    pub fn restore_order(&mut self, market_id: SpotMarketId, order: Order) {
+        let order_id = order.id;
+        let owner = order.owner;
+
+        // Add to market orders
+        self.orders
+            .entry(market_id)
+            .or_insert_with(HashMap::new)
+            .insert(order_id, order.clone());
+
+        // Add to orderbook
+        if let Some(book) = self.orderbooks.get_mut(&market_id) {
+            book.restore_order(order);
+        }
+
+        // Add to account orders index
+        self.account_orders
+            .entry(owner)
+            .or_default()
+            .entry(market_id)
+            .or_default()
+            .push(order_id);
+    }
 }
 
 impl Default for SpotEngineState {

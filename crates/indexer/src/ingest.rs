@@ -2,15 +2,19 @@
 
 use std::sync::Arc;
 
+use chrono::{TimeZone, Utc};
 use hypercore_engine::EngineState;
+use hypercore_primitives::BlockEvent;
 use tokio::sync::RwLock;
 
+use crate::candles::CandleAggregator;
 use crate::db::Database;
 
 /// Block indexer
 pub struct Indexer {
     db: Database,
     engine: Arc<RwLock<EngineState>>,
+    candle_aggregator: CandleAggregator,
     current_height: i64,
 }
 
@@ -23,9 +27,13 @@ impl Indexer {
         // Get latest indexed height
         let current_height = db.get_latest_height().await?.unwrap_or(0);
 
+        // Create candle aggregator
+        let candle_aggregator = CandleAggregator::new(db.pool().clone());
+
         Ok(Self {
             db,
             engine,
+            candle_aggregator,
             current_height,
         })
     }
@@ -71,13 +79,38 @@ impl Indexer {
             tx_count,
         ).await?;
 
-        // Index transactions and events for this block
-        // TODO: Convert JSON events to BlockEvent structs
-        let _events = engine.get_block_events(height as u64);
+        // Get events for this block
+        let json_events = engine.get_block_events(height as u64);
         drop(engine);
 
+        // Process each event
+        let mut event_count = 0;
+        for json_event in json_events {
+            // Try to deserialize as BlockEvent
+            match serde_json::from_value::<BlockEvent>(json_event.clone()) {
+                Ok(event) => {
+                    if let Err(e) = self.process_event(&event).await {
+                        tracing::warn!("Failed to process event: {:?}", e);
+                    }
+                    event_count += 1;
+                }
+                Err(e) => {
+                    // Log but continue - some events may have different formats
+                    tracing::debug!(
+                        "Could not parse event as BlockEvent: {} - raw: {}",
+                        e,
+                        serde_json::to_string(&json_event).unwrap_or_default()
+                    );
+                }
+            }
+        }
+
         self.current_height = height;
-        tracing::debug!("Indexed block {}", height);
+        if event_count > 0 {
+            tracing::debug!("Indexed block {} with {} events", height, event_count);
+        } else {
+            tracing::debug!("Indexed block {}", height);
+        }
 
         Ok(())
     }
@@ -86,39 +119,55 @@ impl Indexer {
     async fn process_event(&self, event: &BlockEvent) -> Result<(), IndexerError> {
         match event {
             BlockEvent::Fill(fill) => {
+                // Insert fill into database
                 self.db.insert_fill(
                     fill.trade_id as i64,
                     fill.order_id as i64,
                     fill.account.as_slice(),
                     fill.market_id as i16,
-                    &fill.side.to_string(),
-                    &fill.price.to_string(),
-                    &fill.size.to_string(),
-                    &fill.fee.to_string(),
+                    &format!("{:?}", fill.side),
+                    &fill.price.to_string_trimmed(),
+                    &fill.size.to_string_trimmed(),
+                    &fill.fee.to_string_trimmed(),
                     fill.is_taker,
                     &fill.realized_pnl.to_string(),
                     fill.timestamp as i64,
                 ).await?;
+
+                // Update candles (only for taker fills to avoid double-counting)
+                if fill.is_taker {
+                    let timestamp = Utc.timestamp_millis_opt(fill.timestamp as i64)
+                        .single()
+                        .unwrap_or_else(Utc::now);
+                    if let Err(e) = self.candle_aggregator.update_from_fill(
+                        fill.market_id as i16,
+                        &fill.price.to_string_trimmed(),
+                        &fill.size.to_string_trimmed(),
+                        timestamp,
+                    ).await {
+                        tracing::warn!("Failed to update candles: {}", e);
+                    }
+                }
             }
             BlockEvent::OrderPlaced(order) => {
                 self.db.insert_order(
-                    order.id as i64,
-                    order.owner.as_slice(),
+                    order.order_id as i64,
+                    order.account.as_slice(),
                     order.market_id as i16,
-                    &order.side.to_string(),
-                    &order.price.to_string(),
-                    &order.size.to_string(),
+                    &format!("{:?}", order.side),
+                    &order.price.to_string_trimmed(),
+                    &order.size.to_string_trimmed(),
                     "0",
                     "open",
-                    &order.order_type.to_string(),
+                    if order.reduce_only { "reduce_only" } else { "limit" },
                     order.timestamp as i64,
                     order.client_order_id.as_deref(),
                 ).await?;
             }
-            BlockEvent::OrderCanceled { market_id, order_id } => {
+            BlockEvent::OrderCanceled(cancel) => {
                 // Update order status
                 sqlx::query("UPDATE orders SET status = 'canceled' WHERE id = $1")
-                    .bind(*order_id as i64)
+                    .bind(cancel.order_id as i64)
                     .execute(self.db.pool())
                     .await
                     .map_err(|e| IndexerError::DatabaseError(e.to_string()))?;
@@ -128,44 +177,54 @@ impl Indexer {
                     pos.account.as_slice(),
                     pos.market_id as i16,
                     &pos.size.to_string(),
-                    &pos.entry_price.to_string(),
-                    &pos.unrealized_pnl.to_string(),
+                    &pos.entry_notional.to_string_trimmed(),
+                    "0", // unrealized PnL calculated on query
                     pos.leverage as i16,
-                    pos.liquidation_price.as_ref().map(|p| p.to_string()).as_deref(),
+                    None, // liquidation price calculated on query
                 ).await?;
             }
-            BlockEvent::FundingApplied { market_id, rate, timestamp } => {
-                let engine = self.engine.read().await;
-                let state = engine.get_market_state(*market_id).cloned();
-                drop(engine);
-
-                if let Some(s) = state {
-                    self.db.insert_funding_rate(
-                        *market_id as i16,
-                        &rate.to_string(),
-                        &s.premium.to_string(),
-                        &s.mark_price.to_string(),
-                        &s.index_price.to_string(),
-                        *timestamp as i64,
-                    ).await?;
-                }
+            BlockEvent::FundingApplied(funding) => {
+                self.db.insert_funding_rate(
+                    funding.market_id as i16,
+                    &funding.funding_rate.to_string(),
+                    "0", // premium index not stored in event
+                    &funding.mark_price.to_string_trimmed(),
+                    &funding.index_price.to_string_trimmed(),
+                    funding.timestamp as i64,
+                ).await?;
             }
             BlockEvent::Liquidation(liq) => {
                 // Insert liquidation event
                 sqlx::query(
                     r#"
-                    INSERT INTO liquidations (account, market_id, size, price, timestamp)
-                    VALUES ($1, $2, $3, $4, to_timestamp($5))
+                    INSERT INTO liquidations (account, market_id, size, price, pnl, timestamp)
+                    VALUES ($1, $2, $3, $4, $5, to_timestamp($6))
                     "#,
                 )
                 .bind(liq.account.as_slice())
                 .bind(liq.market_id as i16)
                 .bind(&liq.size.to_string())
-                .bind(&liq.price.to_string())
+                .bind(&liq.price.to_string_trimmed())
+                .bind(&liq.pnl.to_string())
                 .bind(liq.timestamp as f64 / 1000.0)
                 .execute(self.db.pool())
                 .await
                 .map_err(|e| IndexerError::DatabaseError(e.to_string()))?;
+            }
+            BlockEvent::UsdTransfer(transfer) => {
+                // Log transfer but don't need to store in separate table
+                // Balances are tracked in accounts table
+                tracing::debug!(
+                    "USD transfer: {:?} -> {:?}: {}",
+                    transfer.from, transfer.to, transfer.amount.to_string_trimmed()
+                );
+            }
+            BlockEvent::LeverageUpdated(update) => {
+                // Log leverage update
+                tracing::debug!(
+                    "Leverage update: {:?} market {} -> {}x",
+                    update.account, update.market_id, update.leverage
+                );
             }
         }
 
@@ -176,65 +235,6 @@ impl Indexer {
     pub fn current_height(&self) -> i64 {
         self.current_height
     }
-}
-
-/// Block events from engine
-#[derive(Debug, Clone)]
-pub enum BlockEvent {
-    Fill(FillEvent),
-    OrderPlaced(OrderEvent),
-    OrderCanceled { market_id: u8, order_id: u64 },
-    PositionUpdated(PositionEvent),
-    FundingApplied { market_id: u8, rate: hypercore_primitives::Decimal, timestamp: u64 },
-    Liquidation(LiquidationEvent),
-}
-
-#[derive(Debug, Clone)]
-pub struct FillEvent {
-    pub trade_id: u64,
-    pub order_id: u64,
-    pub account: hypercore_primitives::AccountAddress,
-    pub market_id: u8,
-    pub side: hypercore_primitives::OrderSide,
-    pub price: hypercore_primitives::Decimal,
-    pub size: hypercore_primitives::Decimal,
-    pub fee: hypercore_primitives::Decimal,
-    pub is_taker: bool,
-    pub realized_pnl: hypercore_primitives::Decimal,
-    pub timestamp: u64,
-}
-
-#[derive(Debug, Clone)]
-pub struct OrderEvent {
-    pub id: u64,
-    pub owner: hypercore_primitives::AccountAddress,
-    pub market_id: u8,
-    pub side: hypercore_primitives::OrderSide,
-    pub price: hypercore_primitives::Decimal,
-    pub size: hypercore_primitives::Decimal,
-    pub order_type: hypercore_primitives::OrderType,
-    pub timestamp: u64,
-    pub client_order_id: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct PositionEvent {
-    pub account: hypercore_primitives::AccountAddress,
-    pub market_id: u8,
-    pub size: hypercore_primitives::Decimal,
-    pub entry_price: hypercore_primitives::Decimal,
-    pub unrealized_pnl: hypercore_primitives::Decimal,
-    pub leverage: u8,
-    pub liquidation_price: Option<hypercore_primitives::Decimal>,
-}
-
-#[derive(Debug, Clone)]
-pub struct LiquidationEvent {
-    pub account: hypercore_primitives::AccountAddress,
-    pub market_id: u8,
-    pub size: hypercore_primitives::Decimal,
-    pub price: hypercore_primitives::Decimal,
-    pub timestamp: u64,
 }
 
 /// Indexer errors

@@ -333,9 +333,19 @@ impl UnifiedState {
             .collect()
     }
 
+    /// Get all balances globally (for state commitment)
+    pub fn get_all_balances_global(&self) -> &HashMap<(AccountAddress, TokenIndex), UnifiedBalance> {
+        &self.balances
+    }
+
     /// Verify all balances satisfy the invariant
     pub fn verify_invariants(&self) -> bool {
         self.balances.values().all(|b| b.is_valid())
+    }
+
+    /// Get count of all balances (for metrics)
+    pub fn balance_count(&self) -> usize {
+        self.balances.len()
     }
 }
 

@@ -44,6 +44,28 @@ test-contracts-verbose:
 test-proptest:
 	cargo test --workspace -- --ignored proptest
 
+# Run ALL tests (Rust + Solidity + E2E) verbosely
+test-all:
+	@echo "=========================================="
+	@echo "  Running ALL Tests (Rust + Solidity + E2E)"
+	@echo "=========================================="
+	@echo ""
+	@echo ">>> [1/3] Rust Unit Tests (cargo test)"
+	@echo "------------------------------------------"
+	cargo test --workspace -- --nocapture
+	@echo ""
+	@echo ">>> [2/3] Solidity Contract Tests (forge test)"
+	@echo "------------------------------------------"
+	cd contracts && forge test -vvv
+	@echo ""
+	@echo ">>> [3/3] E2E Integration Tests"
+	@echo "------------------------------------------"
+	./scripts/e2e-test.sh --verbose
+	@echo ""
+	@echo "=========================================="
+	@echo "  ALL TESTS COMPLETE"
+	@echo "=========================================="
+
 # ============ Formatting & Linting ============
 
 fmt:
@@ -158,7 +180,8 @@ help:
 	@echo "  make build-contracts- Build Solidity contracts"
 	@echo ""
 	@echo "Test:"
-	@echo "  make test           - Run all tests"
+	@echo "  make test           - Run Rust unit tests"
+	@echo "  make test-all       - Run ALL tests (Rust + Solidity + E2E) verbosely"
 	@echo "  make test-engine    - Run engine tests"
 	@echo "  make test-contracts - Run contract tests"
 	@echo ""

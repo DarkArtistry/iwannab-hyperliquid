@@ -175,15 +175,75 @@ export class Signer {
 
   /**
    * Get the message object for signing
+   * Transforms the action to match EIP-712 type definitions
    */
   private getMessageForAction(
     action: Record<string, unknown>,
     nonce: number
   ): Record<string, unknown> {
+    const actionType = action.type as string;
+
+    // Transform order arrays to match EIP-712 types
+    if (actionType === 'order' && Array.isArray(action.orders)) {
+      return {
+        ...action,
+        orders: (action.orders as Array<Record<string, unknown>>).map(order =>
+          this.transformOrderForSigning(order)
+        ),
+        nonce: BigInt(nonce),
+      };
+    }
+
+    // Transform spot orders
+    if (actionType === 'spotOrder' && Array.isArray(action.orders)) {
+      return {
+        ...action,
+        orders: (action.orders as Array<Record<string, unknown>>).map(order =>
+          this.transformSpotOrderForSigning(order)
+        ),
+        nonce: BigInt(nonce),
+      };
+    }
+
     return {
       ...action,
       nonce: BigInt(nonce),
     };
+  }
+
+  /**
+   * Transform an order to match EIP-712 signing format
+   * Converts OrderTypeWire object to TIF string
+   */
+  private transformOrderForSigning(order: Record<string, unknown>): Record<string, unknown> {
+    const t = order.t as Record<string, unknown> | string;
+    let tifString = 'gtc';
+
+    if (typeof t === 'string') {
+      tifString = t;
+    } else if (t && typeof t === 'object') {
+      // Handle { limit: { tif: 'Gtc' } } format
+      if ('limit' in t && typeof t.limit === 'object' && t.limit !== null) {
+        const limit = t.limit as Record<string, unknown>;
+        tifString = (limit.tif as string) || 'gtc';
+      }
+      // Handle { trigger: ... } format
+      else if ('trigger' in t) {
+        tifString = 'trigger';
+      }
+    }
+
+    return {
+      ...order,
+      t: tifString.toLowerCase(),
+    };
+  }
+
+  /**
+   * Transform a spot order to match EIP-712 signing format
+   */
+  private transformSpotOrderForSigning(order: Record<string, unknown>): Record<string, unknown> {
+    return this.transformOrderForSigning(order);
   }
 
   /**

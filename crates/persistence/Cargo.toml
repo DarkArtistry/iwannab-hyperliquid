@@ -1,0 +1,42 @@
+[package]
+name = "hypercore-persistence"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "State persistence layer for HyperCore using RocksDB"
+
+[dependencies]
+# Internal
+hypercore-primitives = { workspace = true }
+
+# Storage
+rocksdb = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+
+# Crypto (for key hashing)
+sha2 = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Utilities
+hex = { workspace = true }
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.10"
+proptest = { workspace = true }
+
+[features]
+default = []

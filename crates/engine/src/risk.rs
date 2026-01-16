@@ -230,7 +230,7 @@ impl Default for RiskEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hypercore_primitives::MarketConfig;
+    use hypercore_primitives::{MarketConfig, OrderSide, OrderType, TimeInForce};
 
     fn setup() -> (RiskEngine, Market, AccountState) {
         let engine = RiskEngine::new();
@@ -348,5 +348,507 @@ mod tests {
         // Initial margin = 6500 / 10 = 650
         // Free = 10000 - 650 = 9350
         assert_eq!(free.to_string_trimmed(), "9350");
+    }
+
+    // =========================================================================
+    // NEW COMPREHENSIVE TESTS - Edge Cases and Real-World Scenarios
+    // =========================================================================
+
+    #[test]
+    fn test_equity_with_multiple_positions() {
+        let (engine, _, account) = setup();
+
+        // BTC market at 65000
+        let btc_market = Market::new(
+            MarketConfig::btc_perp(),
+            Decimal::price("65000"),
+            0,
+        );
+
+        // ETH market at 3500
+        let eth_market = Market::new(
+            MarketConfig::eth_perp(),
+            Decimal::price("3500"),
+            1,
+        );
+
+        // Long 1 BTC from 64000 -> +1000 profit
+        let mut btc_position = Position::new();
+        btc_position.apply_fill(Decimal::size("1.0"), Decimal::price("64000"), true);
+
+        // Short 10 ETH from 3400 -> -1000 loss (shorted at lower price)
+        let mut eth_position = Position::new();
+        eth_position.apply_fill(Decimal::size("10.0"), Decimal::price("3400"), false);
+        // Short from 3400, mark at 3500 -> -1000 loss
+
+        let positions = vec![
+            (btc_position, &btc_market),
+            (eth_position, &eth_market),
+        ];
+
+        let equity = engine.calculate_equity(&account, &positions);
+
+        // 10000 + 1000 (BTC profit) - 1000 (ETH loss) = 10000
+        assert_eq!(equity.to_string_trimmed(), "10000");
+    }
+
+    #[test]
+    fn test_zero_balance_account() {
+        let engine = RiskEngine::new();
+        let market = Market::new(
+            MarketConfig::btc_perp(),
+            Decimal::price("65000"),
+            0,
+        );
+
+        let account = AccountState {
+            balance: 0,
+            nonce: 0,
+            last_timestamp_nonce: 0,
+        };
+
+        // Empty position, zero balance
+        let positions: Vec<(Position, &Market)> = vec![];
+        let equity = engine.calculate_equity(&account, &positions);
+
+        assert_eq!(equity.to_string_trimmed(), "0");
+    }
+
+    #[test]
+    fn test_negative_equity_from_large_loss() {
+        let (engine, market, account) = setup();
+
+        let mut position = Position::new();
+        // Long 1 BTC at 80000, mark at 65000 -> -15000 loss
+        position.apply_fill(Decimal::size("1.0"), Decimal::price("80000"), true);
+
+        let positions = vec![(position, &market)];
+        let equity = engine.calculate_equity(&account, &positions);
+
+        // 10000 - 15000 = -5000
+        assert_eq!(equity.to_string_trimmed(), "-5000");
+        assert!(equity.is_negative());
+    }
+
+    #[test]
+    fn test_initial_margin_with_max_leverage() {
+        let (engine, market, _) = setup();
+
+        let mut position = Position::new();
+        position.apply_fill(Decimal::size("1.0"), Decimal::price("65000"), true);
+
+        // 50x leverage (max for BTC)
+        let positions = vec![(position, &market, 50u8)];
+        let margin = engine.calculate_initial_margin(&positions);
+
+        // 65000 notional / 50 leverage = 1300 margin
+        assert_eq!(margin.to_string_trimmed(), "1300");
+    }
+
+    #[test]
+    fn test_initial_margin_with_min_leverage() {
+        let (engine, market, _) = setup();
+
+        let mut position = Position::new();
+        position.apply_fill(Decimal::size("1.0"), Decimal::price("65000"), true);
+
+        // 1x leverage (no leverage)
+        let positions = vec![(position, &market, 1u8)];
+        let margin = engine.calculate_initial_margin(&positions);
+
+        // 65000 notional / 1 leverage = 65000 margin (full notional)
+        assert_eq!(margin.to_string_trimmed(), "65000");
+    }
+
+    #[test]
+    fn test_liquidatable_with_exact_maintenance_margin() {
+        let (engine, market, mut account) = setup();
+
+        let mut position = Position::new();
+        position.apply_fill(Decimal::size("1.0"), Decimal::price("65000"), true);
+
+        // Maintenance margin = 65000 * 0.025 = 1625
+        // Set balance exactly at maintenance margin
+        account.balance = 1625_000000;
+
+        // Equity equals maintenance -> liquidatable (equity <= maintenance)
+        assert!(engine.is_liquidatable(&account, &position, &market));
+    }
+
+    #[test]
+    fn test_liquidatable_slightly_above_maintenance() {
+        let (engine, market, mut account) = setup();
+
+        let mut position = Position::new();
+        position.apply_fill(Decimal::size("1.0"), Decimal::price("65000"), true);
+
+        // Maintenance margin = 1625, set balance slightly above
+        account.balance = 1626_000000;
+
+        // Equity > maintenance -> not liquidatable
+        assert!(!engine.is_liquidatable(&account, &position, &market));
+    }
+
+    #[test]
+    fn test_empty_position_not_liquidatable() {
+        let (engine, market, account) = setup();
+
+        let empty_position = Position::new();
+
+        // Empty position should never be liquidatable
+        assert!(!engine.is_liquidatable(&account, &empty_position, &market));
+    }
+
+    #[test]
+    fn test_free_collateral_with_no_position() {
+        let (engine, market, account) = setup();
+
+        let positions: Vec<(Position, &Market, u8)> = vec![];
+        let free = engine.calculate_free_collateral(&account, &positions);
+
+        // No positions = all balance is free
+        assert_eq!(free.to_string_trimmed(), "10000");
+    }
+
+    #[test]
+    fn test_free_collateral_fully_utilized() {
+        let engine = RiskEngine::new();
+        let market = Market::new(
+            MarketConfig::btc_perp(),
+            Decimal::price("65000"),
+            0,
+        );
+
+        // Account with exactly $6500 (enough for 1 BTC at 10x)
+        let account = AccountState {
+            balance: 6500_000000,
+            nonce: 0,
+            last_timestamp_nonce: 0,
+        };
+
+        let mut position = Position::new();
+        position.apply_fill(Decimal::size("1.0"), Decimal::price("65000"), true);
+
+        let positions = vec![(position, &market, 10u8)];
+        let free = engine.calculate_free_collateral(&account, &positions);
+
+        // Equity = 6500, margin = 6500, free = 0
+        assert_eq!(free.to_string_trimmed(), "0");
+    }
+
+    #[test]
+    fn test_free_collateral_negative() {
+        let engine = RiskEngine::new();
+        let market = Market::new(
+            MarketConfig::btc_perp(),
+            Decimal::price("65000"),
+            0,
+        );
+
+        // Account with only $5000
+        let account = AccountState {
+            balance: 5000_000000,
+            nonce: 0,
+            last_timestamp_nonce: 0,
+        };
+
+        let mut position = Position::new();
+        position.apply_fill(Decimal::size("1.0"), Decimal::price("65000"), true);
+
+        let positions = vec![(position, &market, 10u8)];
+        let free = engine.calculate_free_collateral(&account, &positions);
+
+        // Equity = 5000, margin = 6500, free = -1500
+        assert_eq!(free.to_string_trimmed(), "-1500");
+        assert!(free.is_negative());
+    }
+
+    #[test]
+    fn test_margin_summary_comprehensive() {
+        let (engine, market, account) = setup();
+
+        let mut position = Position::new();
+        // Long 0.5 BTC at 64000, mark at 65000 -> +500 profit
+        position.apply_fill(Decimal::size("0.5"), Decimal::price("64000"), true);
+
+        let positions = vec![(position.clone(), &market, 10u8)];
+        let summary = engine.calculate_margin_summary(&account, &positions);
+
+        // Account value = balance + unrealized PnL = 10000 + 500 = 10500
+        let account_value = Decimal::from_raw(summary.account_value, Decimal::USDC_DECIMALS);
+        assert_eq!(account_value.to_string_trimmed(), "10500");
+
+        // Position value = 0.5 * 65000 = 32500
+        let position_value = Decimal::from_raw(summary.total_position_value as i128, Decimal::USDC_DECIMALS);
+        assert_eq!(position_value.to_string_trimmed(), "32500");
+
+        // Initial margin = 32500 / 10 = 3250
+        let init_margin = Decimal::from_raw(summary.total_initial_margin as i128, Decimal::USDC_DECIMALS);
+        assert_eq!(init_margin.to_string_trimmed(), "3250");
+
+        // Maintenance margin = 32500 * 0.025 = 812.5
+        let maint_margin = Decimal::from_raw(summary.total_maintenance_margin as i128, Decimal::USDC_DECIMALS);
+        assert!((maint_margin.to_f64() - 812.5).abs() < 1.0);
+    }
+
+    #[test]
+    fn test_margin_ratio_healthy() {
+        let (engine, market, account) = setup();
+
+        let mut position = Position::new();
+        position.apply_fill(Decimal::size("0.1"), Decimal::price("65000"), true);
+
+        let positions = vec![(position, &market)];
+        let ratio = engine.margin_ratio(&account, &positions);
+
+        assert!(ratio.is_some());
+        // Equity = 10000, maintenance = 162.5, ratio = ~61.5x
+        let r = ratio.unwrap();
+        assert!(r.to_f64() > 50.0);
+    }
+
+    #[test]
+    fn test_margin_ratio_near_liquidation() {
+        let engine = RiskEngine::new();
+        let market = Market::new(
+            MarketConfig::btc_perp(),
+            Decimal::price("65000"),
+            0,
+        );
+
+        // Very low balance
+        let account = AccountState {
+            balance: 2000_000000,
+            nonce: 0,
+            last_timestamp_nonce: 0,
+        };
+
+        let mut position = Position::new();
+        position.apply_fill(Decimal::size("1.0"), Decimal::price("65000"), true);
+
+        let positions = vec![(position, &market)];
+        let ratio = engine.margin_ratio(&account, &positions);
+
+        assert!(ratio.is_some());
+        // Equity = 2000, maintenance = 1625, ratio = ~1.23x
+        let r = ratio.unwrap();
+        assert!(r.to_f64() > 1.0 && r.to_f64() < 2.0);
+    }
+
+    #[test]
+    fn test_margin_ratio_no_position() {
+        let (engine, _, account) = setup();
+
+        let positions: Vec<(Position, &Market)> = vec![];
+        let ratio = engine.margin_ratio(&account, &positions);
+
+        // No positions = zero maintenance margin = None (division by zero)
+        assert!(ratio.is_none());
+    }
+
+    #[test]
+    fn test_check_order_margin_sufficient() {
+        let (engine, market, account) = setup();
+
+        let empty_position = Position::new();
+        let request = OrderRequest {
+            market_id: 0,
+            size: Decimal::size("0.1"),
+            price: Decimal::price("65000"),
+            side: OrderSide::Buy,
+            order_type: OrderType::Limit { tif: TimeInForce::Gtc },
+            reduce_only: false,
+            client_order_id: None,
+        };
+
+        // 10x leverage: notional 6500, margin needed = 650
+        // Account has 10000, plenty of margin
+        let result = engine.check_order_margin(&request, &account, &empty_position, &market, 10);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_check_order_margin_insufficient() {
+        let engine = RiskEngine::new();
+        let market = Market::new(
+            MarketConfig::btc_perp(),
+            Decimal::price("65000"),
+            0,
+        );
+
+        // Very low balance
+        let account = AccountState {
+            balance: 100_000000, // Only $100
+            nonce: 0,
+            last_timestamp_nonce: 0,
+        };
+
+        let empty_position = Position::new();
+        let request = OrderRequest {
+            market_id: 0,
+            size: Decimal::size("1.0"),
+            price: Decimal::price("65000"),
+            side: OrderSide::Buy,
+            order_type: OrderType::Limit { tif: TimeInForce::Gtc },
+            reduce_only: false,
+            client_order_id: None,
+        };
+
+        // 10x leverage: notional 65000, margin needed = 6500
+        // Account has only 100
+        let result = engine.check_order_margin(&request, &account, &empty_position, &market, 10);
+        assert!(result.is_err());
+
+        match result {
+            Err(Error::InsufficientMargin { required, available }) => {
+                assert!(required.parse::<f64>().unwrap() > 0.0);
+                assert!(available.parse::<f64>().unwrap() < required.parse::<f64>().unwrap());
+            }
+            _ => panic!("Expected InsufficientMargin error"),
+        }
+    }
+
+    #[test]
+    fn test_check_leverage_change_safe() {
+        let (engine, market, account) = setup();
+
+        let mut position = Position::new();
+        position.apply_fill(Decimal::size("0.1"), Decimal::price("65000"), true);
+
+        // Current at 10x, change to 20x (requires less margin)
+        let result = engine.check_leverage_change(&account, &position, &market, 20);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_check_leverage_change_would_liquidate() {
+        let engine = RiskEngine::new();
+        let market = Market::new(
+            MarketConfig::btc_perp(),
+            Decimal::price("65000"),
+            0,
+        );
+
+        // Low balance account
+        let account = AccountState {
+            balance: 5000_000000, // $5000
+            nonce: 0,
+            last_timestamp_nonce: 0,
+        };
+
+        let mut position = Position::new();
+        position.apply_fill(Decimal::size("1.0"), Decimal::price("65000"), true);
+        // Notional = 65000
+
+        // Trying to lower leverage from 20x to 5x would require more margin
+        // At 5x: margin = 65000/5 = 13000 > 5000 balance
+        let result = engine.check_leverage_change(&account, &position, &market, 5);
+        assert!(result.is_err());
+
+        match result {
+            Err(Error::LeverageWouldCauseLiquidation) => {}
+            _ => panic!("Expected LeverageWouldCauseLiquidation error"),
+        }
+    }
+
+    #[test]
+    fn test_short_position_pnl_calculation() {
+        let (engine, market, account) = setup();
+
+        let mut position = Position::new();
+        // Short 1 BTC at 66000, mark at 65000 -> +1000 profit
+        position.apply_fill(Decimal::size("1.0"), Decimal::price("66000"), false);
+
+        let positions = vec![(position, &market)];
+        let equity = engine.calculate_equity(&account, &positions);
+
+        // 10000 + 1000 profit = 11000
+        assert_eq!(equity.to_string_trimmed(), "11000");
+    }
+
+    #[test]
+    fn test_short_position_loss() {
+        let (engine, market, account) = setup();
+
+        let mut position = Position::new();
+        // Short 1 BTC at 64000, mark at 65000 -> -1000 loss
+        position.apply_fill(Decimal::size("1.0"), Decimal::price("64000"), false);
+
+        let positions = vec![(position, &market)];
+        let equity = engine.calculate_equity(&account, &positions);
+
+        // 10000 - 1000 loss = 9000
+        assert_eq!(equity.to_string_trimmed(), "9000");
+    }
+
+    #[test]
+    fn test_high_leverage_margin_requirements() {
+        let (engine, market, _) = setup();
+
+        let mut position = Position::new();
+        position.apply_fill(Decimal::size("1.0"), Decimal::price("65000"), true);
+
+        // Compare margin requirements at different leverages
+        let margin_1x = engine.calculate_initial_margin(&vec![(position.clone(), &market, 1u8)]);
+        let margin_10x = engine.calculate_initial_margin(&vec![(position.clone(), &market, 10u8)]);
+        let margin_50x = engine.calculate_initial_margin(&vec![(position.clone(), &market, 50u8)]);
+
+        // Higher leverage = lower margin requirement
+        assert!(margin_1x > margin_10x);
+        assert!(margin_10x > margin_50x);
+
+        // Verify ratios
+        let ratio_10x = margin_1x.to_f64() / margin_10x.to_f64();
+        let ratio_50x = margin_1x.to_f64() / margin_50x.to_f64();
+
+        assert!((ratio_10x - 10.0).abs() < 0.1);
+        assert!((ratio_50x - 50.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_withdrawable_amount() {
+        let (engine, market, account) = setup();
+
+        let mut position = Position::new();
+        position.apply_fill(Decimal::size("0.1"), Decimal::price("65000"), true);
+
+        let positions = vec![(position, &market, 10u8)];
+        let summary = engine.calculate_margin_summary(&account, &positions);
+
+        let withdrawable = Decimal::from_raw(summary.withdrawable as i128, Decimal::USDC_DECIMALS);
+        let free_collateral = Decimal::from_raw(summary.free_collateral, Decimal::USDC_DECIMALS);
+
+        // Withdrawable should be positive and <= free collateral
+        assert!(withdrawable.is_positive() || withdrawable.is_zero());
+        assert!(withdrawable <= free_collateral);
+    }
+
+    #[test]
+    fn test_withdrawable_with_negative_free_collateral() {
+        let engine = RiskEngine::new();
+        let market = Market::new(
+            MarketConfig::btc_perp(),
+            Decimal::price("65000"),
+            0,
+        );
+
+        // Low balance leading to negative free collateral
+        let account = AccountState {
+            balance: 5000_000000, // $5000
+            nonce: 0,
+            last_timestamp_nonce: 0,
+        };
+
+        let mut position = Position::new();
+        position.apply_fill(Decimal::size("1.0"), Decimal::price("65000"), true);
+        // Margin at 10x = 6500 > 5000 balance
+
+        let positions = vec![(position, &market, 10u8)];
+        let summary = engine.calculate_margin_summary(&account, &positions);
+
+        let withdrawable = Decimal::from_raw(summary.withdrawable as i128, Decimal::USDC_DECIMALS);
+
+        // Negative free collateral = zero withdrawable
+        assert_eq!(withdrawable.to_string_trimmed(), "0");
     }
 }

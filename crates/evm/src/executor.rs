@@ -25,6 +25,13 @@ pub const CORE_WRITER_ADDRESS: Address = Address::new([
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10, 0x00,
 ]);
 
+/// Fee collector address - receives gas fees from EVM transactions
+/// This is a system address that accumulates gas fees.
+/// In production, fees could be redistributed to validators or burned.
+pub const FEE_COLLECTOR_ADDRESS: Address = Address::new([
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFE, 0xE1,
+]);
+
 /// EVM transaction
 #[derive(Debug, Clone)]
 pub struct EvmTransaction {
@@ -62,6 +69,8 @@ pub enum EvmExecutorError {
     Reverted(String),
     #[error("Out of gas")]
     OutOfGas,
+    #[error("Insufficient balance for gas: need {required}, have {available}")]
+    InsufficientGasBalance { required: String, available: String },
     #[error("Invalid transaction: {0}")]
     InvalidTransaction(String),
     #[error("Internal error: {0}")]
@@ -203,6 +212,10 @@ pub struct EvmExecutor {
     block_number: u64,
     /// Current block timestamp
     block_timestamp: u64,
+    /// Whether to enforce gas fees (Phase 3B)
+    /// When true, transactions require sufficient evm_view balance for gas
+    /// When false, gas fees are not charged (development mode)
+    enforce_gas_fees: bool,
 }
 
 impl EvmExecutor {
@@ -221,6 +234,7 @@ impl EvmExecutor {
             block_gas_limit: 30_000_000,
             block_number: 1,
             block_timestamp: now,
+            enforce_gas_fees: false, // Disabled by default for backward compatibility
         }
     }
 
@@ -245,7 +259,26 @@ impl EvmExecutor {
             block_gas_limit: 30_000_000,
             block_number: 1,
             block_timestamp: now,
+            enforce_gas_fees: false, // Disabled by default for backward compatibility
         }
+    }
+
+    /// Enable or disable gas fee enforcement (Phase 3B)
+    ///
+    /// When enabled:
+    /// - Pre-flight check: sender must have evm_view >= gas_limit * gas_price + value
+    /// - Post-execution: gas_used * gas_price is deducted from sender and credited to fee collector
+    ///
+    /// When disabled (default):
+    /// - No gas balance checks
+    /// - No gas fee deductions
+    pub fn set_enforce_gas_fees(&mut self, enforce: bool) {
+        self.enforce_gas_fees = enforce;
+    }
+
+    /// Check if gas fee enforcement is enabled
+    pub fn is_gas_fees_enforced(&self) -> bool {
+        self.enforce_gas_fees
     }
 
     /// Execute a transaction
@@ -263,8 +296,33 @@ impl EvmExecutor {
     }
 
     /// Internal transaction execution
+    ///
+    /// Phase 3B: When `enforce_gas_fees` is true and `commit_state` is true:
+    /// - Pre-flight check: sender must have evm_view >= gas_limit * gas_price + value
+    /// - Post-execution: gas_used * gas_price is deducted from sender's evm_view
+    /// - Gas fees are credited to the fee collector
     fn execute_tx_inner(&mut self, tx: &EvmTransaction, commit_state: bool) -> Result<EvmExecutionResult, EvmExecutorError> {
-        debug!("Executing tx from {:?} to {:?} (commit={})", tx.from, tx.to, commit_state);
+        debug!("Executing tx from {:?} to {:?} (commit={}, enforce_gas={})",
+               tx.from, tx.to, commit_state, self.enforce_gas_fees);
+
+        // Phase 3B: Pre-flight gas balance check
+        // Only for actual transactions (commit_state=true) when gas fees are enforced
+        let max_gas_cost = if self.enforce_gas_fees && commit_state {
+            let max_cost = U256::from(tx.gas_limit) * U256::from(tx.gas_price);
+            let total_required = max_cost + tx.value;
+            let sender_balance = self.db.state.get_balance(&tx.from);
+
+            if sender_balance < total_required {
+                return Err(EvmExecutorError::InsufficientGasBalance {
+                    required: format!("{}", total_required),
+                    available: format!("{}", sender_balance),
+                });
+            }
+            debug!("Gas pre-flight passed: required={}, balance={}", total_required, sender_balance);
+            Some(max_cost)
+        } else {
+            None
+        };
 
         // Debug: Log if we're calling a contract and whether it has code
         if let Some(to) = tx.to {
@@ -280,7 +338,12 @@ impl EvmExecutor {
         // Check if this is a precompile call
         if let Some(to) = tx.to {
             if HyperCorePrecompiles::is_precompile(&to) {
-                return self.execute_precompile(tx, to);
+                let result = self.execute_precompile(tx, to)?;
+                // Apply gas fees for precompile calls too
+                if let Some(_max_cost) = max_gas_cost {
+                    self.apply_gas_fee(tx.from, result.gas_used, tx.gas_price);
+                }
+                return Ok(result);
             }
         }
 
@@ -291,12 +354,12 @@ impl EvmExecutor {
         env.cfg = CfgEnv::default();
         env.cfg.chain_id = self.chain_id;
 
-        // Block environment
+        // Block environment - set coinbase to fee collector
         env.block = BlockEnv {
             number: U256::from(self.block_number),
             timestamp: U256::from(self.block_timestamp),
             gas_limit: U256::from(self.block_gas_limit),
-            coinbase: Address::ZERO,
+            coinbase: FEE_COLLECTOR_ADDRESS, // Gas fees go to fee collector
             basefee: U256::from(1_000_000_000u64), // 1 gwei
             difficulty: U256::ZERO,
             prevrandao: Some(B256::ZERO),
@@ -327,14 +390,18 @@ impl EvmExecutor {
         };
 
         // Ensure sender account exists with sufficient balance
+        // Phase 3B: Only auto-create account if gas fees NOT enforced (development mode)
         if self.db.state.get_account(&tx.from).is_none() {
-            // Create account with some balance for testing
-            self.db.state.set_balance(tx.from, U256::from(10u64).pow(U256::from(20)));
+            if !self.enforce_gas_fees {
+                // Development mode: auto-create account with balance for testing
+                self.db.state.set_balance(tx.from, U256::from(10u64).pow(U256::from(20)));
+            }
+            // Production mode with gas fees: account must already exist with balance
         }
 
         // Execute transaction using EVM and capture results before dropping
         // Use transact_preverified to skip pre-execution validation checks (nonce, balance, etc.)
-        // This allows for more flexible execution, similar to eth_call behavior
+        // Our own gas balance check above handles the important case
         let (execution_result, state_changes) = {
             let mut evm = Evm::builder()
                 .with_db(&mut self.db)
@@ -358,6 +425,12 @@ impl EvmExecutor {
             Ok(result) => match result.clone() {
                 ExecutionResult::Success { output, gas_used, logs, .. } => {
                     debug!("Execution success: gas_used={}, output={} bytes", gas_used, output.data().len());
+
+                    // Phase 3B: Apply gas fees for successful transactions
+                    if max_gas_cost.is_some() {
+                        self.apply_gas_fee(tx.from, gas_used, tx.gas_price);
+                    }
+
                     let (output_data, contract_address) = match output {
                         Output::Call(data) => (data, None),
                         Output::Create(data, addr) => (data, addr),
@@ -377,6 +450,12 @@ impl EvmExecutor {
                 }
                 ExecutionResult::Revert { gas_used, output } => {
                     debug!("Execution reverted: gas_used={}, output=0x{}", gas_used, hex::encode(&output));
+
+                    // Phase 3B: Still charge gas for reverted transactions
+                    if max_gas_cost.is_some() {
+                        self.apply_gas_fee(tx.from, gas_used, tx.gas_price);
+                    }
+
                     Ok(EvmExecutionResult {
                         success: false,
                         gas_used,
@@ -387,11 +466,42 @@ impl EvmExecutor {
                 }
                 ExecutionResult::Halt { reason, gas_used } => {
                     debug!("Execution halted: reason={:?}, gas_used={}", reason, gas_used);
+
+                    // Phase 3B: Charge gas for halted transactions (up to gas_used)
+                    if max_gas_cost.is_some() {
+                        self.apply_gas_fee(tx.from, gas_used, tx.gas_price);
+                    }
+
                     Err(EvmExecutorError::Internal(format!("Execution halted: {:?}", reason)))
                 }
             },
             Err(e) => Err(e),
         }
+    }
+
+    /// Apply gas fee - deduct from sender, credit to fee collector
+    ///
+    /// Phase 3B: This implements the gas fee settlement after transaction execution.
+    /// Gas fee = gas_used * gas_price
+    fn apply_gas_fee(&mut self, sender: Address, gas_used: u64, gas_price: u64) {
+        let gas_fee = U256::from(gas_used) * U256::from(gas_price);
+
+        if gas_fee.is_zero() {
+            return;
+        }
+
+        // Debit from sender
+        let debit_success = self.db.inner_mut().sub_balance(sender, gas_fee);
+        if !debit_success {
+            // This shouldn't happen if pre-flight check passed, but log it
+            debug!("Warning: Failed to debit gas fee {} from {:?}", gas_fee, sender);
+            return;
+        }
+
+        // Credit to fee collector
+        self.db.inner_mut().add_balance(FEE_COLLECTOR_ADDRESS, gas_fee);
+
+        debug!("Gas fee applied: {} from {:?} to fee collector", gas_fee, sender);
     }
 
     /// Execute a precompile call directly

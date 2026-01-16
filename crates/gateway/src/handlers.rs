@@ -1,4 +1,7 @@
 //! API handlers for HTTP endpoints
+//!
+//! Phase 2B: Handlers now route perp transactions through the ABCI layer
+//! for proper consensus and state management.
 
 use axum::{
     extract::State,
@@ -10,9 +13,10 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use hypercore_chain::HyperCoreApp;
 use hypercore_engine::{EngineState, SpotEngine};
 use hypercore_primitives::{
-    AccountAddress, Decimal, OrderRequest, OrderSide, OrderType, TimeInForce,
+    AccountAddress, Decimal, OrderRequest, OrderSide, OrderType, Signature, TimeInForce,
 };
 use tokio::sync::RwLock;
 
@@ -38,7 +42,7 @@ pub async fn handle_exchange(
     State(state): State<AppState>,
     Json(request): Json<ExchangeRequest>,
 ) -> impl IntoResponse {
-    match process_exchange_request(&state.engine, &state.spot_engine, request).await {
+    match process_exchange_request(&state.engine, &state.spot_engine, &state.app, request).await {
         Ok(response) => (StatusCode::OK, Json(response)),
         Err(e) => (
             StatusCode::BAD_REQUEST,
@@ -154,39 +158,81 @@ async fn process_info_request(
         }
 
         InfoRequest::OpenOrders { user } => {
-            let _address = parse_address(&user)?;
-            // TODO: Implement open orders query
-            Ok(json!([]))
+            let address = parse_address(&user)?;
+            let orders = engine.get_all_user_orders(address);
+            let order_json: Vec<Value> = orders.iter().map(|o| json!({
+                "coin": coin_name_from_market_id(o.market_id),
+                "oid": o.id,
+                "side": if o.side == hypercore_primitives::OrderSide::Buy { "B" } else { "A" },
+                "limitPx": o.price.to_string_trimmed(),
+                "sz": o.remaining_size.to_string_trimmed(),
+                "origSz": o.original_size.to_string_trimmed(),
+                "timestamp": o.timestamp,
+                "cloid": o.client_order_id.clone(),
+            })).collect();
+            Ok(json!(order_json))
         }
 
         InfoRequest::UserFills { user, .. } => {
-            let _address = parse_address(&user)?;
-            // TODO: Implement user fills query
-            Ok(json!([]))
+            let address = parse_address(&user)?;
+            let fills = engine.get_user_fills(address, Some(100));
+            let fills_json: Vec<Value> = fills.iter().map(|f| json!({
+                "coin": coin_name_from_market_id(f.market_id),
+                "px": Decimal::from_raw(f.price as i128, 8).to_string_trimmed(),
+                "sz": Decimal::from_raw(f.size as i128, 6).to_string_trimmed(),
+                "side": if f.is_taker_buy { "B" } else { "A" },
+                "time": f.timestamp,
+                "fee": Decimal::from_raw(f.taker_fee as i128, 6).to_string_trimmed(),
+                "oid": f.taker_order_id,
+            })).collect();
+            Ok(json!(fills_json))
         }
 
         InfoRequest::UserFundingHistory { user, .. } => {
-            let _address = parse_address(&user)?;
-            // TODO: Implement user funding query
-            Ok(json!([]))
+            let address = parse_address(&user)?;
+            let history = engine.get_user_funding_history(address, Some(100));
+            let history_json: Vec<Value> = history.iter().map(|f| json!({
+                "coin": coin_name_from_market_id(f.market_id),
+                "fundingRate": Decimal::from_raw(f.funding_rate, 8).to_string_trimmed(),
+                "szi": Decimal::from_raw(f.position_size, 6).to_string_trimmed(),
+                "usdc": Decimal::from_raw(f.payment, 6).to_string_trimmed(),
+                "time": f.timestamp,
+            })).collect();
+            Ok(json!(history_json))
         }
 
         InfoRequest::FundingHistory { coin, .. } => {
-            let _coin = coin;
-            // TODO: Implement funding history query
-            Ok(json!([]))
+            let market_id = market_id_from_coin(&coin);
+            let history = engine.get_market_funding_history(market_id, Some(100));
+            let history_json: Vec<Value> = history.iter().map(|(ts, rate)| json!({
+                "coin": coin,
+                "fundingRate": Decimal::from_raw(*rate, 8).to_string_trimmed(),
+                "time": ts,
+            })).collect();
+            Ok(json!(history_json))
         }
 
         InfoRequest::RecentTrades { coin, .. } => {
-            let _coin = coin;
-            // TODO: Implement recent trades query
-            Ok(json!([]))
+            let market_id = market_id_from_coin(&coin);
+            let trades = engine.get_recent_trades(market_id, Some(50));
+            let trades_json: Vec<Value> = trades.iter().map(|t| json!({
+                "coin": coin,
+                "side": if t.is_taker_buy { "B" } else { "A" },
+                "px": Decimal::from_raw(t.price as i128, 8).to_string_trimmed(),
+                "sz": Decimal::from_raw(t.size as i128, 6).to_string_trimmed(),
+                "time": t.timestamp,
+                "tid": t.taker_order_id,
+            })).collect();
+            Ok(json!(trades_json))
         }
 
         InfoRequest::CandleSnapshot { coin, interval, .. } => {
-            let _coin = coin;
+            // Candles require aggregation from trades - return empty for now
+            // A proper implementation would aggregate recent trades into OHLCV buckets
+            let _market_id = market_id_from_coin(&coin);
             let _interval = interval;
-            // TODO: Implement candles query
+            // Candle aggregation is complex and typically done by a separate indexer
+            // For now, return empty array - real implementation would query indexed data
             Ok(json!([]))
         }
 
@@ -403,12 +449,16 @@ async fn process_spot_info_request(
 }
 
 /// Process an exchange request
+///
+/// Phase 2B: Perp transactions are now routed through the ABCI app layer
+/// for proper transaction processing with state commitment.
 async fn process_exchange_request(
-    engine: &Arc<RwLock<EngineState>>,
+    _engine: &Arc<RwLock<EngineState>>,
     spot_engine: &Arc<RwLock<SpotEngine>>,
+    app: &Arc<RwLock<HyperCoreApp>>,
     request: ExchangeRequest,
 ) -> Result<Value, HandlerError> {
-    // Verify signature (stub - in production, implement proper EIP-712 verification)
+    // Verify signature and extract sender address
     let sender = verify_signature(&request)?;
 
     // Handle spot-specific actions and view transfers
@@ -422,159 +472,149 @@ async fn process_exchange_request(
         _ => {}
     }
 
-    let mut engine = engine.write().await;
+    // Route perp transactions through ABCI app layer
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
 
-    match request.action {
-        ExchangeAction::Order { orders, grouping: _ } => {
-            let mut results = Vec::new();
+    // Execute all perp transactions through ABCI app layer (no fallback)
+    execute_perp_action_via_app(app, sender, &request, timestamp).await
+}
 
-            for order_wire in orders {
-                // Parse order - a is already the market_id
-                let market_id = order_wire.a;
+/// Execute perp action through the ABCI app layer
+async fn execute_perp_action_via_app(
+    app: &Arc<RwLock<HyperCoreApp>>,
+    sender: AccountAddress,
+    request: &ExchangeRequest,
+    timestamp: u64,
+) -> Result<Value, HandlerError> {
+    use hypercore_chain::tx::{Transaction, TransactionType, OrderWire, CancelWire, CancelByCloidWire};
+    use alloy_primitives::B256;
 
-                // Verify market exists
-                if !engine.has_market(market_id) {
-                    return Err(HandlerError::MarketNotFound(market_id.to_string()));
-                }
-
-                let price = Decimal::from_str(&order_wire.p)
-                    .map_err(|_| HandlerError::InvalidParameter("price".to_string()))?;
-                let size = Decimal::from_str(&order_wire.s)
-                    .map_err(|_| HandlerError::InvalidParameter("size".to_string()))?;
-
-                // TODO: Create and execute order through engine
-                results.push(json!({
-                    "status": "pending",
-                    "market": order_wire.a,
-                    "price": price.to_string_trimmed(),
-                    "size": size.to_string_trimmed(),
-                }));
-            }
-
-            Ok(json!({
-                "status": "ok",
-                "response": {
-                    "type": "order",
-                    "data": {
-                        "statuses": results
-                    }
-                }
-            }))
+    // Convert ExchangeAction to TransactionType
+    let tx_type = match &request.action {
+        ExchangeAction::Order { orders, grouping } => {
+            let order_wires: Vec<OrderWire> = orders.iter().map(|o| OrderWire {
+                a: o.a,
+                b: o.b,
+                p: o.p.clone(),
+                s: o.s.clone(),
+                r: o.r,
+                t: convert_order_type_wire(&o.t),
+                c: o.c.clone(),
+            }).collect();
+            // Convert grouping string to OrderGrouping enum
+            let order_grouping = match grouping.to_lowercase().as_str() {
+                "normalTpsl" | "normaltpsl" => hypercore_chain::tx::OrderGrouping::NormalTpsl,
+                "positionTpsl" | "positiontpsl" => hypercore_chain::tx::OrderGrouping::PositionTpsl,
+                _ => hypercore_chain::tx::OrderGrouping::Na,
+            };
+            TransactionType::Order { orders: order_wires, grouping: order_grouping }
         }
-
         ExchangeAction::Cancel { cancels } => {
-            let mut results = Vec::new();
-
-            for cancel in cancels {
-                // TODO: Cancel order through engine
-                results.push(json!({
-                    "status": "pending",
-                    "oid": cancel.o,
-                    "market": cancel.a,
-                }));
-            }
-
-            Ok(json!({
-                "status": "ok",
-                "response": {
-                    "type": "cancel",
-                    "data": {
-                        "statuses": results
-                    }
-                }
-            }))
+            let cancel_wires: Vec<CancelWire> = cancels.iter().map(|c| CancelWire {
+                a: c.a,
+                o: c.o,
+            }).collect();
+            TransactionType::Cancel { cancels: cancel_wires }
         }
-
         ExchangeAction::CancelByCloid { cancels } => {
-            let mut results = Vec::new();
-
-            for cancel in cancels {
-                // TODO: Cancel order by client order ID
-                results.push(json!({
-                    "status": "pending",
-                    "cloid": cancel.cloid,
-                }));
-            }
-
-            Ok(json!({
-                "status": "ok",
-                "response": {
-                    "type": "cancelByCloid",
-                    "data": {
-                        "statuses": results
-                    }
-                }
-            }))
+            let cancel_wires: Vec<CancelByCloidWire> = cancels.iter().map(|c| CancelByCloidWire {
+                asset: c.asset,
+                cloid: c.cloid.clone(),
+            }).collect();
+            TransactionType::CancelByCloid { cancels: cancel_wires }
         }
-
+        ExchangeAction::CancelAll => TransactionType::CancelAll,
         ExchangeAction::UsdTransfer { destination, amount } => {
-            let dest = parse_address(&destination)?;
-            let _amount = Decimal::from_str(&amount)
-                .map_err(|_| HandlerError::InvalidParameter("amount".to_string()))?;
-
-            // TODO: Execute transfer
-            Ok(json!({
-                "status": "ok",
-                "response": {
-                    "type": "usdTransfer",
-                    "data": {
-                        "destination": destination,
-                        "amount": amount
-                    }
-                }
-            }))
+            let dest = parse_address(destination)?;
+            TransactionType::UsdTransfer { destination: dest, amount: amount.clone() }
         }
-
         ExchangeAction::Withdraw { destination, amount } => {
-            let _dest = parse_address(&destination)?;
-            let _amount = Decimal::from_str(&amount)
-                .map_err(|_| HandlerError::InvalidParameter("amount".to_string()))?;
-
-            // TODO: Execute withdrawal
-            Ok(json!({
-                "status": "ok",
-                "response": {
-                    "type": "withdraw",
-                    "data": {
-                        "destination": destination,
-                        "amount": amount
-                    }
-                }
-            }))
+            let dest = parse_address(destination)?;
+            TransactionType::Withdraw { destination: dest, amount: amount.clone() }
         }
-
         ExchangeAction::UpdateLeverage { asset, is_cross, leverage } => {
-            // TODO: Update leverage through engine
+            TransactionType::UpdateLeverage { asset: *asset, is_cross: *is_cross, leverage: *leverage }
+        }
+        _ => return Err(HandlerError::Internal("Unsupported action type".to_string())),
+    };
+
+    // Create transaction with signature
+    let sig_wire = &request.signature;
+    let r_bytes = hex::decode(sig_wire.r.strip_prefix("0x").unwrap_or(&sig_wire.r))
+        .map_err(|_| HandlerError::InvalidSignature)?;
+    let s_bytes = hex::decode(sig_wire.s.strip_prefix("0x").unwrap_or(&sig_wire.s))
+        .map_err(|_| HandlerError::InvalidSignature)?;
+
+    let signature = Signature::new(
+        B256::from_slice(&r_bytes.get(..32).unwrap_or(&[0u8; 32])),
+        B256::from_slice(&s_bytes.get(..32).unwrap_or(&[0u8; 32])),
+        sig_wire.v,
+    );
+
+    let tx = Transaction {
+        action: tx_type,
+        nonce: request.nonce,
+        signature,
+        hash: None,
+    };
+
+    // Execute transaction through app
+    let mut app_guard = app.write().await;
+    match app_guard.execute_tx(&tx, timestamp) {
+        Ok(result) => {
+            // Convert result to JSON response
             Ok(json!({
                 "status": "ok",
                 "response": {
-                    "type": "updateLeverage",
+                    "type": format_action_type(&request.action),
                     "data": {
-                        "asset": asset,
-                        "isCross": is_cross,
-                        "leverage": leverage
+                        "success": result.success,
+                        "events": result.events.iter().map(|e| json!({
+                            "type": e.r#type.clone(),
+                            "attributes": e.attributes.clone()
+                        })).collect::<Vec<_>>(),
+                        "gasUsed": result.gas_used
                     }
                 }
             }))
         }
+        Err(e) => Err(HandlerError::Internal(format!("Transaction failed: {}", e)))
+    }
+}
 
-        ExchangeAction::CancelAll => {
-            // TODO: Cancel all orders for user
-            Ok(json!({
-                "status": "ok",
-                "response": {
-                    "type": "cancelAll",
-                    "data": {}
-                }
-            }))
+/// Format action type for response
+fn format_action_type(action: &ExchangeAction) -> &'static str {
+    match action {
+        ExchangeAction::Order { .. } => "order",
+        ExchangeAction::Cancel { .. } => "cancel",
+        ExchangeAction::CancelByCloid { .. } => "cancelByCloid",
+        ExchangeAction::CancelAll => "cancelAll",
+        ExchangeAction::UsdTransfer { .. } => "usdTransfer",
+        ExchangeAction::Withdraw { .. } => "withdraw",
+        ExchangeAction::UpdateLeverage { .. } => "updateLeverage",
+        _ => "unknown",
+    }
+}
+
+/// Convert API order type wire to chain order type wire
+fn convert_order_type_wire(wire: &crate::api::OrderTypeWire) -> hypercore_chain::tx::OrderTypeWire {
+    match wire {
+        crate::api::OrderTypeWire::Limit { limit } => {
+            hypercore_chain::tx::OrderTypeWire::Limit {
+                limit: hypercore_chain::tx::LimitTif { tif: limit.tif.clone() }
+            }
         }
-
-        // Spot actions and view transfers are handled above
-        ExchangeAction::SpotOrder { .. }
-        | ExchangeAction::SpotCancel { .. }
-        | ExchangeAction::SpotCancelAll { .. }
-        | ExchangeAction::ViewTransfer { .. } => {
-            unreachable!("Spot actions handled in process_spot_exchange_request")
+        crate::api::OrderTypeWire::Trigger { trigger } => {
+            hypercore_chain::tx::OrderTypeWire::Trigger {
+                trigger: hypercore_chain::tx::TriggerOrder {
+                    is_market: trigger.is_market,
+                    trigger_px: trigger.trigger_px.clone(),
+                    tpsl: trigger.tpsl.clone(),
+                }
+            }
         }
     }
 }
@@ -807,20 +847,64 @@ fn parse_order_type(wire: &crate::api::OrderTypeWire) -> Result<OrderType, Handl
     }
 }
 
-/// Verify signature and extract sender address
-/// NOTE: This is a stub implementation for development.
-/// Production must implement proper EIP-712 signature verification.
+/// Verify signature and extract sender address using EIP-712
+///
+/// This implements proper EIP-712 signature verification:
+/// 1. Computes the typed data hash using the same encoding as the SDK
+/// 2. Recovers the signer address using ecrecover
+/// 3. Returns the recovered address
+///
+/// PRODUCTION MODE: All signatures are cryptographically verified.
+/// No bypass mechanisms are available.
 fn verify_signature(request: &ExchangeRequest) -> Result<AccountAddress, HandlerError> {
-    // STUB: Extract address from signature r value for testing
-    // In production, this MUST verify the EIP-712 signature properly
-    let sig = &request.signature;
-    let r_hex = sig.r.strip_prefix("0x").unwrap_or(&sig.r);
+    use alloy_primitives::B256;
+    use hypercore_primitives::Signature;
 
-    if r_hex.len() >= 40 {
-        let addr_hex = &r_hex[r_hex.len() - 40..];
-        parse_address(&format!("0x{}", addr_hex))
-    } else {
-        Err(HandlerError::InvalidSignature)
+    let sig = &request.signature;
+
+    // Parse signature components
+    let r_hex = sig.r.strip_prefix("0x").unwrap_or(&sig.r);
+    let s_hex = sig.s.strip_prefix("0x").unwrap_or(&sig.s);
+
+    // Validate hex lengths
+    if r_hex.len() != 64 || s_hex.len() != 64 {
+        tracing::warn!("Invalid signature format: r={} s={}", r_hex.len(), s_hex.len());
+        return Err(HandlerError::InvalidSignature);
+    }
+
+    let r_bytes = hex::decode(r_hex).map_err(|_| HandlerError::InvalidSignature)?;
+    let s_bytes = hex::decode(s_hex).map_err(|_| HandlerError::InvalidSignature)?;
+
+    let signature = Signature::new(
+        B256::from_slice(&r_bytes),
+        B256::from_slice(&s_bytes),
+        sig.v,
+    );
+
+    // Get chain ID from environment or use default
+    let chain_id: u64 = std::env::var("CHAIN_ID")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(crate::eip712::DEFAULT_CHAIN_ID);
+
+    // Compute EIP-712 typed data hash using proper encoding
+    let message_hash = crate::eip712::compute_typed_data_hash(request, chain_id);
+
+    // Recover signer from signature
+    match signature.recover(&message_hash) {
+        Ok(recovered) => {
+            tracing::info!(
+                "EIP-712 signature verified: action={:?}, recovered={:?}, hash={:?}",
+                std::mem::discriminant(&request.action),
+                recovered,
+                hex::encode(&message_hash[..8])
+            );
+            Ok(recovered)
+        }
+        Err(e) => {
+            tracing::warn!("Signature verification failed: {:?}", e);
+            Err(HandlerError::InvalidSignature)
+        }
     }
 }
 
@@ -838,6 +922,36 @@ fn parse_address(s: &str) -> Result<AccountAddress, HandlerError> {
     let mut addr = [0u8; 20];
     addr.copy_from_slice(&bytes);
     Ok(AccountAddress::from(addr))
+}
+
+/// Convert market ID to coin name
+fn coin_name_from_market_id(market_id: u8) -> &'static str {
+    match market_id {
+        0 => "BTC",
+        1 => "ETH",
+        2 => "SOL",
+        3 => "AVAX",
+        4 => "MATIC",
+        5 => "ARB",
+        6 => "OP",
+        7 => "DOGE",
+        _ => "UNKNOWN",
+    }
+}
+
+/// Convert coin name to market ID
+fn market_id_from_coin(coin: &str) -> u8 {
+    match coin.to_uppercase().as_str() {
+        "BTC" => 0,
+        "ETH" => 1,
+        "SOL" => 2,
+        "AVAX" => 3,
+        "MATIC" => 4,
+        "ARB" => 5,
+        "OP" => 6,
+        "DOGE" => 7,
+        _ => 255, // Invalid market
+    }
 }
 
 /// Handler errors

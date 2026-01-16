@@ -3,19 +3,44 @@
 //! All amounts are stored as integers with implicit decimal places.
 //! This avoids floating-point precision issues.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use std::ops::{Add, Div, Mul, Neg, Sub};
 
 /// Fixed-point decimal with configurable precision
 ///
 /// Internal representation: value * 10^decimals
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize)]
+///
+/// Serializes to/from JSON as a string with decimal notation (e.g., "123.456")
+/// to avoid precision loss and support values larger than JSON's number type.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Decimal {
     /// Raw integer value (scaled)
     value: i128,
     /// Number of decimal places
     decimals: u8,
+}
+
+impl Serialize for Decimal {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        // Serialize as string to preserve precision
+        serializer.serialize_str(&self.to_string_trimmed())
+    }
+}
+
+impl<'de> Deserialize<'de> for Decimal {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        // Default to 8 decimal places when parsing
+        Self::from_str_exact(&s, Self::PRICE_DECIMALS)
+            .ok_or_else(|| serde::de::Error::custom(format!("Invalid decimal: {}", s)))
+    }
 }
 
 impl Decimal {
@@ -34,6 +59,16 @@ impl Decimal {
     /// Create from raw integer value with specified decimals
     pub const fn from_raw(value: i128, decimals: u8) -> Self {
         Self { value, decimals }
+    }
+
+    /// Get the raw integer value (scaled by 10^decimals)
+    pub const fn raw_value(&self) -> i128 {
+        self.value
+    }
+
+    /// Get the number of decimal places
+    pub const fn decimal_places(&self) -> u8 {
+        self.decimals
     }
 
     /// Create from integer (no decimals)

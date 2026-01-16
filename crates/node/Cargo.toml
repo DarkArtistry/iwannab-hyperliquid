@@ -8,6 +8,12 @@ license.workspace = true
 name = "hypercore"
 path = "src/main.rs"
 
+[features]
+default = []
+cometbft = ["hypercore-chain/cometbft"]
+persistence = ["hypercore-persistence", "hypercore-chain/persistence"]
+indexer = ["hypercore-indexer"]
+
 [dependencies]
 # Workspace crates
 hypercore-primitives = { workspace = true }
@@ -15,6 +21,8 @@ hypercore-engine = { workspace = true }
 hypercore-chain = { workspace = true }
 hypercore-evm = { workspace = true }
 hypercore-gateway = { workspace = true }
+hypercore-persistence = { workspace = true, optional = true }
+hypercore-indexer = { workspace = true, optional = true }
 
 # CLI
 clap = { workspace = true }
@@ -33,6 +41,9 @@ tracing-subscriber = { workspace = true }
 # Error handling
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+
+# Hex encoding
+hex = { workspace = true }
 
 # Random (for mock price feed)
 rand = "0.8"

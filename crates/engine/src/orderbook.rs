@@ -290,6 +290,16 @@ impl OrderBook {
         }
         book
     }
+
+    /// Get all orders in the book (for persistence)
+    pub fn get_all_orders(&self) -> Vec<&Order> {
+        self.bids.values().chain(self.asks.values()).collect()
+    }
+
+    /// Restore a single order (for state restore)
+    pub fn restore_order(&mut self, order: Order) {
+        self.insert(order);
+    }
 }
 
 #[cfg(test)]

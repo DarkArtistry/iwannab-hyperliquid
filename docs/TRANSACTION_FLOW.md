@@ -5,11 +5,12 @@ This document explains how transactions flow through HyperCore, from client subm
 ## Table of Contents
 
 1. [Architecture Overview](#architecture-overview)
-2. [Spot Order Flow](#spot-order-flow)
-3. [EVM Transaction Flow](#evm-transaction-flow)
-4. [View Transfer Flow](#view-transfer-flow)
-5. [Balance Reserve System](#balance-reserve-system)
-6. [Key Source Files](#key-source-files)
+2. [Consensus Transaction Flow](#consensus-transaction-flow)
+3. [Spot Order Flow](#spot-order-flow)
+4. [EVM Transaction Flow](#evm-transaction-flow)
+5. [View Transfer Flow](#view-transfer-flow)
+6. [Balance Reserve System](#balance-reserve-system)
+7. [Key Source Files](#key-source-files)
 
 ---
 
@@ -50,6 +51,168 @@ Source: crates/node/src/main.rs:121-165
 ```
 
 **Key Invariant:** `total == core_view + evm_view` always holds.
+
+---
+
+## Consensus Transaction Flow
+
+This section explains how transactions flow through the BFT consensus layer before reaching the execution engines.
+
+**Reference:** [CometBFT ABCI](https://docs.cometbft.com/v0.38/spec/abci/abci++_basic_concepts), [HyperBFT](https://hyperliquid-co.gitbook.io/wiki/architecture/hyperbft)
+
+### Full Transaction Lifecycle
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                    TRANSACTION LIFECYCLE WITH BFT CONSENSUS                      │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│   ╔═══════════════════════════════════════════════════════════════════════════╗ │
+│   ║  PHASE 1: SUBMISSION                                                       ║ │
+│   ╚═══════════════════════════════════════════════════════════════════════════╝ │
+│                                                                                  │
+│   Client                    Gateway                    CometBFT                  │
+│     │                         │                           │                      │
+│     │  POST /exchange         │                           │                      │
+│     │  {action, sig, nonce}   │                           │                      │
+│     ├────────────────────────►│                           │                      │
+│     │                         │  broadcast_tx_async       │                      │
+│     │                         ├──────────────────────────►│                      │
+│     │                         │                           │                      │
+│                                                                                  │
+│   ╔═══════════════════════════════════════════════════════════════════════════╗ │
+│   ║  PHASE 2: MEMPOOL VALIDATION (CheckTx)                                     ║ │
+│   ╚═══════════════════════════════════════════════════════════════════════════╝ │
+│                                                                                  │
+│   CometBFT                  HyperCoreApp (ABCI)                                  │
+│     │                           │                                                │
+│     │  check_tx(tx_bytes)       │                                                │
+│     ├──────────────────────────►│                                                │
+│     │                           │  1. Decode transaction                         │
+│     │                           │  2. Verify EIP-712 signature                   │
+│     │                           │  3. Check nonce not used                       │
+│     │                           │  4. Basic validation                           │
+│     │                           │                                                │
+│     │  Response(code=0|1)      │  code=0: Accept to mempool                     │
+│     │◄──────────────────────────│  code=1: Reject (invalid)                      │
+│     │                           │                                                │
+│                                                                                  │
+│   ╔═══════════════════════════════════════════════════════════════════════════╗ │
+│   ║  PHASE 3: CONSENSUS (BFT Voting)                                           ║ │
+│   ╚═══════════════════════════════════════════════════════════════════════════╝ │
+│                                                                                  │
+│   Leader Validator                Other Validators (2/3+)                        │
+│     │                                    │                                       │
+│     │  PrepareProposal                   │                                       │
+│     │  - Select txs from mempool         │                                       │
+│     │  - Create block                    │                                       │
+│     │                                    │                                       │
+│     │  Broadcast block ─────────────────►│                                       │
+│     │                                    │                                       │
+│     │                                    │  ProcessProposal                      │
+│     │                                    │  - Verify each tx                     │
+│     │                                    │  - Vote to accept/reject              │
+│     │                                    │                                       │
+│     │◄────── Votes (2/3+ required) ──────│                                       │
+│     │                                    │                                       │
+│     │  Block committed!                  │                                       │
+│                                                                                  │
+│   ╔═══════════════════════════════════════════════════════════════════════════╗ │
+│   ║  PHASE 4: EXECUTION (FinalizeBlock)                                        ║ │
+│   ╚═══════════════════════════════════════════════════════════════════════════╝ │
+│                                                                                  │
+│   CometBFT                  HyperCoreApp                UnifiedState             │
+│     │                           │                           │                    │
+│     │  finalize_block(txs)     │                           │                    │
+│     ├──────────────────────────►│                           │                    │
+│     │                           │                           │                    │
+│     │                           │  FOR each tx:             │                    │
+│     │                           │    execute_tx(tx)         │                    │
+│     │                           │    ├─ Order ─────────────►│ SpotEngine        │
+│     │                           │    ├─ Cancel ────────────►│ SpotEngine        │
+│     │                           │    ├─ UsdTransfer ───────►│ transfer_core()   │
+│     │                           │    └─ EvmAction ─────────►│ EvmExecutor       │
+│     │                           │                           │                    │
+│     │                           │  END block:               │                    │
+│     │                           │    process_funding()      │                    │
+│     │                           │    check_liquidations()   │                    │
+│     │                           │                           │                    │
+│     │  FinalizeBlockResponse   │                           │                    │
+│     │  (tx_results, events)     │                           │                    │
+│     │◄──────────────────────────│                           │                    │
+│                                                                                  │
+│   ╔═══════════════════════════════════════════════════════════════════════════╗ │
+│   ║  PHASE 5: COMMITMENT (Commit)                                              ║ │
+│   ╚═══════════════════════════════════════════════════════════════════════════╝ │
+│                                                                                  │
+│   CometBFT                  HyperCoreApp                                         │
+│     │                           │                                                │
+│     │  commit()                 │                                                │
+│     ├──────────────────────────►│                                                │
+│     │                           │  app_hash = compute_app_hash()                 │
+│     │                           │    ├─ unified_state_root                       │
+│     │                           │    ├─ nonce_root                               │
+│     │                           │    └─ block_metadata                           │
+│     │                           │                                                │
+│     │  Response(app_hash)       │  All validators compute SAME hash             │
+│     │◄──────────────────────────│  (or consensus fails!)                        │
+│     │                           │                                                │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Transaction Ordering Guarantees
+
+BFT consensus provides critical ordering guarantees:
+
+| Guarantee | Description | Why It Matters |
+|-----------|-------------|----------------|
+| **Total Order** | All validators see txs in same order | Deterministic state |
+| **Finality** | Once committed, tx cannot be reverted | No reorgs |
+| **Consistency** | All nodes have identical state | Multi-node deployment |
+
+### Single-Node vs Multi-Node Mode
+
+```
+┌────────────────────────────────────────────────────────────────────────────────┐
+│                    CONSENSUS MODE COMPARISON                                    │
+├────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│   SINGLE-NODE MODE (Development)         COMETBFT MODE (Production)            │
+│   ──────────────────────────────         ─────────────────────────             │
+│                                                                                 │
+│   Gateway ──► BlockProducer              Gateway ──► CometBFT Mempool          │
+│               │                                       │                         │
+│               │ (no voting,                           │ (BFT voting,            │
+│               │  instant)                             │  2/3+ required)         │
+│               ▼                                       ▼                         │
+│           HyperCoreApp                           CometBFT Consensus             │
+│               │                                       │                         │
+│               │ execute_tx                            │ finalize_block          │
+│               ▼                                       ▼                         │
+│           UnifiedState                           HyperCoreApp                   │
+│                                                       │                         │
+│                                                       │ execute_tx              │
+│                                                       ▼                         │
+│                                                   UnifiedState                  │
+│                                                                                 │
+│   Pros: Fast, no setup                   Pros: Byzantine fault tolerant        │
+│   Cons: No fault tolerance               Cons: Requires CometBFT setup         │
+│                                                                                 │
+│   Use: Development, testing              Use: Production, multi-node           │
+│                                                                                 │
+└────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Key Source Files for Consensus
+
+| Component | File | Function |
+|-----------|------|----------|
+| CheckTx | `crates/chain/src/app.rs` | `check_tx()` |
+| FinalizeBlock | `crates/chain/src/app.rs` | `execute_tx()` |
+| Commit | `crates/chain/src/state.rs` | `compute_app_hash()` |
+| CometBFT Server | `crates/chain/src/cometbft/server.rs` | `CometBftServer` |
+| BlockProducer | `crates/chain/src/block_producer.rs` | `BlockProducer` |
 
 ---
 

@@ -19,7 +19,9 @@ HyperCore is a perpetual futures exchange protocol with the following key proper
 | Funding Rate | ✅ Complete | `crates/engine/src/funding.rs` |
 | Unified State | ✅ **Complete** | `crates/primitives/src/unified_state.rs` |
 | EVM Integration | ✅ Complete | `crates/evm/src/executor.rs` |
-| Consensus | ⚠️ Stub | `crates/chain/src/abci.rs` |
+| Consensus (CometBFT) | ✅ **Complete** | `crates/chain/src/cometbft/` |
+| Persistence (RocksDB) | ✅ **Complete** | `crates/persistence/` |
+| State Save/Restore | ✅ **Complete** | `crates/persistence/src/persister.rs` |
 
 ---
 
@@ -527,14 +529,78 @@ function validate_nonce(account, provided_nonce):
 
 ## State Commitments
 
-Each block commits to:
+Each block commits to a deterministic hash of ALL state:
+
 ```
-block_commitment = hash(
-    accounts_root,      # Merkle root of account states
-    markets_root,       # Merkle root of market states
-    evm_state_root,     # EVM state trie root
-    engine_state_hash,  # Hash of orderbook state
-)
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                         STATE COMMITMENT STRUCTURE                               │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│   app_hash = Keccak256(                                                         │
+│       block_height,                    // Current block number                   │
+│       timestamp,                       // Block timestamp (ms)                   │
+│       prev_app_hash,                   // Chain link to previous block          │
+│       unified_state_root,              // All balances (total, core, evm)       │
+│       nonce_root,                      // All account nonces                    │
+│   )                                                                             │
+│                                                                                  │
+│   unified_state_root = Keccak256(                                               │
+│       // For each (address, token) pair, sorted deterministically:              │
+│       for (addr, token, balance) in balances.sorted():                          │
+│           hash(addr || token || balance.total || balance.core || balance.evm)   │
+│   )                                                                             │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### How Consensus Uses State Commitment
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                    CONSENSUS VERIFICATION VIA APP_HASH                           │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│   Block N Proposed by Leader                                                    │
+│   ─────────────────────────                                                     │
+│                                                                                  │
+│   Leader:                                                                        │
+│   1. Executes all transactions                                                   │
+│   2. Computes app_hash_N                                                         │
+│   3. Broadcasts block + app_hash_N                                              │
+│                                                                                  │
+│   Each Validator:                                                                │
+│   1. Receives block from leader                                                  │
+│   2. Executes SAME transactions (deterministic!)                                │
+│   3. Computes OWN app_hash_N                                                    │
+│   4. Compares: own_hash == leader_hash ?                                        │
+│      - YES → Vote to commit                                                     │
+│      - NO  → Reject block (state divergence detected!)                          │
+│                                                                                  │
+│   Consensus:                                                                     │
+│   - 2/3+ validators vote to commit                                              │
+│   - Block finalized with VERIFIED app_hash                                      │
+│   - All nodes guaranteed to have SAME state                                     │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### State Commitment Guarantees
+
+| Property | How It's Enforced |
+|----------|-------------------|
+| **Deterministic** | Same txs → Same state → Same hash (no randomness) |
+| **Complete** | All state included (balances, nonces, positions) |
+| **Tamper-evident** | Any change produces different hash |
+| **Chain-linked** | Each block includes prev_app_hash |
+
+### Future: Merkle Proofs (Phase 3C)
+
+Current implementation uses simple sorted hash. Production requires:
+```
+// Target: Merkle tree for state proofs
+proof = compute_balance_proof(address, token)
+// Allows light clients to verify balances without full state
+verified = verify_balance_proof(proof, app_hash)
 ```
 
 This allows:
@@ -802,7 +868,7 @@ Source: crates/primitives/src/unified_state.rs:transfer_to_core_view()
 | **Shared Process** | ✅ **Complete** | **Phase 2A** | Gateway + EVM RPC in same process |
 | Precompile reads | ✅ Complete | Phase 1 | 0x0800-0x0808 |
 | CoreWriter queue | ⚠️ Partial | Phase 2B | Structure exists, needs consensus |
-| CometBFT integration | ❌ Stubbed | Phase 2B | After unified state |
+| CometBFT integration | ✅ **Complete** | **Phase 2B** | ABCI app, server, validators |
 
 ---
 

@@ -50,7 +50,7 @@ HyperCore is a high-performance perpetual futures exchange with an integrated EV
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                           CometBFT Consensus                             │
 │                    (Block Production, P2P, Finality)                     │
-│                         [Phase 2B - Pending]                             │
+│                         [Phase 2B - COMPLETE ✅]                          │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -88,11 +88,14 @@ Core matching and risk logic (no network/consensus awareness):
 
 ### Chain (`crates/chain`)
 Consensus integration layer:
-- ABCI application implementation
-- Block processing pipeline
-- State commitment (Merkle roots)
+- ABCI application implementation (`app.rs`, `abci.rs`)
+- Block processing pipeline (`block_producer.rs`)
+- State commitment (Merkle roots) (`state.rs`)
 - Genesis handling
-- Validator set management (future)
+- **CometBFT Integration** (Phase 2B - COMPLETE ✅):
+  - `cometbft/app.rs` - `CometBftApp` implements `tendermint_abci::Application`
+  - `cometbft/server.rs` - TCP-based ABCI server
+  - `cometbft/validators.rs` - Validator set management
 
 ### EVM (`crates/evm`)
 EVM execution environment:
@@ -151,12 +154,22 @@ Binary entry point combining all components.
 4. Returns ABI-encoded result to contract
 ```
 
-## Consensus Model
+## Consensus Model (Phase 2B - COMPLETE ✅)
 
-We use CometBFT (Tendermint) for BFT consensus:
-- **Block time**: 500ms target
+HyperCore supports two consensus modes:
+
+### Single-Node Mode (default)
+Fast development and testing mode using the built-in BlockProducer:
+- **Block time**: Configurable (default 500ms)
+- **No external dependencies**: No CometBFT process needed
+- **Usage**: `hypercore start --consensus-mode single-node`
+
+### CometBFT Mode (multi-node)
+Production mode with Byzantine fault-tolerant consensus:
+- **Block time**: Determined by CometBFT configuration
 - **Finality**: Instant (single-slot)
-- **Validator set**: Initially single validator, expand in hardening phase
+- **Validator set**: Managed via `ValidatorSet` in `cometbft/validators.rs`
+- **Usage**: `cargo build --features cometbft && hypercore start --consensus-mode cometbft`
 
 ### Block Processing Order
 ```
@@ -177,6 +190,193 @@ Commit
   → Persist state
   → Notify indexer
 ```
+
+---
+
+## How Unified State Syncs with BFT Consensus
+
+This section explains the critical relationship between state management and Byzantine Fault Tolerant consensus. Understanding this is essential for maintaining consistency across a multi-node network.
+
+**Reference:** [HyperBFT Architecture](https://hyperliquid-co.gitbook.io/wiki/architecture/hyperbft), [CometBFT ABCI](https://docs.cometbft.com/v0.38/spec/abci/abci++_basic_concepts)
+
+### The Core Principle: Deterministic State Machine Replication
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                    DETERMINISTIC STATE MACHINE REPLICATION                       │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│   Validator A                Validator B                Validator C             │
+│   ┌─────────┐                ┌─────────┐                ┌─────────┐             │
+│   │ State₀  │                │ State₀  │                │ State₀  │             │
+│   └────┬────┘                └────┬────┘                └────┬────┘             │
+│        │                          │                          │                   │
+│        │    SAME TX₁              │    SAME TX₁              │    SAME TX₁      │
+│        ▼                          ▼                          ▼                   │
+│   ┌─────────┐                ┌─────────┐                ┌─────────┐             │
+│   │ State₁  │ ═══════════════│ State₁  │════════════════│ State₁  │             │
+│   └────┬────┘                └────┬────┘                └────┬────┘             │
+│        │                          │                          │                   │
+│        │    SAME TX₂              │    SAME TX₂              │    SAME TX₂      │
+│        ▼                          ▼                          ▼                   │
+│   ┌─────────┐                ┌─────────┐                ┌─────────┐             │
+│   │ State₂  │ ═══════════════│ State₂  │════════════════│ State₂  │             │
+│   └─────────┘                └─────────┘                └─────────┘             │
+│                                                                                  │
+│   KEY: Same inputs → Same outputs → Same state → Same app_hash                  │
+│        Consensus verifies all validators compute identical app_hash             │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Transaction Flow Through Consensus
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                    TRANSACTION LIFECYCLE WITH CONSENSUS                          │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│   1. SUBMISSION                                                                  │
+│   ─────────────                                                                  │
+│   Client → Gateway → CometBFT Mempool                                           │
+│                           │                                                      │
+│   2. MEMPOOL VALIDATION   │                                                      │
+│   ─────────────────────   ▼                                                      │
+│   ┌──────────────────────────────────────┐                                      │
+│   │            CheckTx (ABCI)             │                                      │
+│   │  • Decode transaction                 │                                      │
+│   │  • Verify signature                   │                                      │
+│   │  • Validate nonce (not already used)  │                                      │
+│   │  • Return: Accept or Reject           │                                      │
+│   └──────────────────────────────────────┘                                      │
+│                           │                                                      │
+│   3. CONSENSUS            │ (CometBFT BFT voting)                               │
+│   ───────────             ▼                                                      │
+│   ┌──────────────────────────────────────┐                                      │
+│   │  PrepareProposal → ProcessProposal   │                                      │
+│   │  • Leader proposes block             │                                      │
+│   │  • Validators verify transactions    │                                      │
+│   │  • 2/3+ vote to commit               │                                      │
+│   └──────────────────────────────────────┘                                      │
+│                           │                                                      │
+│   4. EXECUTION            │                                                      │
+│   ────────────            ▼                                                      │
+│   ┌──────────────────────────────────────┐                                      │
+│   │         FinalizeBlock (ABCI)          │                                      │
+│   │  FOR each tx in block:                │                                      │
+│   │    • execute_tx(tx)                   │                                      │
+│   │    • Apply to UnifiedState            │                                      │
+│   │    • Record events                    │                                      │
+│   │  END block:                           │                                      │
+│   │    • Process funding rates            │                                      │
+│   │    • Check liquidations               │                                      │
+│   └──────────────────────────────────────┘                                      │
+│                           │                                                      │
+│   5. COMMITMENT           │                                                      │
+│   ────────────            ▼                                                      │
+│   ┌──────────────────────────────────────┐                                      │
+│   │           Commit (ABCI)               │                                      │
+│   │  • compute_app_hash()                 │                                      │
+│   │  • Return hash to consensus           │                                      │
+│   │  • All validators verify SAME hash    │                                      │
+│   └──────────────────────────────────────┘                                      │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### State Commitment Structure
+
+The app_hash commits to ALL state, ensuring any divergence is detected:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                         APP_HASH COMPUTATION                                     │
+│                    Source: crates/chain/src/state.rs                             │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│                              app_hash                                            │
+│                                 │                                                │
+│            ┌────────────────────┼────────────────────┐                          │
+│            │                    │                    │                          │
+│            ▼                    ▼                    ▼                          │
+│   ┌────────────────┐   ┌────────────────┐   ┌────────────────┐                  │
+│   │ unified_state  │   │  nonce_root    │   │ block_metadata │                  │
+│   │     _root      │   │                │   │                │                  │
+│   └───────┬────────┘   └───────┬────────┘   └───────┬────────┘                  │
+│           │                    │                    │                           │
+│           ▼                    ▼                    ▼                           │
+│   ┌────────────────┐   ┌────────────────┐   ┌────────────────┐                  │
+│   │ For each       │   │ For each       │   │ height         │                  │
+│   │ (user, token): │   │ account:       │   │ timestamp      │                  │
+│   │  • total       │   │  • nonce       │   │ prev_app_hash  │                  │
+│   │  • core_view   │   │                │   │                │                  │
+│   │  • evm_view    │   │                │   │                │                  │
+│   └────────────────┘   └────────────────┘   └────────────────┘                  │
+│                                                                                  │
+│   Invariant checked at commit:                                                   │
+│   ∀ balance: total == core_view + evm_view                                      │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Why Single Process Architecture Matters
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│              SHARED STATE WITHIN CONSENSUS BOUNDARY                              │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│   ┌───────────────────────────────────────────────────────────────────────┐     │
+│   │                    HyperCore Node (SINGLE PROCESS)                     │     │
+│   │                                                                        │     │
+│   │                 ┌──────────────────────────────────┐                  │     │
+│   │                 │     SharedUnifiedState           │                  │     │
+│   │                 │   Arc<RwLock<UnifiedState>>      │                  │     │
+│   │                 │                                  │                  │     │
+│   │                 │  ┌─────────────────────────┐     │                  │     │
+│   │                 │  │ User balances           │     │                  │     │
+│   │                 │  │ (core_view + evm_view)  │     │                  │     │
+│   │                 │  └─────────────────────────┘     │                  │     │
+│   │                 └──────────────────────────────────┘                  │     │
+│   │                          ▲           ▲                                │     │
+│   │                          │           │                                │     │
+│   │         ┌────────────────┴───┐   ┌───┴────────────────┐              │     │
+│   │         │                    │   │                    │              │     │
+│   │   ┌─────┴─────┐        ┌─────┴───┴─┐        ┌────────┴────┐         │     │
+│   │   │  Gateway  │        │ SpotEngine │        │ EvmExecutor │         │     │
+│   │   │  (:3000)  │        │ (matching) │        │   (:8545)   │         │     │
+│   │   └───────────┘        └────────────┘        └─────────────┘         │     │
+│   │                                                                        │     │
+│   │   ✅ All state changes happen in ONE process                          │     │
+│   │   ✅ No network calls between components                              │     │
+│   │   ✅ Atomic state updates within transaction                          │     │
+│   │   ✅ Consensus commits SINGLE consistent state                        │     │
+│   │                                                                        │     │
+│   └────────────────────────────────────────────────────────────────────────┘     │
+│                                        │                                         │
+│                                        │ ABCI                                    │
+│                                        ▼                                         │
+│   ┌────────────────────────────────────────────────────────────────────────┐     │
+│   │                           CometBFT Consensus                            │     │
+│   │                      (P2P, Block Production, Voting)                    │     │
+│   └────────────────────────────────────────────────────────────────────────┘     │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Hyperliquid's HyperBFT Comparison
+
+Our architecture mirrors Hyperliquid's design:
+
+| Aspect | Hyperliquid | HyperCore | Notes |
+|--------|-------------|-----------|-------|
+| Consensus | HyperBFT (HotStuff variant) | CometBFT (Tendermint) | Both are BFT with instant finality |
+| Block Time | ~0.07s (median) | Configurable (500ms default) | HyperBFT optimized for latency |
+| State Model | Unified (one ledger, two views) | Unified (one ledger, two views) | ✅ Matches |
+| Gas Fees | Zero for trading, HYPE for EVM | Zero for trading (planned) | 🔶 Phase 3B |
+| Execution | HyperCore + HyperEVM | SpotEngine + EvmExecutor | Same dual-layer model |
+
+**Reference:** [How Hyperliquid Works - Technical Deep Dive](https://rocknblock.io/blog/how-does-hyperliquid-work-a-technical-deep-dive)
 
 ## State Management
 
@@ -205,6 +405,83 @@ Not consensus-critical:
 - Trade history
 - Candles
 - User activity
+
+## Persistence Architecture (Phase 4 - COMPLETE ✅)
+
+The persistence layer provides durable state storage using RocksDB:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                         PERSISTENCE ARCHITECTURE                                  │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│   ┌─────────────────────┐                                                       │
+│   │    BlockProducer    │                                                       │
+│   │    (block commit)   │                                                       │
+│   └──────────┬──────────┘                                                       │
+│              │ PostCommitHandler callback                                        │
+│              ▼                                                                   │
+│   ┌─────────────────────┐                                                       │
+│   │   StateExtractor    │ ◄── Extracts state from runtime components            │
+│   │   (builder pattern) │                                                       │
+│   └──────────┬──────────┘                                                       │
+│              │ PersistedState                                                    │
+│              ▼                                                                   │
+│   ┌─────────────────────┐                                                       │
+│   │   StatePersister    │ ◄── Serializes to RocksDB                             │
+│   │   (persist/load)    │                                                       │
+│   └──────────┬──────────┘                                                       │
+│              │                                                                   │
+│              ▼                                                                   │
+│   ┌─────────────────────────────────────────────────────────────────────────┐   │
+│   │                        RocksDB Backend                                   │   │
+│   │   ┌───────────────────────────────────────────────────────────────────┐ │   │
+│   │   │  24 Column Families:                                              │ │   │
+│   │   │  • Balances, Positions, Orders, Accounts (trading state)         │ │   │
+│   │   │  • SpotTokens, SpotMarkets, SpotReserved (spot state)            │ │   │
+│   │   │  • EvmAccounts, EvmStorage, EvmCode (EVM state)                  │ │   │
+│   │   │  • Nonces, BlockMeta, BlockHashes (chain state)                  │ │   │
+│   │   │  • Fills, FundingPayments, Trades (history)                      │ │   │
+│   │   │  • CloidToOid mapping (order tracking)                           │ │   │
+│   │   └───────────────────────────────────────────────────────────────────┘ │   │
+│   │   Features:                                                              │   │
+│   │   • WAL (Write-Ahead Log) for crash recovery                            │   │
+│   │   • Write batches for atomic operations                                  │   │
+│   │   • Binary key encoding for efficient storage                           │   │
+│   └─────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                  │
+│   On Node Startup:                                                               │
+│   1. Check if persisted state exists in RocksDB                                 │
+│   2. If yes: restore_state() → populate runtime components                      │
+│   3. If no: initialize from genesis                                             │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Key Implementation Files
+
+| File | Purpose |
+|------|---------|
+| `crates/persistence/src/lib.rs` | PersistenceBackend trait, WriteBatch |
+| `crates/persistence/src/column_families.rs` | 24 column family definitions |
+| `crates/persistence/src/keys.rs` | Binary key encoding |
+| `crates/persistence/src/rocksdb_backend.rs` | RocksDB implementation |
+| `crates/persistence/src/persister.rs` | StatePersister with persist/load |
+| `crates/persistence/src/extractor.rs` | StateExtractor builder |
+| `crates/chain/src/persistence_integration.rs` | extract_state/restore_state |
+
+### Usage
+
+```bash
+# Build with persistence feature
+cargo build -p hypercore-node --features persistence
+
+# Start with persistence enabled
+hypercore start --enable-persistence --data-dir ./data/chain
+
+# Without persistence (default, in-memory mode)
+hypercore start
+```
 
 ## Precompile Architecture
 
@@ -319,7 +596,7 @@ When implementing specific features, these projects served as reference:
 
 See [IMPLEMENTATION_STATUS.md](./IMPLEMENTATION_STATUS.md) for detailed analysis of what's implemented vs stubbed.
 
-### Quick Status (Phase 1 + 2A Complete)
+### Quick Status (Phase 1 + 2A + 2B Complete)
 
 | Component | Status | Key File |
 |-----------|--------|----------|
@@ -330,14 +607,16 @@ See [IMPLEMENTATION_STATUS.md](./IMPLEMENTATION_STATUS.md) for detailed analysis
 | Precompiles (Spot) | ✅ Complete (0x0806-0x0808) | `crates/evm/src/precompiles.rs` |
 | Gateway (read) | ✅ Complete | `crates/gateway/src/handlers.rs` |
 | Gateway (write/spot) | ✅ Complete | `crates/gateway/src/handlers.rs` |
-| Gateway (write/perps) | ⚠️ Partial | `crates/gateway/src/handlers.rs` |
+| Gateway (write/perps) | ✅ Complete | `crates/gateway/src/handlers.rs` |
 | EVM JSON-RPC | ✅ Complete | `crates/evm/src/rpc.rs` |
 | EVM Execution | ✅ Complete (revm) | `crates/evm/src/executor.rs` |
 | HIP-1 Spot Tokens | ✅ Complete | `crates/engine/src/spot_engine.rs` |
 | **Unified State** | ✅ **Complete** | `crates/primitives/src/unified_state.rs` |
 | **Shared Process** | ✅ **Complete** | `crates/node/src/main.rs` |
-| Consensus | ❌ Stub (Phase 2B) | `crates/chain/src/abci.rs` |
-| Persistence | ❌ Stub (Phase 4) | N/A |
+| **BlockProducer** | ✅ **Complete** | `crates/chain/src/block_producer.rs` |
+| **CometBFT Integration** | ✅ **Complete** | `crates/chain/src/cometbft/` |
+| **Persistence (RocksDB)** | ✅ **Complete** | `crates/persistence/` |
+| **State Save/Restore** | ✅ **Complete** | `crates/persistence/src/persister.rs` |
 
 ---
 
@@ -575,28 +854,38 @@ pub struct SpotEngineState {
 State Change → Write-Ahead Log → Commit to RocksDB → Snapshot periodically
 ```
 
-### V3: Stub Signature Verification (SECURITY)
+### V3: Signature Verification with Fallback (SECURITY - Partially Resolved)
 
-**Problem**: Signatures are not cryptographically verified.
+**Current Status**: Real EIP-712 verification is implemented with development fallback.
 
 ```rust
-// Current: Address extracted from signature r-value (STUB!)
-let address_hex = &r[r.len() - 40..];  // Anyone can spoof any address!
-```
+// Current: Real EIP-712 verification with fallback
+fn verify_signature(request: &ExchangeRequest) -> Result<AccountAddress, HandlerError> {
+    // 1. Parse signature and compute EIP-712 hash
+    let message_hash = compute_eip712_hash(request);
 
-**Impact**:
-- Any user can impersonate any other user
-- No authentication whatsoever
-- Completely insecure for production
-
-**Solution (Phase 3)**: Implement EIP-712 verification:
-```rust
-// Target: Real signature verification
-let recovered = ecrecover(typed_data_hash, v, r, s)?;
-if recovered != claimed_address {
-    return Err(InvalidSignature);
+    // 2. Attempt to recover signer
+    match signature.recover(&message_hash) {
+        Ok(signer) => Ok(signer),
+        Err(_) => {
+            // Fallback to stub for development/testing
+            // TODO: Remove this fallback in production
+            verify_signature_stub(request)
+        }
+    }
 }
 ```
+
+**What's Implemented (handlers.rs:859-897)**:
+- ✅ EIP-712 typed data hash computation
+- ✅ Domain separator calculation
+- ✅ Action-specific hash computation
+- ✅ Signature recovery via k256/ecrecover
+- ⚠️ Fallback to stub if signature recovery fails
+
+**Remaining for Production**:
+- Remove the fallback path (line 892-894)
+- Ensure all clients send valid EIP-712 signatures
 
 ### V4: No Bridge Between Layers (DESIGN GAP)
 
@@ -687,7 +976,7 @@ All transactions ordered by consensus → Execute in order → Deterministic sta
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### ABCI Integration Points
+### ABCI Integration Points (Phase 2B - COMPLETE ✅)
 
 | ABCI Method | Purpose | Current Status |
 |-------------|---------|----------------|
@@ -696,14 +985,25 @@ All transactions ordered by consensus → Execute in order → Deterministic sta
 | `process_proposal` | Validators verify proposal | ✅ Implemented |
 | `finalize_block` | Execute txs, return results | ✅ Implemented |
 | `commit` | Persist state, return app_hash | ✅ Implemented |
-| **Connection to CometBFT** | Actually receive transactions | ❌ **STUBBED** |
+| **CometBFT ABCI Server** | TCP server for CometBFT connection | ✅ **Implemented** |
+| **Validator Set** | Track validators, supermajority | ✅ **Implemented** |
 
-The ABCI methods are implemented but the server just sleeps:
+**Consensus Mode Selection** (crates/node/src/main.rs):
 ```rust
-// crates/node/src/main.rs:193-200
-// In production, integrate with tendermint-abci crate
-// For now, just keep the task alive
-tokio::time::sleep(tokio::time::Duration::from_secs(u64::MAX)).await;
+match consensus_mode {
+    ConsensusMode::SingleNode => {
+        // Uses BlockProducer for fast development
+        let block_producer = BlockProducer::new(app, mempool, config);
+        block_producer.start().await;
+    }
+    #[cfg(feature = "cometbft")]
+    ConsensusMode::CometBft => {
+        // Uses tendermint-abci for multi-node consensus
+        let cometbft_app = CometBftApp::new(hypercore_app);
+        let server = CometBftServer::new(cometbft_app);
+        server.start(abci_addr)?;
+    }
+}
 ```
 
 ### Bridging Architecture (Future)
@@ -778,16 +1078,18 @@ tokio::time::sleep(tokio::time::Duration::from_secs(u64::MAX)).await;
 
 ## Phase Roadmap Summary
 
-⚠️ **RESTRUCTURED**: Based on the discovery that Hyperliquid uses a unified state model.
-
-| Phase | Focus | Key Deliverables | Solves |
+| Phase | Focus | Key Deliverables | Status |
 |-------|-------|------------------|--------|
-| **Phase 1** ✅ | EVM Integration | EVM RPC, Precompiles, HIP-1 Tokens | Basic functionality |
-| **Phase 2A** ✅ | **Unified State** | **Master balance sheet, view separation** | **V0 (architecture)** |
-| **Phase 2B** | Consensus | CometBFT connection, ABCI wiring | V1, V5 (consensus, ordering) |
-| **Phase 3** | Gateway Security | EIP-712 signatures, view transfer API | V3 (auth) |
-| **Phase 4** | Persistence | RocksDB, WAL, Snapshots | V2 (durability) |
-| **Phase 5** | Production | Rate limiting, monitoring, hardening | Security |
+| **Phase 1** | EVM Integration | EVM RPC, Precompiles, HIP-1 Tokens | ✅ **COMPLETE** |
+| **Phase 2A** | **Unified State** | **Master balance sheet, view separation** | ✅ **COMPLETE** |
+| **Phase 2B** | **Consensus** | **CometBFT integration, ABCI, validators** | ✅ **COMPLETE** |
+| **Phase 3A** | Genesis State | Proper genesis initialization | ✅ **COMPLETE** |
+| **Phase 3B** | Gas Fees | Zero for trading, charged for EVM | ✅ **COMPLETE** |
+| **Phase 4A** | Persistence Infrastructure | RocksDB, WAL, Column Families | ✅ **COMPLETE** |
+| **Phase 4B** | State Save/Restore | Auto-persist on commit, restore on start | ✅ **COMPLETE** |
+| **Phase 3C** | State Hardening | Merkle proofs, snapshots | 🟡 Pending |
+| **Phase 3D** | EIP-712 Production | Remove dev signature workarounds | 🟠 Pending |
+| **Phase 5** | Production | Monitoring, hardening | ❌ Pending |
 
 ---
 
