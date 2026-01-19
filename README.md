@@ -82,9 +82,10 @@ HyperCore uses a **unified state model** where all components share the same bal
 - **EVM Integration**: Deploy Solidity contracts that read exchange state
 - **Custom Precompiles**: Gas-efficient state reads (positions, orderbook, funding)
 - **Real-time Updates**: WebSocket feeds for trades, orderbook, user events
+- **Rate Limiting**: Per-IP and per-endpoint rate limiting for DoS protection
 
 ### Developer Features
-- **TypeScript SDK**: Full-featured client with 86 integration tests
+- **TypeScript SDK**: Full-featured client with 135 E2E integration tests
 - **Python SDK**: Async client for algorithmic trading
 - **Foundry Integration**: 49 Solidity tests for smart contracts
 - **Comprehensive Docs**: Architecture, API, and protocol specifications
@@ -244,28 +245,47 @@ contract MyStrategy {
 
 ## Test Coverage
 
-| Component | Tests | Status |
-|-----------|-------|--------|
-| Rust Unit Tests | 160 | ✅ Passing |
-| Solidity Contracts | 49 | ✅ Passing |
-| E2E Integration | 122 | ✅ Passing |
-| **Total** | **331** | **All Passing** |
+| Component | Tests | Description |
+|-----------|-------|-------------|
+| Rust Unit Tests | 298 | Core engine, chain, gateway, primitives |
+| Solidity Contracts | 49 | CoreWriter, HyperCore integration |
+| E2E Integration | 135 | Full system integration (requires Docker) |
+| **Total** | **482** | **All Passing** |
 
-### Running All Tests
+### Running Tests
 
 ```bash
-# Rust tests
-cargo test
+# Quick tests - Rust + Solidity only (no Docker required)
+make test-quick
 
-# Solidity tests
-cd contracts && forge test
+# All tests - Rust + Solidity + E2E (starts Docker services)
+make test-all
 
-# TypeScript SDK integration tests
-cd sdk/typescript && pnpm test:integration
+# Individual test commands
+make test              # Rust unit tests only (298 tests)
+make test-contracts    # Solidity tests only (49 tests)
+make test-e2e          # E2E integration only (135 tests)
 
-# Full E2E test suite (starts services, runs tests, cleanup)
-./scripts/e2e-test.sh
+# Crate-specific tests
+make test-engine       # Engine (matching, risk, funding)
+make test-chain        # Chain (Merkle, consensus, state)
+make test-gateway      # Gateway (rate limit, validation)
+make test-primitives   # Primitives (types, EIP-712)
 ```
+
+### Test Categories
+
+| Category | Location | Tests | Coverage |
+|----------|----------|-------|----------|
+| **Matching Engine** | `crates/engine/` | 86 | Order matching, price-time priority |
+| **Merkle Proofs** | `crates/chain/` | 22 | State proofs, verification |
+| **Rate Limiting** | `crates/gateway/` | 11 | DoS protection |
+| **Input Validation** | `crates/gateway/` | 30 | Order parameter validation |
+| **EIP-712 Signing** | `crates/primitives/` | 15 | Signature verification |
+| **Unified State** | `crates/primitives/` | 18 | Balance management |
+| **Spot Trading** | `crates/engine/` | 13 | HIP-1 token trading |
+| **CoreWriter** | `contracts/test/` | 21 | EVM write operations |
+| **EVM Integration** | `contracts/test/` | 28 | Precompile tests |
 
 ### E2E Test Suite
 
@@ -304,6 +324,7 @@ See [scripts/e2e/README.md](scripts/e2e/README.md) for detailed test documentati
 | [docs/PROTOCOL.md](docs/PROTOCOL.md) | Protocol specification |
 | [docs/API.md](docs/API.md) | REST and WebSocket API reference |
 | [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md) | Detailed implementation analysis |
+| [docs/ORDERS_THROUGHPUT_UPGRADE.md](docs/ORDERS_THROUGHPUT_UPGRADE.md) | 100k orders/sec upgrade plan |
 | [TODO.md](TODO.md) | Development roadmap |
 | [contracts/README.md](contracts/README.md) | Smart contract documentation |
 | [sdk/typescript/README.md](sdk/typescript/README.md) | TypeScript SDK guide |
@@ -393,12 +414,13 @@ This is a development implementation. See [docs/IMPLEMENTATION_STATUS.md](docs/I
 | **Genesis Initialization** | ✅ | `crates/node/src/main.rs:create_genesis()` |
 | **Gas Fee Infrastructure** | ✅ | `crates/evm/src/executor.rs:apply_gas_fee()` |
 | **Persistence Layer** | ✅ | `crates/persistence/` (RocksDB, 24 column families) |
+| **State Commitment (Merkle)** | ✅ | `crates/chain/src/merkle.rs` (proofs, verification) |
 
 ### What's Stubbed or Pending (⚠️)
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| **State Commitment** | ⚠️ Simple | Basic hash, needs Merkle proofs (Phase 3C) |
+| **ABCI State Sync** | ⚠️ Pending | Snapshot methods for fast node bootstrap |
 
 ### Development Phases
 
@@ -409,12 +431,12 @@ This is a development implementation. See [docs/IMPLEMENTATION_STATUS.md](docs/I
 | Phase 2B | CometBFT Consensus Integration | ✅ Complete |
 | Phase 3A | Genesis State Initialization | ✅ Complete |
 | Phase 3B | Gas Fee Infrastructure | ✅ Complete |
-| Phase 3C | State Commitment Hardening | ⚠️ Pending |
+| Phase 3C | State Commitment Hardening (Merkle Proofs) | ✅ Complete |
 | Phase 3D | EIP-712 Production Mode | ✅ Complete |
 | Phase 4A | Persistence Infrastructure (RocksDB) | ✅ Complete |
 | Phase 4B | State Save/Restore | ✅ Complete |
 
-**122/122 E2E tests passing** - See [TODO.md](TODO.md) for the development roadmap.
+**482 total tests passing** (298 Rust + 135 E2E + 49 Solidity) - See [TODO.md](TODO.md) for the development roadmap.
 
 ## Contributing
 

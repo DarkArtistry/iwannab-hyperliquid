@@ -483,9 +483,11 @@ impl EngineState {
             .unwrap_or_default()
     }
 
-    /// Get list of all market IDs
+    /// Get list of all market IDs (sorted for determinism)
     pub fn get_market_ids(&self) -> Vec<MarketId> {
-        self.markets.keys().copied().collect()
+        let mut ids: Vec<_> = self.markets.keys().copied().collect();
+        ids.sort();
+        ids
     }
 
     // === Persistence helper methods ===
@@ -498,6 +500,14 @@ impl EngineState {
     /// Get all leverage settings across all accounts (for persistence)
     pub fn get_all_leverage_global(&self) -> &HashMap<AccountAddress, HashMap<MarketId, u8>> {
         &self.leverage
+    }
+
+    /// Get all orders across all markets (for Merkle tree computation)
+    ///
+    /// Returns a reference to the orders HashMap indexed by market_id then order_id.
+    /// Used by AppState::compute_orders_root() for state commitment.
+    pub fn get_all_orders_global(&self) -> &HashMap<MarketId, HashMap<OrderId, Order>> {
+        &self.orders
     }
 
     /// Set a position directly (for state restore)

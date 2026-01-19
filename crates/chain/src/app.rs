@@ -88,10 +88,10 @@ impl HyperCoreApp {
             if let Some(ref spot_engine) = self.state.spot_engine {
                 let mut engine = spot_engine.blocking_write();
                 let deployer = AccountAddress::from([0u8; 20]); // System deployer
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
+                // Use genesis timestamp (0) for deterministic genesis state
+                // CRITICAL: Do not use SystemTime::now() - it breaks consensus determinism
+                // All validators must produce identical genesis state
+                let genesis_timestamp: u64 = 0;
 
                 for token in &genesis.spot_tokens {
                     let params = hypercore_primitives::SpotTokenDeployParams {
@@ -105,7 +105,7 @@ impl HyperCoreApp {
                         erc20_address: None,
                     };
 
-                    match engine.deploy_token(params, deployer, now) {
+                    match engine.deploy_token(params, deployer, genesis_timestamp) {
                         Ok(deployed) => {
                             tracing::info!(
                                 "Genesis: Deployed spot token {} at index {}",
@@ -185,10 +185,21 @@ impl HyperCoreApp {
         Ok(())
     }
 
-    /// Check transaction validity
+    /// Check transaction validity (for mempool admission)
+    ///
+    /// Uses current system time for timestamp-based nonce validation.
+    /// This is acceptable for CheckTx since mempool admission is NOT consensus-critical.
+    /// Each node can independently decide which transactions to accept into its mempool.
     pub fn check_tx(&self, tx: &Transaction) -> Result<(), AppError> {
-        // Basic validation
-        self.state.validate_tx(tx)?;
+        // Get current time for mempool validation
+        // Note: This is NOT consensus-critical - each node validates mempool independently
+        let current_time_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        // Basic validation with current time as reference
+        self.state.validate_tx(tx, current_time_ms)?;
         Ok(())
     }
 
@@ -196,9 +207,16 @@ impl HyperCoreApp {
     ///
     /// This is the main entry point for transaction execution from the ABCI layer.
     /// Uses blocking operations internally to work in sync context.
+    ///
+    /// # Determinism
+    /// This function is deterministic: given the same transaction and timestamp,
+    /// all validators will produce identical results. The timestamp parameter
+    /// is the consensus-agreed block timestamp, ensuring all nodes use the same
+    /// reference time for timestamp-based nonce validation.
     pub fn execute_tx(&mut self, tx: &Transaction, timestamp: Timestamp) -> Result<TxResult, AppError> {
-        // Validate
-        self.state.validate_tx(tx)?;
+        // Validate using block timestamp for deterministic nonce validation
+        // CRITICAL: Must use block timestamp, not SystemTime::now(), for consensus
+        self.state.validate_tx(tx, timestamp)?;
 
         let sender = tx.sender()?;
 
@@ -916,8 +934,9 @@ impl HyperCoreApp {
         // Store events for this block (in AppState)
         self.state.store_block_events(self.state.height, events.clone());
 
-        // Store block metadata (in AppState)
-        let app_hash = self.state.compute_app_hash();
+        // Finalize block state - builds Merkle trees and computes app hash
+        // Phase 3C: This caches the Merkle trees for efficient proof generation
+        let app_hash = self.state.end_block();
         let tx_count = self.state.pending_txs().len() as u32;
         self.state.store_block_metadata(BlockMeta {
             height: self.state.height,

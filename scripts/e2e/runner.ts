@@ -38,6 +38,7 @@ import {
   runStressTests,
   runAdvancedTests,
   runRiskTests,
+  runStateProofTests,
 } from './tests/index.js';
 
 // ============================================================================
@@ -140,6 +141,7 @@ async function main(): Promise<void> {
     await runStressTests(ctx);
     await runAdvancedTests(ctx);
     await runRiskTests(ctx);
+    await runStateProofTests(ctx);
   } catch (error) {
     log(`${colors.red}Fatal error during test execution:${colors.reset}`);
     log(`${colors.red}${error}${colors.reset}`);

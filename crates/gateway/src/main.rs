@@ -31,7 +31,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use hypercore_chain::{BlockProducer, BlockProducerConfig, HyperCoreApp, SharedMempool};
 use hypercore_engine::{EngineState, SpotEngine};
-use hypercore_gateway::{GatewayConfig, GatewayServer};
+use hypercore_gateway::{GatewayConfig, GatewayServer, RateLimitConfig, ValidationConfig};
 use hypercore_primitives::{AccountAddress, Decimal, Market, MarketConfig, SpotTokenDeployParams};
 
 /// HyperCore Gateway CLI
@@ -59,6 +59,14 @@ struct Cli {
     /// Log level
     #[arg(long, default_value = "info", env = "RUST_LOG")]
     log_level: String,
+
+    /// Disable rate limiting (for development/testing)
+    #[arg(long, default_value = "false", env = "DISABLE_RATE_LIMIT")]
+    disable_rate_limit: bool,
+
+    /// Use development rate limits (more permissive)
+    #[arg(long, default_value = "false", env = "DEV_RATE_LIMIT")]
+    dev_rate_limit: bool,
 }
 
 #[tokio::main]
@@ -90,12 +98,26 @@ async fn main() -> anyhow::Result<()> {
     // are designed to work with shared state when connected.
     let app = Arc::new(RwLock::new(HyperCoreApp::new()));
 
+    // Create rate limit config based on CLI flags
+    let rate_limit = if cli.disable_rate_limit {
+        tracing::warn!("Rate limiting is DISABLED via CLI flag");
+        RateLimitConfig::disabled()
+    } else if cli.dev_rate_limit {
+        tracing::info!("Using development rate limits (relaxed)");
+        RateLimitConfig::development()
+    } else {
+        tracing::info!("Using default rate limits");
+        RateLimitConfig::default()
+    };
+
     // Create gateway config
     let config = GatewayConfig {
         http_addr: cli.http_addr,
         enable_websocket: cli.enable_websocket,
         chain_id: cli.chain_id,
         block_time_ms: cli.block_time_ms,
+        rate_limit,
+        validation: ValidationConfig::default(),
     };
 
     // Create gateway server with all components

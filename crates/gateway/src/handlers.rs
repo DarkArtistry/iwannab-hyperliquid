@@ -10,6 +10,7 @@ use axum::{
     Json,
 };
 use serde_json::{json, Value};
+use sha3::Digest;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -28,7 +29,15 @@ pub async fn handle_info(
     State(state): State<AppState>,
     Json(request): Json<InfoRequest>,
 ) -> impl IntoResponse {
-    match process_info_request(&state.engine, &state.spot_engine, request).await {
+    // Validate request first (fail-fast)
+    if let Err(e) = state.validator.validate_info_request(&request) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("Validation error: {}", e)})),
+        );
+    }
+
+    match process_info_request(&state.engine, &state.spot_engine, &state.app, request).await {
         Ok(response) => (StatusCode::OK, Json(response)),
         Err(e) => (
             StatusCode::BAD_REQUEST,
@@ -42,6 +51,14 @@ pub async fn handle_exchange(
     State(state): State<AppState>,
     Json(request): Json<ExchangeRequest>,
 ) -> impl IntoResponse {
+    // Validate request first (fail-fast)
+    if let Err(e) = state.validator.validate_exchange_request(&request) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("Validation error: {}", e)})),
+        );
+    }
+
     match process_exchange_request(&state.engine, &state.spot_engine, &state.app, request).await {
         Ok(response) => (StatusCode::OK, Json(response)),
         Err(e) => (
@@ -55,6 +72,7 @@ pub async fn handle_exchange(
 async fn process_info_request(
     engine: &Arc<RwLock<EngineState>>,
     spot_engine: &Arc<RwLock<SpotEngine>>,
+    app: &Arc<RwLock<HyperCoreApp>>,
     request: InfoRequest,
 ) -> Result<Value, HandlerError> {
     // Handle spot-specific requests first
@@ -67,6 +85,10 @@ async fn process_info_request(
         | InfoRequest::SpotTokenInfo { .. }
         | InfoRequest::UnifiedBalances { .. } => {
             return process_spot_info_request(spot_engine, request).await;
+        }
+        // Handle state proof requests (Phase 3C)
+        InfoRequest::StateInfo | InfoRequest::StateProof { .. } => {
+            return process_state_proof_request(app, request).await;
         }
         _ => {}
     }
@@ -245,6 +267,11 @@ async fn process_info_request(
         | InfoRequest::SpotTokenInfo { .. }
         | InfoRequest::UnifiedBalances { .. } => {
             unreachable!("Spot requests handled in process_spot_info_request")
+        }
+
+        // State proof requests are handled above
+        InfoRequest::StateInfo | InfoRequest::StateProof { .. } => {
+            unreachable!("State proof requests handled in process_state_proof_request")
         }
     }
 }
@@ -445,6 +472,100 @@ async fn process_spot_info_request(
 
         // Other requests are handled in process_info_request
         _ => Err(HandlerError::Internal("Unexpected request type".to_string())),
+    }
+}
+
+/// Process state proof requests (Phase 3C)
+///
+/// Handles requests for state information and Merkle proofs:
+/// - StateInfo: Returns block height, app hash, and state roots
+/// - StateProof: Returns a Merkle proof for a user's balance
+async fn process_state_proof_request(
+    app: &Arc<RwLock<HyperCoreApp>>,
+    request: InfoRequest,
+) -> Result<Value, HandlerError> {
+    let app_guard = app.read().await;
+
+    match request {
+        InfoRequest::StateInfo => {
+            // Return current state information
+            let height = app_guard.current_height();
+            let unified_root = app_guard.state.get_unified_state_root();
+            let nonce_root = app_guard.state.get_nonce_root();
+
+            // Compute app hash (combination of all state roots)
+            let app_hash = {
+                let mut hasher = sha3::Keccak256::new();
+                sha3::Digest::update(&mut hasher, &unified_root);
+                sha3::Digest::update(&mut hasher, &nonce_root);
+                let result: [u8; 32] = sha3::Digest::finalize(hasher).into();
+                result
+            };
+
+            Ok(json!({
+                "blockHeight": height,
+                "appHash": format!("0x{}", hex::encode(app_hash)),
+                "stateRoots": {
+                    "unifiedState": format!("0x{}", hex::encode(unified_root)),
+                    "nonces": format!("0x{}", hex::encode(nonce_root))
+                }
+            }))
+        }
+
+        InfoRequest::StateProof { user, token } => {
+            let address = parse_address(&user)?;
+
+            // Get the proof for this user's balance
+            match app_guard.state.prove_balance(address, token) {
+                Some(proof) => {
+                    // Get the current balance for context
+                    let unified_state = app_guard.unified_state();
+                    let unified = unified_state.read().unwrap();
+                    let balance = unified.get_balance_or_default(address, token);
+                    let root = app_guard.state.get_unified_state_root();
+
+                    // Serialize proof to hex for API response
+                    let proof_bytes = proof.to_bytes();
+
+                    Ok(json!({
+                        "user": user,
+                        "token": token,
+                        "balance": {
+                            "total": balance.total.to_string_trimmed(),
+                            "coreView": balance.core_view.to_string_trimmed(),
+                            "evmView": balance.evm_view.to_string_trimmed()
+                        },
+                        "proof": {
+                            "leafHash": format!("0x{}", hex::encode(proof.leaf_hash)),
+                            "leafIndex": proof.leaf_index,
+                            "siblings": proof.siblings.iter()
+                                .map(|s| format!("0x{}", hex::encode(s)))
+                                .collect::<Vec<_>>(),
+                            "directions": proof.directions.iter()
+                                .map(|d| match d {
+                                    hypercore_chain::merkle::ProofDirection::Left => "left",
+                                    hypercore_chain::merkle::ProofDirection::Right => "right",
+                                })
+                                .collect::<Vec<_>>(),
+                            "proofHex": format!("0x{}", hex::encode(&proof_bytes))
+                        },
+                        "root": format!("0x{}", hex::encode(root)),
+                        "verified": proof.verify(&root)
+                    }))
+                }
+                None => {
+                    // No proof available - user might not have a balance
+                    Ok(json!({
+                        "user": user,
+                        "token": token,
+                        "error": "No balance found for this user/token combination",
+                        "proof": null
+                    }))
+                }
+            }
+        }
+
+        _ => Err(HandlerError::Internal("Unexpected request type for state proof".to_string())),
     }
 }
 

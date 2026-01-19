@@ -3,6 +3,8 @@
 //! Phase 2B: The gateway now integrates with the chain crate for proper
 //! transaction flow. Exchange requests are converted to Transactions and
 //! submitted to the mempool, where the BlockProducer picks them up.
+//!
+//! Phase 6: Added rate limiting middleware for DoS protection.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -19,6 +21,8 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 use crate::handlers::{handle_exchange, handle_info};
+use crate::rate_limit::{RateLimiter, RateLimitConfig};
+use crate::validation::{ValidationConfig, Validator};
 use crate::websocket::{ws_handler, WsManager};
 
 /// Gateway server configuration
@@ -32,6 +36,10 @@ pub struct GatewayConfig {
     pub chain_id: u64,
     /// Block time in milliseconds (for BlockProducer)
     pub block_time_ms: u64,
+    /// Rate limiting configuration
+    pub rate_limit: RateLimitConfig,
+    /// Input validation configuration
+    pub validation: ValidationConfig,
 }
 
 impl Default for GatewayConfig {
@@ -41,13 +49,48 @@ impl Default for GatewayConfig {
             enable_websocket: true,
             chain_id: 1337,
             block_time_ms: 500, // 500ms blocks
+            rate_limit: RateLimitConfig::default(),
+            validation: ValidationConfig::default(),
         }
+    }
+}
+
+impl GatewayConfig {
+    /// Create a config with rate limiting disabled (for testing)
+    pub fn without_rate_limit(mut self) -> Self {
+        self.rate_limit = RateLimitConfig::disabled();
+        self
+    }
+
+    /// Create a config with development rate limits (relaxed)
+    pub fn with_dev_rate_limit(mut self) -> Self {
+        self.rate_limit = RateLimitConfig::development();
+        self
+    }
+
+    /// Create a config with production rate limits (strict)
+    pub fn with_prod_rate_limit(mut self) -> Self {
+        self.rate_limit = RateLimitConfig::production();
+        self
+    }
+
+    /// Create a config with validation disabled (for testing)
+    pub fn without_validation(mut self) -> Self {
+        self.validation = ValidationConfig::disabled();
+        self
+    }
+
+    /// Create a config with strict validation (for production)
+    pub fn with_strict_validation(mut self) -> Self {
+        self.validation = ValidationConfig::strict();
+        self
     }
 }
 
 /// Shared application state
 ///
 /// Phase 2B: Now includes chain components for proper transaction flow.
+/// Phase 6: Added validator for input validation.
 #[derive(Clone)]
 pub struct AppState {
     /// Engine state for perpetual markets (read access for info queries)
@@ -62,6 +105,8 @@ pub struct AppState {
     pub mempool: SharedMempool,
     /// HyperCore application (for direct execution in development mode)
     pub app: Arc<RwLock<HyperCoreApp>>,
+    /// Input validator
+    pub validator: Arc<Validator>,
 }
 
 /// Gateway server
@@ -72,6 +117,8 @@ pub struct GatewayServer {
     ws_manager: Arc<WsManager>,
     mempool: SharedMempool,
     app: Arc<RwLock<HyperCoreApp>>,
+    rate_limiter: RateLimiter,
+    validator: Arc<Validator>,
 }
 
 impl GatewayServer {
@@ -83,6 +130,8 @@ impl GatewayServer {
         mempool: SharedMempool,
         app: Arc<RwLock<HyperCoreApp>>,
     ) -> Self {
+        let rate_limiter = RateLimiter::new(config.rate_limit.clone());
+        let validator = Arc::new(Validator::new(config.validation.clone()));
         Self {
             config,
             engine,
@@ -90,6 +139,8 @@ impl GatewayServer {
             ws_manager: Arc::new(WsManager::new()),
             mempool,
             app,
+            rate_limiter,
+            validator,
         }
     }
 
@@ -102,6 +153,8 @@ impl GatewayServer {
         let spot_engine = Arc::new(RwLock::new(SpotEngine::new()));
         let mempool = SharedMempool::new();
         let app = Arc::new(RwLock::new(HyperCoreApp::new()));
+        let rate_limiter = RateLimiter::new(config.rate_limit.clone());
+        let validator = Arc::new(Validator::new(config.validation.clone()));
 
         Self {
             config,
@@ -110,7 +163,19 @@ impl GatewayServer {
             ws_manager: Arc::new(WsManager::new()),
             mempool,
             app,
+            rate_limiter,
+            validator,
         }
+    }
+
+    /// Get the rate limiter for monitoring
+    pub fn rate_limiter(&self) -> &RateLimiter {
+        &self.rate_limiter
+    }
+
+    /// Get the validator for monitoring
+    pub fn validator(&self) -> &Validator {
+        &self.validator
     }
 
     /// Get the mempool for submitting transactions externally
@@ -151,6 +216,7 @@ impl GatewayServer {
             chain_id: self.config.chain_id,
             mempool: self.mempool.clone(),
             app: Arc::clone(&self.app),
+            validator: Arc::clone(&self.validator),
         };
 
         // CORS configuration
@@ -172,16 +238,32 @@ impl GatewayServer {
             router = router.route("/ws", get(ws_handler));
         }
 
+        // Apply layers in order: rate limiting -> CORS -> tracing
+        // Rate limiting is first so it can reject requests before any processing
         router
             .with_state(app_state)
             .layer(cors)
             .layer(TraceLayer::new_for_http())
+            .layer(self.rate_limiter.layer())
     }
 
     /// Run the server
     pub async fn run(self) -> Result<(), GatewayError> {
         let router = self.build_router();
         let addr = self.config.http_addr;
+
+        // Start rate limiter cleanup task
+        if self.config.rate_limit.enabled {
+            self.rate_limiter.start_cleanup_task();
+            tracing::info!(
+                "Rate limiting enabled: {} req/min global, {} req/min for /exchange, {} req/min for /info",
+                self.config.rate_limit.requests_per_minute,
+                self.config.rate_limit.exchange_requests_per_minute,
+                self.config.rate_limit.info_requests_per_minute
+            );
+        } else {
+            tracing::warn!("Rate limiting is DISABLED");
+        }
 
         tracing::info!("Starting gateway server on {}", addr);
 
@@ -203,6 +285,19 @@ impl GatewayServer {
     ) -> Result<(), GatewayError> {
         let router = self.build_router();
         let addr = self.config.http_addr;
+
+        // Start rate limiter cleanup task
+        if self.config.rate_limit.enabled {
+            self.rate_limiter.start_cleanup_task();
+            tracing::info!(
+                "Rate limiting enabled: {} req/min global, {} req/min for /exchange, {} req/min for /info",
+                self.config.rate_limit.requests_per_minute,
+                self.config.rate_limit.exchange_requests_per_minute,
+                self.config.rate_limit.info_requests_per_minute
+            );
+        } else {
+            tracing::warn!("Rate limiting is DISABLED");
+        }
 
         tracing::info!("Starting gateway server on {}", addr);
 
@@ -243,6 +338,27 @@ mod tests {
         assert_eq!(config.http_addr.port(), 4000);
         assert!(config.enable_websocket);
         assert_eq!(config.block_time_ms, 500);
+        assert!(config.rate_limit.enabled);
+    }
+
+    #[test]
+    fn test_config_without_rate_limit() {
+        let config = GatewayConfig::default().without_rate_limit();
+        assert!(!config.rate_limit.enabled);
+    }
+
+    #[test]
+    fn test_config_with_dev_rate_limit() {
+        let config = GatewayConfig::default().with_dev_rate_limit();
+        assert!(config.rate_limit.enabled);
+        assert_eq!(config.rate_limit.requests_per_minute, 1000);
+    }
+
+    #[test]
+    fn test_config_with_prod_rate_limit() {
+        let config = GatewayConfig::default().with_prod_rate_limit();
+        assert!(config.rate_limit.enabled);
+        assert_eq!(config.rate_limit.requests_per_minute, 60);
     }
 
     #[tokio::test]
@@ -254,7 +370,21 @@ mod tests {
         let ws = server.ws_manager();
         assert!(Arc::strong_count(&ws) >= 2);
 
+        // Verify rate limiter is created
+        let limiter = server.rate_limiter();
+        assert_eq!(limiter.state().tracked_ips(), 0);
+
         // Verify we can create a block producer
         let _producer = server.create_block_producer();
+    }
+
+    #[tokio::test]
+    async fn test_server_with_disabled_rate_limiting() {
+        let config = GatewayConfig::default().without_rate_limit();
+        let server = GatewayServer::standalone(config);
+
+        // Rate limiter should exist but be disabled
+        let limiter = server.rate_limiter();
+        assert!(!limiter.state().config().enabled);
     }
 }

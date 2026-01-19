@@ -30,7 +30,7 @@ use hypercore_chain::{AbciService, HyperCoreApp};
 use hypercore_chain::{extract_state, restore_state, restore_chain_state};
 use hypercore_engine::{EngineState, SpotEngine};
 use hypercore_evm::{EvmExecutor, EvmRpcServer};
-use hypercore_gateway::{GatewayConfig, GatewayServer};
+use hypercore_gateway::{GatewayConfig, GatewayServer, RateLimitConfig, ValidationConfig};
 use hypercore_primitives::new_shared_unified_state;
 
 #[cfg(feature = "persistence")]
@@ -298,11 +298,14 @@ async fn main() -> anyhow::Result<()> {
             let mempool = hypercore_chain::SharedMempool::new();
 
             // Create gateway server with chain integration
+            // Use development rate limits and validation for the node (more permissive)
             let gateway_config = GatewayConfig {
                 http_addr,
                 enable_websocket: true,
                 chain_id,
                 block_time_ms: 500, // 500ms blocks
+                rate_limit: RateLimitConfig::development(),
+                validation: ValidationConfig::default(),
             };
             let gateway = GatewayServer::new(
                 gateway_config,

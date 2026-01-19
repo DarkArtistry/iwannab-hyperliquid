@@ -84,6 +84,17 @@ pub enum InfoRequest {
     // === Phase 2A: Unified Balance Queries ===
     /// Get unified balances (showing Core and EVM views)
     UnifiedBalances { user: String },
+
+    // === Phase 3C: State Proof Queries ===
+    /// Get current state info (block height, app hash, state roots)
+    StateInfo,
+    /// Get a Merkle proof for a user's balance
+    #[serde(rename = "stateProof")]
+    StateProof {
+        user: String,
+        #[serde(default)]
+        token: TokenIndex,
+    },
 }
 
 fn default_sig_figs() -> u8 {

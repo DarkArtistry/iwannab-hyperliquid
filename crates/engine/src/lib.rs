@@ -401,6 +401,9 @@ impl Engine {
             }
         }
 
+        // Sort for deterministic liquidation order
+        // This ensures all validators process liquidations in the same order
+        result.sort_by_key(|(addr, mid)| (*addr, *mid));
         result
     }
 

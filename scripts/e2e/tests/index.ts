@@ -53,3 +53,6 @@ export { runAdvancedTests } from './advanced.js';
 
 // 15. Risk & Margin Tests
 export { runRiskTests } from './risk.js';
+
+// 16. State Proof Tests (Phase 3C)
+export { runStateProofTests } from './state-proofs.js';

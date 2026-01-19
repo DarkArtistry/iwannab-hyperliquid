@@ -3,6 +3,7 @@
 //! Shared types and utilities used across all HyperCore components.
 
 pub mod decimal;
+pub mod eip712;
 pub mod error;
 pub mod events;
 pub mod market;

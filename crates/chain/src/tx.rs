@@ -1,8 +1,15 @@
 //! Transaction types for HyperCore chain
+//!
+//! Note: Core EIP-712 encoding functions are imported from hypercore_primitives::eip712
+//! to ensure consistency with the gateway crate's implementation.
 
 use hypercore_primitives::{
     AccountAddress, Decimal, MarketId, OrderId, OrderRequest, OrderSide, OrderType, Signature,
     TimeInForce,
+    eip712::{
+        compute_domain_separator, encode_array, encode_bool, encode_string,
+        encode_uint64, encode_uint8, encode_address_bytes, type_hash, DEFAULT_CHAIN_ID,
+    },
 };
 use serde::{Deserialize, Serialize};
 
@@ -63,8 +70,8 @@ impl Transaction {
     fn compute_eip712_hash(&self) -> Result<[u8; 32], TransactionError> {
         use sha3::{Digest, Keccak256};
 
-        // Domain separator
-        let domain_separator = compute_domain_separator();
+        // Domain separator (use default chain ID for now, will be configurable)
+        let domain_separator = compute_domain_separator(DEFAULT_CHAIN_ID);
 
         // Struct hash based on action type
         let struct_hash = self.action.compute_struct_hash(self.nonce)?;
@@ -111,57 +118,14 @@ pub enum TransactionType {
 }
 
 // ============================================================================
-// EIP-712 Encoding Helpers (must match gateway/src/eip712.rs exactly)
+// Address Encoding Helper
 // ============================================================================
 
-/// Encode a string as keccak256 hash (EIP-712 string encoding)
-fn encode_string(s: &str) -> [u8; 32] {
-    use sha3::{Digest, Keccak256};
-    let result = Keccak256::digest(s.as_bytes());
-    let mut hash = [0u8; 32];
-    hash.copy_from_slice(&result);
-    hash
-}
-
-/// Encode a uint8 as 32-byte big-endian
-fn encode_uint8(v: u8) -> [u8; 32] {
-    let mut bytes = [0u8; 32];
-    bytes[31] = v;
-    bytes
-}
-
-/// Encode a uint64 as 32-byte big-endian
-fn encode_uint64(v: u64) -> [u8; 32] {
-    let mut bytes = [0u8; 32];
-    bytes[24..32].copy_from_slice(&v.to_be_bytes());
-    bytes
-}
-
-/// Encode a bool as 32-byte (0 or 1)
-fn encode_bool(v: bool) -> [u8; 32] {
-    let mut bytes = [0u8; 32];
-    bytes[31] = if v { 1 } else { 0 };
-    bytes
-}
-
-/// Encode an address as 32-byte (left-padded with zeros)
+/// Encode an AccountAddress as 32-byte (left-padded with zeros)
+/// This wraps the shared encode_address_bytes for AccountAddress type
 fn encode_address(addr: &AccountAddress) -> [u8; 32] {
-    let mut bytes = [0u8; 32];
-    bytes[12..32].copy_from_slice(addr.as_slice());
-    bytes
-}
-
-/// Encode an array of struct hashes as keccak256 of concatenated hashes
-fn encode_array(hashes: &[[u8; 32]]) -> [u8; 32] {
-    use sha3::{Digest, Keccak256};
-    let mut hasher = Keccak256::new();
-    for hash in hashes {
-        hasher.update(hash);
-    }
-    let result = hasher.finalize();
-    let mut hash = [0u8; 32];
-    hash.copy_from_slice(&result);
-    hash
+    let addr_bytes: [u8; 20] = addr.as_slice().try_into().unwrap_or([0u8; 20]);
+    encode_address_bytes(&addr_bytes)
 }
 
 impl TransactionType {
@@ -515,32 +479,7 @@ pub enum TransactionError {
     SignatureRecoveryFailed,
 }
 
-/// Compute EIP-712 domain separator for HyperCore
-fn compute_domain_separator() -> [u8; 32] {
-    use sha3::{Digest, Keccak256};
-
-    let type_hash = Keccak256::digest(
-        b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
-    );
-
-    let name_hash = Keccak256::digest(b"HyperCore");
-    let version_hash = Keccak256::digest(b"1");
-    let chain_id: [u8; 32] = {
-        let mut buf = [0u8; 32];
-        buf[31] = 0x39; // 1337 in last bytes
-        buf[30] = 0x05;
-        buf
-    };
-    let verifying_contract = [0u8; 32]; // Zero address
-
-    let mut hasher = Keccak256::new();
-    hasher.update(type_hash);
-    hasher.update(name_hash);
-    hasher.update(version_hash);
-    hasher.update(chain_id);
-    hasher.update(verifying_contract);
-    hasher.finalize().into()
-}
+// DEFAULT_CHAIN_ID and compute_domain_separator are now imported from hypercore_primitives::eip712
 
 /// Recover address from message hash and signature
 fn recover_address(message_hash: &[u8; 32], signature: &Signature) -> Result<AccountAddress, TransactionError> {
@@ -607,8 +546,15 @@ mod tests {
 
     #[test]
     fn test_domain_separator() {
-        let sep = compute_domain_separator();
+        let sep = compute_domain_separator(DEFAULT_CHAIN_ID);
         assert_eq!(sep.len(), 32);
+    }
+
+    #[test]
+    fn test_different_chain_ids_produce_different_separators() {
+        let sep1 = compute_domain_separator(1);
+        let sep2 = compute_domain_separator(1337);
+        assert_ne!(sep1, sep2);
     }
 
     #[test]

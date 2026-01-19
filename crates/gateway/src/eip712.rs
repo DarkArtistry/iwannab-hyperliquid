@@ -4,6 +4,9 @@
 //! that matches the TypeScript SDK's viem implementation exactly.
 //!
 //! Reference: https://eips.ethereum.org/EIPS/eip-712
+//!
+//! Note: Core encoding functions are imported from hypercore_primitives::eip712
+//! to ensure consistency with the chain crate's implementation.
 
 use sha3::{Digest, Keccak256};
 
@@ -12,31 +15,20 @@ use crate::api::{
     SpotCancelWire, SpotOrderWire,
 };
 
-// ============================================================================
-// Constants
-// ============================================================================
+// Re-export shared constants and functions from primitives
+pub use hypercore_primitives::eip712::{
+    compute_domain_separator, DEFAULT_CHAIN_ID, DOMAIN_TYPE_HASH,
+};
 
-/// Default chain ID
-pub const DEFAULT_CHAIN_ID: u64 = 1337;
-
-/// EIP-712 Domain Type Hash
-/// keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)")
-pub const DOMAIN_TYPE_HASH: [u8; 32] = [
-    0x8b, 0x73, 0xc3, 0xc6, 0x9b, 0xb8, 0xfe, 0x3d, 0x51, 0x2e, 0xcc, 0x4c, 0xf7, 0x59, 0xcc, 0x79,
-    0x23, 0x9f, 0x7b, 0x17, 0x9b, 0x0f, 0xfa, 0xca, 0xa9, 0xa7, 0x5d, 0x52, 0x2b, 0x39, 0x40, 0x0f,
-];
+// Import shared encoding functions (used internally)
+use hypercore_primitives::eip712::{
+    encode_array, encode_bool, encode_string, encode_uint64, encode_uint8,
+    type_hash, encode_address_str as encode_address,
+};
 
 // ============================================================================
 // Type Hashes for Action Types
 // ============================================================================
-
-/// Compute type hash for a type string
-fn type_hash(type_str: &str) -> [u8; 32] {
-    let result = Keccak256::digest(type_str.as_bytes());
-    let mut hash = [0u8; 32];
-    hash.copy_from_slice(&result);
-    hash
-}
 
 /// Get the type hash for Order action
 /// Action(string type,Order[] orders,string grouping,uint64 nonce)Order(uint8 a,bool b,string p,string s,bool r,string t)
@@ -130,61 +122,8 @@ fn view_transfer_action_type_hash() -> [u8; 32] {
 }
 
 // ============================================================================
-// Encoding Helpers
+// Action-Specific Helpers
 // ============================================================================
-
-/// Encode a string as keccak256 hash (EIP-712 string encoding)
-fn encode_string(s: &str) -> [u8; 32] {
-    let result = Keccak256::digest(s.as_bytes());
-    let mut hash = [0u8; 32];
-    hash.copy_from_slice(&result);
-    hash
-}
-
-/// Encode a uint8 as 32-byte big-endian
-fn encode_uint8(v: u8) -> [u8; 32] {
-    let mut bytes = [0u8; 32];
-    bytes[31] = v;
-    bytes
-}
-
-/// Encode a uint64 as 32-byte big-endian
-fn encode_uint64(v: u64) -> [u8; 32] {
-    let mut bytes = [0u8; 32];
-    bytes[24..32].copy_from_slice(&v.to_be_bytes());
-    bytes
-}
-
-/// Encode a bool as 32-byte (0 or 1)
-fn encode_bool(v: bool) -> [u8; 32] {
-    let mut bytes = [0u8; 32];
-    bytes[31] = if v { 1 } else { 0 };
-    bytes
-}
-
-/// Encode an address string as 32-byte (left-padded)
-fn encode_address(addr: &str) -> [u8; 32] {
-    let hex_str = addr.strip_prefix("0x").unwrap_or(addr);
-    let mut bytes = [0u8; 32];
-    if let Ok(addr_bytes) = hex::decode(hex_str) {
-        if addr_bytes.len() == 20 {
-            bytes[12..32].copy_from_slice(&addr_bytes);
-        }
-    }
-    bytes
-}
-
-/// Encode an array of struct hashes as keccak256 of concatenated hashes
-fn encode_array(hashes: &[[u8; 32]]) -> [u8; 32] {
-    let mut hasher = Keccak256::new();
-    for hash in hashes {
-        hasher.update(hash);
-    }
-    let result = hasher.finalize();
-    let mut hash = [0u8; 32];
-    hash.copy_from_slice(&result);
-    hash
-}
 
 /// Convert OrderTypeWire to TIF string (lowercase for EIP-712 consistency)
 fn order_type_to_tif(t: &OrderTypeWire) -> String {
@@ -466,30 +405,6 @@ pub fn compute_action_struct_hash(action: &ExchangeAction, nonce: u64) -> [u8; 3
             hash
         }
     }
-}
-
-/// Compute the EIP-712 domain separator
-pub fn compute_domain_separator(chain_id: u64) -> [u8; 32] {
-    // keccak256("HyperCore")
-    let name_hash = encode_string("HyperCore");
-    // keccak256("1")
-    let version_hash = encode_string("1");
-    // chainId as uint256
-    let chain_id_bytes = encode_uint64(chain_id);
-    // verifyingContract as address (zero address)
-    let verifying_contract = [0u8; 32];
-
-    let mut hasher = Keccak256::new();
-    hasher.update(DOMAIN_TYPE_HASH);
-    hasher.update(name_hash);
-    hasher.update(version_hash);
-    hasher.update(chain_id_bytes);
-    hasher.update(verifying_contract);
-
-    let result = hasher.finalize();
-    let mut hash = [0u8; 32];
-    hash.copy_from_slice(&result);
-    hash
 }
 
 /// Compute the full EIP-712 typed data hash

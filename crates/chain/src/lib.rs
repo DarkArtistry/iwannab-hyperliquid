@@ -51,6 +51,7 @@ pub mod abci;
 pub mod app;
 pub mod block_producer;
 pub mod mempool;
+pub mod merkle;
 pub mod state;
 pub mod tx;
 
@@ -66,6 +67,7 @@ pub use abci::AbciService;
 pub use app::HyperCoreApp;
 pub use block_producer::{BlockProducer, BlockProducerConfig, BlockResult, PostCommitHandler};
 pub use mempool::{Mempool, SharedMempool};
+pub use merkle::{MerkleProof, MerkleTree, verify_proof, compute_leaf_hash, hash_entry};
 pub use state::{AppState, SharedEngine, SharedEngineState, SharedSpotEngine};
 pub use tx::{Transaction, TransactionType};
 
