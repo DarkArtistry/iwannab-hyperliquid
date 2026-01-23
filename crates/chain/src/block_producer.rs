@@ -13,6 +13,14 @@
 //! 2. DeliverTx  - Execute each transaction
 //! 3. EndBlock   - Finalize the block (funding, liquidations)
 //! 4. Commit     - Commit state and compute app hash
+//! 5. Attest     - Sign and broadcast state attestation (Phase 7B)
+//!
+//! ## State Attestation (Phase 7B)
+//!
+//! After each block is committed, the producer can optionally:
+//! - Sign a state attestation with the computed app_hash
+//! - Record the hash for local comparison
+//! - Check for divergence alerts from other validators
 //!
 //! ## Usage
 //!
@@ -21,6 +29,7 @@
 //! producer.start().await; // Runs in a loop
 //! ```
 
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,6 +37,8 @@ use tokio::sync::RwLock;
 use tokio::time::{interval, Instant};
 
 use crate::app::HyperCoreApp;
+use crate::attestation::AttestationKeyPair;
+use crate::attestation_collector::AttestationCollector;
 use crate::mempool::{Mempool, SharedMempool};
 use crate::tx::Transaction;
 
@@ -67,6 +78,12 @@ pub struct BlockProducer {
     running: Arc<std::sync::atomic::AtomicBool>,
     /// Optional post-commit handler (e.g., for persistence)
     on_commit: Option<PostCommitHandler>,
+    /// Optional attestation key pair for signing state attestations (Phase 7B)
+    attestation_key: Option<AttestationKeyPair>,
+    /// Optional attestation collector for state verification (Phase 7B)
+    attestation_collector: Option<Arc<AttestationCollector>>,
+    /// External halt flag (can be set by divergence handler)
+    halted: Option<Arc<AtomicBool>>,
 }
 
 impl BlockProducer {
@@ -82,6 +99,9 @@ impl BlockProducer {
             config,
             running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             on_commit: None,
+            attestation_key: None,
+            attestation_collector: None,
+            halted: None,
         }
     }
 
@@ -108,22 +128,66 @@ impl BlockProducer {
         self
     }
 
+    /// Enable state attestation (Phase 7B)
+    ///
+    /// When enabled, the producer will:
+    /// 1. Sign a state attestation after each block
+    /// 2. Record our app_hash in the collector
+    /// 3. Check for divergence before producing blocks
+    pub fn with_attestation(
+        mut self,
+        key: AttestationKeyPair,
+        collector: Arc<AttestationCollector>,
+    ) -> Self {
+        self.attestation_key = Some(key);
+        self.attestation_collector = Some(collector);
+        self
+    }
+
+    /// Set an external halt flag (e.g., from divergence handler)
+    ///
+    /// When this flag is set to true, block production will stop.
+    pub fn with_halt_flag(mut self, halted: Arc<AtomicBool>) -> Self {
+        self.halted = Some(halted);
+        self
+    }
+
+    /// Check if the node is halted due to divergence
+    pub fn is_halted(&self) -> bool {
+        self.halted
+            .as_ref()
+            .map(|h| h.load(std::sync::atomic::Ordering::SeqCst))
+            .unwrap_or(false)
+    }
+
     /// Start block production loop
     ///
     /// This runs indefinitely, producing blocks at the configured interval.
     /// Call `stop()` to terminate.
+    ///
+    /// Will stop producing blocks if the halted flag is set (divergence detected).
     pub async fn start(&self) {
         self.running.store(true, std::sync::atomic::Ordering::SeqCst);
 
         let mut block_interval = interval(Duration::from_millis(self.config.block_time_ms));
 
+        let attestation_enabled = self.attestation_key.is_some();
         tracing::info!(
-            "Block producer starting with {}ms block time",
-            self.config.block_time_ms
+            "Block producer starting with {}ms block time (attestation: {})",
+            self.config.block_time_ms,
+            if attestation_enabled { "enabled" } else { "disabled" }
         );
 
         while self.running.load(std::sync::atomic::Ordering::SeqCst) {
             block_interval.tick().await;
+
+            // Check if halted due to divergence
+            if self.is_halted() {
+                tracing::error!("Block production halted due to state divergence!");
+                tracing::error!("Manual intervention required to resume.");
+                // Keep running but don't produce blocks
+                continue;
+            }
 
             if let Err(e) = self.produce_block().await {
                 tracing::error!("Block production failed: {}", e);
@@ -225,6 +289,33 @@ impl BlockProducer {
             handler(&result, &app);
         }
 
+        // Phase 7B: State Attestation
+        // Record our hash and create attestation after commit
+        if let (Some(collector), Some(key)) = (&self.attestation_collector, &self.attestation_key) {
+            // Record our computed hash for divergence comparison
+            collector.record_our_hash(height, app_hash).await;
+
+            // Create and sign attestation
+            let attestation = key.sign_attestation(height, app_hash);
+
+            tracing::debug!(
+                "Created attestation for block {}: hash {:02x?}",
+                height,
+                &app_hash[..8]
+            );
+
+            // Process our own attestation (this allows the collector to track our vote)
+            // In a real network, we'd also broadcast this to other validators
+            if let Err(e) = collector.process_attestation(attestation.clone()).await {
+                // This might fail if we're not registered as a validator (in tests)
+                tracing::debug!("Could not process own attestation: {}", e);
+            }
+
+            // TODO: Broadcast attestation to other validators via P2P
+            // This would be done via a broadcast channel or P2P layer
+            // For now, attestation is just recorded locally
+        }
+
         Ok(result)
     }
 
@@ -287,6 +378,8 @@ pub enum BlockProducerError {
     MempoolFull,
     #[error("Block production error: {0}")]
     Production(String),
+    #[error("Block production halted due to state divergence")]
+    Halted,
 }
 
 #[cfg(test)]
@@ -537,5 +630,118 @@ mod tests {
         assert!(result1.is_ok());
         // Height should be 0 or 1 (depending on timing)
         assert!(height <= 1 && result2 <= 1);
+    }
+
+    // ========================================
+    // Phase 7B: State Attestation Tests
+    // ========================================
+
+    #[tokio::test]
+    async fn test_attestation_integration() {
+        use crate::attestation::AttestationKeyPair;
+        use crate::attestation_collector::{AttestationCollector, AttestationConfig};
+        use tokio::sync::mpsc;
+
+        let app = Arc::new(RwLock::new(HyperCoreApp::new()));
+        let mempool = SharedMempool::new();
+
+        // Create attestation system
+        let (alert_tx, _alert_rx) = mpsc::channel(10);
+        let key_pair = AttestationKeyPair::generate();
+        let collector = Arc::new(AttestationCollector::new(
+            alert_tx,
+            AttestationConfig::default(),
+            Some(key_pair.public_key()),
+        ));
+
+        // Register ourselves as a validator
+        collector.add_validator(key_pair.public_key(), 100).await;
+
+        // Create producer with attestation
+        let producer = BlockProducer::with_block_time(Arc::clone(&app), mempool, 100)
+            .with_attestation(key_pair, Arc::clone(&collector));
+
+        // Produce a block
+        let result = producer.produce_block().await.unwrap();
+
+        // Verify attestation was recorded
+        assert_eq!(collector.attestation_count(result.height).await, 1);
+
+        // Verify attestation data
+        let attestations = collector.get_attestations(result.height).await;
+        assert_eq!(attestations.len(), 1);
+        assert_eq!(attestations[0].height, result.height);
+        assert_eq!(attestations[0].app_hash, result.app_hash);
+    }
+
+    #[tokio::test]
+    async fn test_halted_flag_stops_production() {
+        let app = Arc::new(RwLock::new(HyperCoreApp::new()));
+        let mempool = SharedMempool::new();
+
+        let halted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let producer = BlockProducer::with_block_time(Arc::clone(&app), mempool, 100)
+            .with_halt_flag(Arc::clone(&halted));
+
+        // Not halted initially
+        assert!(!producer.is_halted());
+
+        // Produce a block - should succeed
+        let result = producer.produce_block().await;
+        assert!(result.is_ok());
+
+        // Set halted flag
+        halted.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(producer.is_halted());
+
+        // Note: produce_block() itself doesn't check halted flag
+        // The halt check is in the start() loop
+    }
+
+    #[tokio::test]
+    async fn test_multiple_blocks_with_attestation() {
+        use crate::attestation::AttestationKeyPair;
+        use crate::attestation_collector::{AttestationCollector, AttestationConfig};
+        use tokio::sync::mpsc;
+
+        let app = Arc::new(RwLock::new(HyperCoreApp::new()));
+        let mempool = SharedMempool::new();
+
+        let (alert_tx, _alert_rx) = mpsc::channel(10);
+        let key_pair = AttestationKeyPair::generate();
+        let collector = Arc::new(AttestationCollector::new(
+            alert_tx,
+            AttestationConfig::default(),
+            Some(key_pair.public_key()),
+        ));
+
+        collector.add_validator(key_pair.public_key(), 100).await;
+
+        let producer = BlockProducer::with_block_time(Arc::clone(&app), mempool, 100)
+            .with_attestation(key_pair, Arc::clone(&collector));
+
+        // Produce multiple blocks
+        for height in 1..=5 {
+            let result = producer.produce_block().await.unwrap();
+            assert_eq!(result.height, height);
+            assert_eq!(collector.attestation_count(height).await, 1);
+        }
+
+        // Check stats
+        let stats = collector.stats().await;
+        assert_eq!(stats.total_attestations, 5);
+        assert_eq!(stats.heights_tracked, 5);
+    }
+
+    #[tokio::test]
+    async fn test_attestation_without_collector() {
+        let app = Arc::new(RwLock::new(HyperCoreApp::new()));
+        let mempool = SharedMempool::new();
+
+        // Producer without attestation - should still work
+        let producer = BlockProducer::with_block_time(Arc::clone(&app), mempool, 100);
+
+        let result = producer.produce_block().await;
+        assert!(result.is_ok());
     }
 }

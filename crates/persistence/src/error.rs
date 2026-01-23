@@ -63,6 +63,10 @@ pub enum PersistenceError {
     /// Recovery failed
     #[error("Recovery failed: {0}")]
     RecoveryFailed(String),
+
+    /// Resource not found
+    #[error("Not found: {0}")]
+    NotFound(String),
 }
 
 impl PersistenceError {
@@ -94,6 +98,11 @@ impl PersistenceError {
     /// Create a corruption error
     pub fn corruption<E: std::fmt::Display>(e: E) -> Self {
         PersistenceError::Corruption(e.to_string())
+    }
+
+    /// Create a not found error
+    pub fn not_found<E: std::fmt::Display>(e: E) -> Self {
+        PersistenceError::NotFound(e.to_string())
     }
 
     /// Check if this is a recoverable error

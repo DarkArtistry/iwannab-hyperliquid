@@ -59,7 +59,7 @@ test-quick:
 	@echo "  Quick Tests (Rust + Solidity - No Docker)"
 	@echo "=========================================="
 	@echo ""
-	@echo ">>> [1/2] Rust Unit Tests (298 tests)"
+	@echo ">>> [1/2] Rust Unit Tests (379 tests)"
 	@echo "------------------------------------------"
 	@cargo test --workspace 2>&1 | tail -30
 	@echo ""
@@ -68,7 +68,7 @@ test-quick:
 	@cd contracts && forge test --summary
 	@echo ""
 	@echo "=========================================="
-	@echo "  QUICK TESTS COMPLETE (347 tests)"
+	@echo "  QUICK TESTS COMPLETE (428 tests)"
 	@echo "=========================================="
 
 # Run ALL tests (Rust + Solidity + E2E) verbosely
@@ -78,10 +78,10 @@ test-all:
 	@echo "=========================================="
 	@echo ""
 	@echo "Test Suite Breakdown:"
-	@echo "  - Rust Unit Tests:      298 tests"
+	@echo "  - Rust Unit Tests:      379 tests"
 	@echo "  - Solidity Contracts:    49 tests"
 	@echo "  - E2E Integration:      135 tests"
-	@echo "  - Total:                482+ tests"
+	@echo "  - Total:                563+ tests"
 	@echo ""
 	@echo ">>> [1/3] Rust Unit Tests (cargo test)"
 	@echo "------------------------------------------"
@@ -96,7 +96,7 @@ test-all:
 	./scripts/e2e-test.sh --verbose
 	@echo ""
 	@echo "=========================================="
-	@echo "  ALL TESTS COMPLETE (482+ tests)"
+	@echo "  ALL TESTS COMPLETE (563+ tests)"
 	@echo "=========================================="
 
 # Run E2E tests only (requires Docker)
@@ -110,6 +110,14 @@ test-e2e-quick:
 # SDK Integration tests (requires services running)
 test-sdk:
 	cd sdk/typescript && pnpm test:integration
+
+# Export/Import CLI tests
+test-export-import:
+	./scripts/test-export-import.sh
+
+# Persistence layer tests
+test-persistence:
+	cargo test -p hypercore-persistence --lib
 
 # ============ Formatting & Linting ============
 
@@ -224,18 +232,20 @@ help:
 	@echo "  make build-debug     - Build all crates (debug)"
 	@echo "  make build-contracts - Build Solidity contracts"
 	@echo ""
-	@echo "Test (482+ total tests):"
-	@echo "  make test            - Run Rust unit tests (298 tests)"
-	@echo "  make test-quick      - Run Rust + Solidity (347 tests, no Docker)"
-	@echo "  make test-all        - Run ALL tests (Rust + Solidity + E2E)"
-	@echo "  make test-engine     - Run engine tests only"
-	@echo "  make test-chain      - Run chain/consensus tests only"
-	@echo "  make test-gateway    - Run gateway tests only"
-	@echo "  make test-primitives - Run primitives tests only"
-	@echo "  make test-contracts  - Run Solidity tests (49 tests)"
-	@echo "  make test-e2e        - Run E2E integration tests (135 tests)"
-	@echo "  make test-e2e-quick  - Run E2E with existing services"
-	@echo "  make test-sdk        - Run SDK integration tests"
+	@echo "Test (563+ total tests):"
+	@echo "  make test             - Run Rust unit tests (379 tests)"
+	@echo "  make test-quick       - Run Rust + Solidity (428 tests, no Docker)"
+	@echo "  make test-all         - Run ALL tests (Rust + Solidity + E2E)"
+	@echo "  make test-engine      - Run engine tests only"
+	@echo "  make test-chain       - Run chain/consensus tests only"
+	@echo "  make test-gateway     - Run gateway tests only (81 tests)"
+	@echo "  make test-primitives  - Run primitives tests only"
+	@echo "  make test-persistence - Run persistence tests (51 tests)"
+	@echo "  make test-contracts   - Run Solidity tests (49 tests)"
+	@echo "  make test-e2e         - Run E2E integration tests (135 tests)"
+	@echo "  make test-e2e-quick   - Run E2E with existing services"
+	@echo "  make test-sdk         - Run SDK integration tests"
+	@echo "  make test-export-import - Run export/import CLI tests"
 	@echo ""
 	@echo "Devnet:"
 	@echo "  make devnet          - Start local development network"

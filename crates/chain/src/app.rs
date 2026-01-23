@@ -412,7 +412,7 @@ impl HyperCoreApp {
                                 size: fill_size,
                                 fee: Decimal::from_raw(fill.maker_fee.abs(), Decimal::USDC_DECIMALS),
                                 is_taker: false,
-                                realized_pnl: 0, // TODO: Calculate realized PnL
+                                realized_pnl: fill.realized_pnl_maker,
                                 timestamp: fill.timestamp,
                             });
                             if let Ok(json) = serde_json::to_value(&maker_event) {
@@ -431,7 +431,7 @@ impl HyperCoreApp {
                                 size: fill_size,
                                 fee: Decimal::from_raw(fill.taker_fee as i128, Decimal::USDC_DECIMALS),
                                 is_taker: true,
-                                realized_pnl: 0, // TODO: Calculate realized PnL
+                                realized_pnl: fill.realized_pnl_taker,
                                 timestamp: fill.timestamp,
                             });
                             if let Ok(json) = serde_json::to_value(&taker_event) {
@@ -819,35 +819,94 @@ impl HyperCoreApp {
     }
 
     /// Execute EVM action (sync version)
+    ///
+    /// Handles actions queued by smart contracts via CoreWriter:
+    /// - Action 0: Deposit from EVM view to Core view
+    /// - Action 1: Withdraw from Core view to EVM view
+    /// - Action 2: View transfer Core -> EVM (alias for action 1)
+    /// - Action 3: View transfer EVM -> Core (alias for action 0)
+    ///
+    /// Data format (ABI-encoded):
+    /// - bytes 0-31: token index (uint256, only last byte used)
+    /// - bytes 32-63: amount (uint256)
     fn execute_evm_action_sync(
         &mut self,
         sender: AccountAddress,
         action_type: u8,
-        _data: &[u8],
+        data: &[u8],
     ) -> Result<Vec<Event>, AppError> {
-        // EVM actions are processed by the EVM executor
-        // This is a passthrough for queued writes from CoreWriter
+        // Parse token and amount from ABI-encoded data
+        let (token, amount) = if data.len() >= 64 {
+            let token = data[31]; // Last byte of first 32-byte word
+            // Parse amount from bytes 32-63 (uint256, we use lower 128 bits)
+            let amount_bytes = &data[32..64];
+            let high = u128::from_be_bytes(amount_bytes[0..16].try_into().unwrap_or([0; 16]));
+            let low = u128::from_be_bytes(amount_bytes[16..32].try_into().unwrap_or([0; 16]));
+            // If high bits are set, value is too large - use max i128
+            let amount_raw = if high > 0 { i128::MAX } else { low as i128 };
+            // Amount is in 18 decimals (EVM standard), convert to token decimals
+            let token_decimals = if token == 0 { 6 } else { 18 };
+            let amount = Decimal::from_raw(amount_raw, 18).scale_to(token_decimals);
+            (token, amount)
+        } else if data.is_empty() {
+            // Empty data means this is just an event notification
+            return match action_type {
+                0 | 3 => Ok(vec![Event::new("evm_deposit")
+                    .add_attribute("sender", &format!("{:?}", sender))
+                    .add_attribute("status", "no_data")]),
+                1 | 2 => Ok(vec![Event::new("evm_withdraw")
+                    .add_attribute("sender", &format!("{:?}", sender))
+                    .add_attribute("status", "no_data")]),
+                _ => Ok(vec![Event::new("evm_action_unknown")
+                    .add_attribute("action_type", &action_type.to_string())]),
+            };
+        } else {
+            return Err(AppError::Internal(format!(
+                "Invalid EVM action data length: {} (expected 64 bytes)",
+                data.len()
+            )));
+        };
+
+        let mut unified = self.state.unified_state.write().unwrap();
 
         match action_type {
-            0 => {
-                // Placeholder for deposit from EVM to Core
+            0 | 3 => {
+                // Deposit: Move from EVM view to Core view
+                if let Err(e) = unified.transfer_to_core_view(sender, token, amount) {
+                    return Err(AppError::Internal(format!(
+                        "View transfer to core failed: token={}, amount={}, error={:?}",
+                        token, amount.to_string_trimmed(), e
+                    )));
+                }
+
+                let new_core = unified.get_core_view(sender, token);
+                let new_evm = unified.get_evm_view(sender, token);
+
                 Ok(vec![Event::new("evm_deposit")
-                    .add_attribute("sender", &format!("{:?}", sender))])
+                    .add_attribute("sender", &format!("{:?}", sender))
+                    .add_attribute("token", &token.to_string())
+                    .add_attribute("amount", &amount.to_string_trimmed())
+                    .add_attribute("new_core_view", &new_core.to_string_trimmed())
+                    .add_attribute("new_evm_view", &new_evm.to_string_trimmed())])
             }
-            1 => {
-                // Placeholder for withdraw from Core to EVM
+            1 | 2 => {
+                // Withdraw: Move from Core view to EVM view
+                if let Err(e) = unified.transfer_to_evm_view(sender, token, amount) {
+                    return Err(AppError::Internal(format!(
+                        "View transfer to EVM failed: token={}, amount={}, error={:?}",
+                        token, amount.to_string_trimmed(), e
+                    )));
+                }
+
+                let new_core = unified.get_core_view(sender, token);
+                let new_evm = unified.get_evm_view(sender, token);
+
                 Ok(vec![Event::new("evm_withdraw")
-                    .add_attribute("sender", &format!("{:?}", sender))])
-            }
-            2 => {
-                // View transfer: Core -> EVM
-                Ok(vec![Event::new("view_transfer_to_evm")
-                    .add_attribute("sender", &format!("{:?}", sender))])
-            }
-            3 => {
-                // View transfer: EVM -> Core
-                Ok(vec![Event::new("view_transfer_to_core")
-                    .add_attribute("sender", &format!("{:?}", sender))])
+                    .add_attribute("sender", &format!("{:?}", sender))
+                    .add_attribute("token", &token.to_string())
+                    .add_attribute("amount", &amount.to_string_trimmed())
+                    .add_attribute("new_core_view", &new_core.to_string_trimmed())
+                    .add_attribute("new_evm_view", &new_evm.to_string_trimmed())])
             }
             _ => {
                 Ok(vec![Event::new("evm_action_unknown")
@@ -1003,6 +1062,11 @@ impl HyperCoreApp {
     /// Get all block metadata (for persistence)
     pub fn get_block_metadata(&self) -> &std::collections::HashMap<BlockHeight, crate::state::BlockMeta> {
         self.state.get_all_block_metadata()
+    }
+
+    /// Get block events for a specific height (for WebSocket broadcasting)
+    pub fn get_block_events(&self, height: BlockHeight) -> Vec<serde_json::Value> {
+        self.state.get_block_events(height)
     }
 
     /// Query state (for ABCI Query)

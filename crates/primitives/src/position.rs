@@ -120,6 +120,49 @@ impl Position {
         }
     }
 
+    /// Calculate realized PnL from a fill WITHOUT modifying state
+    ///
+    /// Returns the PnL that would be realized if this fill were applied.
+    /// Returns 0 if the fill would increase the position (no realization).
+    pub fn calculate_fill_pnl(&self, fill_size: Decimal, fill_price: Decimal, is_buy: bool) -> Decimal {
+        if self.size.is_zero() {
+            // Opening new position - no realized PnL
+            return Decimal::from_raw(0, Decimal::USDC_DECIMALS);
+        }
+
+        let fill_side_size = if is_buy { fill_size } else { -fill_size };
+        let new_size = self.size + fill_side_size;
+        let fill_notional = fill_size * fill_price;
+
+        // Check if we're increasing, reducing, or flipping
+        let same_sign = (self.size.is_positive() && new_size.is_positive())
+            || (self.size.is_negative() && new_size.is_negative())
+            || new_size.is_zero();
+
+        if same_sign {
+            // Check if increasing or reducing
+            if self.size.raw().signum() == fill_side_size.raw().signum() {
+                // Increasing position - no realized PnL
+                Decimal::from_raw(0, Decimal::USDC_DECIMALS)
+            } else {
+                // Reducing position - calculate PnL on closed portion
+                let close_ratio = fill_size / self.abs_size();
+                let closed_notional = self.entry_notional * close_ratio;
+
+                let pnl = if self.is_long() {
+                    fill_notional - closed_notional
+                } else {
+                    closed_notional - fill_notional
+                };
+
+                pnl.to_decimals(Decimal::USDC_DECIMALS)
+            }
+        } else {
+            // Flipping position - realize PnL on closing old position
+            self.unrealized_pnl(fill_price).to_decimals(Decimal::USDC_DECIMALS)
+        }
+    }
+
     /// Update position after a fill
     pub fn apply_fill(&mut self, fill_size: Decimal, fill_price: Decimal, is_buy: bool) {
         let fill_side_size = if is_buy {
@@ -183,6 +226,34 @@ impl Position {
 
         // Return the payment amount (positive = payment owed by position holder)
         payment.to_decimals(Decimal::USDC_DECIMALS)
+    }
+
+    /// Create a position for testing purposes
+    ///
+    /// # Arguments
+    /// * `is_long` - True for long position, false for short
+    /// * `size` - Position size as a string (e.g., "0.5")
+    /// * `entry_price` - Entry price as a string (e.g., "65000")
+    /// * `realized_pnl` - Realized PnL as a string (e.g., "100")
+    /// * `last_funding_index` - Last funding index as an integer
+    #[cfg(any(test, feature = "testing"))]
+    pub fn new_for_test(
+        is_long: bool,
+        size: &str,
+        entry_price: &str,
+        realized_pnl: &str,
+        last_funding_index: i128,
+    ) -> Self {
+        let abs_size = Decimal::size(size);
+        let price = Decimal::price(entry_price);
+        let entry_notional = abs_size * price;
+
+        Self {
+            size: if is_long { abs_size } else { -abs_size },
+            entry_notional,
+            realized_pnl: Decimal::usdc(realized_pnl),
+            last_funding_index: Decimal::from_raw(last_funding_index, Decimal::RATE_DECIMALS),
+        }
     }
 }
 
@@ -280,5 +351,93 @@ mod tests {
         // Mark price 66000 -> -1000 loss
         let pnl = pos.unrealized_pnl(Decimal::price("66000"));
         assert_eq!(pnl.to_string_trimmed(), "-1000");
+    }
+
+    #[test]
+    fn test_calculate_fill_pnl_empty_position() {
+        let pos = Position::new();
+
+        // Opening a new position should have 0 realized PnL
+        let pnl = pos.calculate_fill_pnl(Decimal::size("1.0"), Decimal::price("65000"), true);
+        assert_eq!(pnl.raw(), 0, "Opening new position should realize 0 PnL");
+    }
+
+    #[test]
+    fn test_calculate_fill_pnl_increase_long() {
+        let mut pos = Position::new();
+        pos.apply_fill(Decimal::size("1.0"), Decimal::price("65000"), true);
+
+        // Adding to long position should have 0 realized PnL
+        let pnl = pos.calculate_fill_pnl(Decimal::size("1.0"), Decimal::price("66000"), true);
+        assert_eq!(pnl.raw(), 0, "Increasing position should realize 0 PnL");
+    }
+
+    #[test]
+    fn test_calculate_fill_pnl_reduce_long_profit() {
+        let mut pos = Position::new();
+        pos.apply_fill(Decimal::size("1.0"), Decimal::price("65000"), true);
+
+        // Closing half at 66000 -> $500 profit (0.5 * 1000)
+        let pnl = pos.calculate_fill_pnl(Decimal::size("0.5"), Decimal::price("66000"), false);
+        assert_eq!(pnl.to_string_trimmed(), "500", "Closing long at profit should realize positive PnL");
+    }
+
+    #[test]
+    fn test_calculate_fill_pnl_reduce_long_loss() {
+        let mut pos = Position::new();
+        pos.apply_fill(Decimal::size("1.0"), Decimal::price("65000"), true);
+
+        // Closing half at 64000 -> -$500 loss (0.5 * -1000)
+        let pnl = pos.calculate_fill_pnl(Decimal::size("0.5"), Decimal::price("64000"), false);
+        assert_eq!(pnl.to_string_trimmed(), "-500", "Closing long at loss should realize negative PnL");
+    }
+
+    #[test]
+    fn test_calculate_fill_pnl_reduce_short_profit() {
+        let mut pos = Position::new();
+        pos.apply_fill(Decimal::size("1.0"), Decimal::price("65000"), false);
+
+        // Closing half short at 64000 -> $500 profit (short wins when price drops)
+        let pnl = pos.calculate_fill_pnl(Decimal::size("0.5"), Decimal::price("64000"), true);
+        assert_eq!(pnl.to_string_trimmed(), "500", "Closing short at profit should realize positive PnL");
+    }
+
+    #[test]
+    fn test_calculate_fill_pnl_reduce_short_loss() {
+        let mut pos = Position::new();
+        pos.apply_fill(Decimal::size("1.0"), Decimal::price("65000"), false);
+
+        // Closing half short at 66000 -> -$500 loss (short loses when price rises)
+        let pnl = pos.calculate_fill_pnl(Decimal::size("0.5"), Decimal::price("66000"), true);
+        assert_eq!(pnl.to_string_trimmed(), "-500", "Closing short at loss should realize negative PnL");
+    }
+
+    #[test]
+    fn test_calculate_fill_pnl_flip_position() {
+        let mut pos = Position::new();
+        pos.apply_fill(Decimal::size("1.0"), Decimal::price("65000"), true);
+
+        // Selling 2 BTC at 66000 flips from long to short
+        // Closing 1 BTC long at +$1000 profit
+        let pnl = pos.calculate_fill_pnl(Decimal::size("2.0"), Decimal::price("66000"), false);
+        assert_eq!(pnl.to_string_trimmed(), "1000", "Flipping position should realize PnL on closed portion");
+    }
+
+    #[test]
+    fn test_calculate_fill_pnl_doesnt_modify_state() {
+        let mut pos = Position::new();
+        pos.apply_fill(Decimal::size("1.0"), Decimal::price("65000"), true);
+
+        let size_before = pos.size;
+        let entry_before = pos.entry_notional;
+        let realized_before = pos.realized_pnl;
+
+        // Calculate PnL without modifying state
+        let _ = pos.calculate_fill_pnl(Decimal::size("0.5"), Decimal::price("66000"), false);
+
+        // State should be unchanged
+        assert_eq!(pos.size.raw(), size_before.raw(), "calculate_fill_pnl should not modify size");
+        assert_eq!(pos.entry_notional.raw(), entry_before.raw(), "calculate_fill_pnl should not modify entry_notional");
+        assert_eq!(pos.realized_pnl.raw(), realized_before.raw(), "calculate_fill_pnl should not modify realized_pnl");
     }
 }

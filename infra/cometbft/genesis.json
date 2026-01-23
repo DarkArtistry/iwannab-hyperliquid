@@ -1,0 +1,124 @@
+{
+  "genesis_time": "2026-01-01T00:00:00.000000000Z",
+  "chain_id": "hypercore-dev",
+  "initial_height": "1",
+  "consensus_params": {
+    "block": {
+      "max_bytes": "22020096",
+      "max_gas": "-1"
+    },
+    "evidence": {
+      "max_age_num_blocks": "100000",
+      "max_age_duration": "172800000000000",
+      "max_bytes": "1048576"
+    },
+    "validator": {
+      "pub_key_types": ["ed25519"]
+    },
+    "version": {
+      "app": "0"
+    },
+    "abci": {
+      "vote_extensions_enable_height": "0"
+    }
+  },
+  "validators": [
+    {
+      "address": "44EDF55C5A70A8741DE3F4B3FB4960156260A89A",
+      "pub_key": {
+        "type": "tendermint/PubKeyEd25519",
+        "value": "aVz+erxkWAGnD7uN2qIdpKyG9ZWLS3+UZG4EUlgP+FA="
+      },
+      "power": "10",
+      "name": "validator-0"
+    }
+  ],
+  "app_hash": "",
+  "app_state": {
+    "chain_id": "hypercore-dev",
+    "markets": [
+      {
+        "id": 0,
+        "symbol": "BTC-PERP",
+        "max_leverage": 50,
+        "initial_margin_rate": "0.02",
+        "maintenance_margin_rate": "0.01",
+        "tick_size": "0.1",
+        "lot_size": "0.0001",
+        "min_order_size": "0.001",
+        "max_order_size": "1000",
+        "maker_fee_rate": "-0.0001",
+        "taker_fee_rate": "0.0005",
+        "initial_price": "65000"
+      },
+      {
+        "id": 1,
+        "symbol": "ETH-PERP",
+        "max_leverage": 50,
+        "initial_margin_rate": "0.02",
+        "maintenance_margin_rate": "0.01",
+        "tick_size": "0.01",
+        "lot_size": "0.001",
+        "min_order_size": "0.01",
+        "max_order_size": "10000",
+        "maker_fee_rate": "-0.0001",
+        "taker_fee_rate": "0.0005",
+        "initial_price": "3500"
+      }
+    ],
+    "spot_tokens": [
+      {
+        "index": 0,
+        "symbol": "USDC",
+        "name": "USD Coin",
+        "wei_decimals": 6,
+        "is_native": true
+      },
+      {
+        "index": 1,
+        "symbol": "TEST",
+        "name": "Test Token",
+        "wei_decimals": 18,
+        "is_native": false
+      }
+    ],
+    "balances": [
+      {
+        "address": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+        "token": 0,
+        "amount": "100000000000",
+        "view": "core"
+      },
+      {
+        "address": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+        "token": 1,
+        "amount": "10000000000000000000000",
+        "view": "core"
+      },
+      {
+        "address": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+        "token": 0,
+        "amount": "100000000000",
+        "view": "core"
+      },
+      {
+        "address": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+        "token": 1,
+        "amount": "10000000000000000000000",
+        "view": "core"
+      },
+      {
+        "address": "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC",
+        "token": 0,
+        "amount": "100000000000",
+        "view": "core"
+      },
+      {
+        "address": "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC",
+        "token": 1,
+        "amount": "10000000000000000000000",
+        "view": "core"
+      }
+    ]
+  }
+}

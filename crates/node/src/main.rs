@@ -30,8 +30,8 @@ use hypercore_chain::{AbciService, HyperCoreApp};
 use hypercore_chain::{extract_state, restore_state, restore_chain_state};
 use hypercore_engine::{EngineState, SpotEngine};
 use hypercore_evm::{EvmExecutor, EvmRpcServer};
-use hypercore_gateway::{GatewayConfig, GatewayServer, RateLimitConfig, ValidationConfig};
-use hypercore_primitives::new_shared_unified_state;
+use hypercore_gateway::{GatewayConfig, GatewayServer, RateLimitConfig, ValidationConfig, EventBroadcaster};
+use hypercore_primitives::{new_shared_unified_state, BlockEvent};
 
 #[cfg(feature = "persistence")]
 use hypercore_persistence::{PersistenceBackend, PersistenceConfig, RocksDbBackend, StatePersister};
@@ -127,6 +127,11 @@ enum Commands {
         /// Block height (default: latest)
         #[arg(long)]
         height: Option<u64>,
+
+        /// Data directory for persistent storage
+        #[cfg(feature = "persistence")]
+        #[arg(long, default_value = "./data/chain", env = "DATA_DIR")]
+        data_dir: String,
     },
 
     /// Import state from snapshot
@@ -134,6 +139,11 @@ enum Commands {
         /// Input file path
         #[arg(long)]
         input: String,
+
+        /// Data directory for persistent storage
+        #[cfg(feature = "persistence")]
+        #[arg(long, default_value = "./data/chain", env = "DATA_DIR")]
+        data_dir: String,
     },
 }
 
@@ -316,6 +326,37 @@ async fn main() -> anyhow::Result<()> {
             );
             let ws_manager = gateway.ws_manager();
 
+            // === WebSocket Event Broadcasting ===
+            // Create a channel to send block events from the post-commit handler
+            // to an async task that broadcasts them via WebSocket
+            let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<Vec<serde_json::Value>>(100);
+
+            // Market names for event broadcasting
+            let market_names = vec!["BTC-PERP".to_string(), "ETH-PERP".to_string()];
+
+            // Spawn event broadcasting task
+            let broadcaster_ws = Arc::clone(&ws_manager);
+            let broadcast_markets = market_names.clone();
+            tokio::spawn(async move {
+                let broadcaster = EventBroadcaster::new(broadcaster_ws, broadcast_markets);
+
+                while let Some(events) = event_rx.recv().await {
+                    for event_json in events {
+                        // Parse JSON back to BlockEvent
+                        match serde_json::from_value::<BlockEvent>(event_json) {
+                            Ok(event) => {
+                                broadcaster.broadcast_event(&event).await;
+                            }
+                            Err(e) => {
+                                tracing::debug!("Failed to parse block event for broadcasting: {}", e);
+                            }
+                        }
+                    }
+                }
+                tracing::info!("Event broadcaster task stopped");
+            });
+            tracing::info!("WebSocket event broadcasting enabled");
+
             // Set up graceful shutdown
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
@@ -365,16 +406,33 @@ async fn main() -> anyhow::Result<()> {
                         },
                     );
 
-                    // Add persistence handler if enabled
+                    // Add post-commit handler for event broadcasting and optionally persistence
                     #[cfg(feature = "persistence")]
-                    if let Some(ref db) = persistence {
-                        let persistence_db = Arc::clone(db);
-                        let state_unified = Arc::clone(&unified_state);
-                        let state_engine = Arc::clone(&engine);
-                        let state_spot = Arc::clone(&spot_engine);
+                    let persistence_opt = persistence.clone();
 
-                        block_producer = block_producer.with_post_commit_handler(Arc::new(
-                            move |result: &hypercore_chain::BlockResult, app: &HyperCoreApp| {
+                    // Clone references for the handler
+                    let handler_event_tx = event_tx.clone();
+
+                    #[cfg(feature = "persistence")]
+                    let state_unified = Arc::clone(&unified_state);
+                    #[cfg(feature = "persistence")]
+                    let state_engine = Arc::clone(&engine);
+                    #[cfg(feature = "persistence")]
+                    let state_spot = Arc::clone(&spot_engine);
+
+                    block_producer = block_producer.with_post_commit_handler(Arc::new(
+                        move |result: &hypercore_chain::BlockResult, app: &HyperCoreApp| {
+                            // 1. Broadcast block events via WebSocket
+                            let events = app.get_block_events(result.height);
+                            if !events.is_empty() {
+                                if let Err(e) = handler_event_tx.try_send(events) {
+                                    tracing::warn!("Failed to send events to broadcaster: {}", e);
+                                }
+                            }
+
+                            // 2. Persist state (if persistence is enabled)
+                            #[cfg(feature = "persistence")]
+                            if let Some(ref db) = persistence_opt {
                                 // Extract state from runtime components
                                 let persisted_state = extract_state(
                                     result.height,
@@ -389,7 +447,7 @@ async fn main() -> anyhow::Result<()> {
                                 );
 
                                 // Persist state
-                                let persister = StatePersister::new(persistence_db.as_ref());
+                                let persister = StatePersister::new(db.as_ref());
                                 match persister.persist_state(&persisted_state) {
                                     Ok(()) => {
                                         tracing::debug!(
@@ -402,10 +460,18 @@ async fn main() -> anyhow::Result<()> {
                                         tracing::error!("Failed to persist state: {}", e);
                                     }
                                 }
-                            },
-                        ));
-                        tracing::info!("State persistence handler enabled");
+                            }
+                        },
+                    ));
+
+                    #[cfg(feature = "persistence")]
+                    if persistence.is_some() {
+                        tracing::info!("Post-commit handler enabled with event broadcasting and persistence");
+                    } else {
+                        tracing::info!("Post-commit handler enabled with event broadcasting");
                     }
+                    #[cfg(not(feature = "persistence"))]
+                    tracing::info!("Post-commit handler enabled with event broadcasting");
 
                     let _abci_service = AbciService::new(Arc::clone(&app));
                     tokio::spawn(async move {
@@ -537,21 +603,144 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
 
-        Commands::Export { output, height } => {
+        Commands::Export {
+            output,
+            height: _height,
+            #[cfg(feature = "persistence")]
+            data_dir,
+        } => {
             init_logging("info");
             tracing::info!("Exporting state to {}", output);
 
-            // In production, load state from persistent storage
-            // and export at the specified height
+            #[cfg(feature = "persistence")]
+            {
+                // Open RocksDB backend
+                let config = PersistenceConfig {
+                    data_dir: data_dir.clone(),
+                    create_if_missing: false,
+                    ..Default::default()
+                };
+
+                let backend = RocksDbBackend::open(&config)
+                    .map_err(|e| anyhow::anyhow!("Failed to open persistence backend: {}. Make sure the data directory exists and was previously initialized.", e))?;
+
+                let persister = StatePersister::new(&backend);
+
+                // Load state from persistence
+                let state = persister.load_state()
+                    .map_err(|e| anyhow::anyhow!("Failed to load state: {}", e))?
+                    .ok_or_else(|| anyhow::anyhow!("No persisted state found. Export requires existing state."))?;
+
+                tracing::info!("Loaded state at height {}", state.height);
+
+                // Serialize to JSON
+                let json = serde_json::to_string_pretty(&state)
+                    .map_err(|e| anyhow::anyhow!("Failed to serialize state: {}", e))?;
+
+                // Write to output file
+                std::fs::write(&output, json)
+                    .map_err(|e| anyhow::anyhow!("Failed to write export file: {}", e))?;
+
+                tracing::info!(
+                    "Exported state at height {} to {} ({} bytes)",
+                    state.height,
+                    output,
+                    std::fs::metadata(&output)?.len()
+                );
+                tracing::info!(
+                    "State contains: {} balances, {} positions, {} orders",
+                    state.core.balances.len(),
+                    state.core.positions.len(),
+                    state.core.orders.len() + state.spot.orders.len()
+                );
+            }
+
+            #[cfg(not(feature = "persistence"))]
+            {
+                return Err(anyhow::anyhow!(
+                    "Export requires the 'persistence' feature. Build with: cargo build --features persistence"
+                ));
+            }
 
             Ok(())
         }
 
-        Commands::Import { input } => {
+        Commands::Import {
+            input,
+            #[cfg(feature = "persistence")]
+            data_dir,
+        } => {
             init_logging("info");
             tracing::info!("Importing state from {}", input);
 
-            // In production, load snapshot and restore state
+            #[cfg(feature = "persistence")]
+            {
+                // Read JSON from input file
+                let json = std::fs::read_to_string(&input)
+                    .map_err(|e| anyhow::anyhow!("Failed to read import file: {}", e))?;
+
+                // Deserialize to PersistedState
+                let state: hypercore_persistence::PersistedState = serde_json::from_str(&json)
+                    .map_err(|e| anyhow::anyhow!("Failed to parse import file: {}", e))?;
+
+                tracing::info!("Parsed state at height {}", state.height);
+
+                // Validate the state
+                state.validate()
+                    .map_err(|e| anyhow::anyhow!("State validation failed: {}", e))?;
+
+                tracing::info!("State validated successfully");
+
+                // Open RocksDB backend (create if missing for import)
+                let config = PersistenceConfig {
+                    data_dir: data_dir.clone(),
+                    create_if_missing: true,
+                    ..Default::default()
+                };
+
+                let backend = RocksDbBackend::open(&config)
+                    .map_err(|e| anyhow::anyhow!("Failed to open persistence backend: {}", e))?;
+
+                let persister = StatePersister::new(&backend);
+
+                // Check if there's existing state
+                if persister.has_state().unwrap_or(false) {
+                    let existing_height = persister.get_height().unwrap_or(0);
+                    tracing::warn!(
+                        "Existing state at height {} will be overwritten with imported state at height {}",
+                        existing_height,
+                        state.height
+                    );
+                }
+
+                // Persist the imported state
+                persister.persist_state(&state)
+                    .map_err(|e| anyhow::anyhow!("Failed to persist imported state: {}", e))?;
+
+                // Flush to ensure data is written
+                persister.flush()
+                    .map_err(|e| anyhow::anyhow!("Failed to flush persistence: {}", e))?;
+
+                tracing::info!(
+                    "Imported state at height {} from {} to {}",
+                    state.height,
+                    input,
+                    data_dir
+                );
+                tracing::info!(
+                    "State contains: {} balances, {} positions, {} orders",
+                    state.core.balances.len(),
+                    state.core.positions.len(),
+                    state.core.orders.len() + state.spot.orders.len()
+                );
+            }
+
+            #[cfg(not(feature = "persistence"))]
+            {
+                return Err(anyhow::anyhow!(
+                    "Import requires the 'persistence' feature. Build with: cargo build --features persistence"
+                ));
+            }
 
             Ok(())
         }

@@ -449,6 +449,66 @@ impl SpotEngineState {
             .or_default()
             .push(order_id);
     }
+
+    // === Snapshot/Restore for Re-org Handling ===
+
+    /// Create a snapshot of the current spot engine state
+    ///
+    /// This captures all state needed to restore during a re-org.
+    /// Note: Does NOT capture unified_state - that's handled separately.
+    pub fn snapshot(&self) -> SpotEngineStateSnapshot {
+        SpotEngineStateSnapshot {
+            tokens: self.tokens.clone(),
+            markets: self.markets.clone(),
+            reserved: self.reserved.clone(),
+            orders: self.orders.clone(),
+            account_orders: self.account_orders.clone(),
+            next_token_index: self.next_token_index,
+            next_order_id: self.next_order_id,
+            next_market_id: self.next_market_id,
+        }
+    }
+
+    /// Restore state from a snapshot
+    ///
+    /// Note: This does NOT restore unified_state - that must be restored separately.
+    /// The orderbooks are rebuilt from the orders.
+    pub fn restore(&mut self, snapshot: SpotEngineStateSnapshot) {
+        self.tokens = snapshot.tokens;
+        self.markets = snapshot.markets;
+        self.reserved = snapshot.reserved;
+        self.orders = snapshot.orders;
+        self.account_orders = snapshot.account_orders;
+        self.next_token_index = snapshot.next_token_index;
+        self.next_order_id = snapshot.next_order_id;
+        self.next_market_id = snapshot.next_market_id;
+
+        // Rebuild orderbooks from orders
+        self.orderbooks.clear();
+        for (market_id, _) in &self.markets {
+            self.orderbooks.insert(*market_id, OrderBook::new());
+        }
+        for (market_id, market_orders) in &self.orders {
+            if let Some(book) = self.orderbooks.get_mut(market_id) {
+                for order in market_orders.values() {
+                    book.insert(order.clone());
+                }
+            }
+        }
+    }
+}
+
+/// Snapshot of SpotEngineState for re-org handling
+#[derive(Debug, Clone)]
+pub struct SpotEngineStateSnapshot {
+    pub tokens: HashMap<TokenIndex, SpotToken>,
+    pub markets: HashMap<SpotMarketId, SpotMarket>,
+    pub reserved: HashMap<(AccountAddress, TokenIndex), Decimal>,
+    pub orders: HashMap<SpotMarketId, HashMap<OrderId, Order>>,
+    pub account_orders: HashMap<AccountAddress, HashMap<SpotMarketId, Vec<OrderId>>>,
+    pub next_token_index: TokenIndex,
+    pub next_order_id: OrderId,
+    pub next_market_id: SpotMarketId,
 }
 
 impl Default for SpotEngineState {

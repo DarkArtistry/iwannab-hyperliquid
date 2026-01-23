@@ -373,6 +373,43 @@ pub fn new_shared_unified_state() -> SharedUnifiedState {
     Arc::new(RwLock::new(UnifiedState::new()))
 }
 
+/// Snapshot of UnifiedState for re-org handling
+///
+/// This captures the complete state of all balances at a point in time.
+/// Used to restore state during blockchain reorganizations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnifiedStateSnapshot {
+    /// Complete copy of all balances
+    pub balances: HashMap<(AccountAddress, TokenIndex), UnifiedBalance>,
+}
+
+impl UnifiedState {
+    /// Create a snapshot of the current state
+    ///
+    /// This is used during re-org scenarios to capture state at a block boundary.
+    /// The snapshot can later be used to restore the state.
+    pub fn snapshot(&self) -> UnifiedStateSnapshot {
+        UnifiedStateSnapshot {
+            balances: self.balances.clone(),
+        }
+    }
+
+    /// Restore state from a snapshot
+    ///
+    /// This replaces all current state with the snapshot's state.
+    /// Used during re-org to revert to a previous block's state.
+    pub fn restore(&mut self, snapshot: UnifiedStateSnapshot) {
+        self.balances = snapshot.balances;
+    }
+
+    /// Restore from a snapshot reference (avoids clone if we own the snapshot)
+    pub fn restore_from(snapshot: UnifiedStateSnapshot) -> Self {
+        Self {
+            balances: snapshot.balances,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

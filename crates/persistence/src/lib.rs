@@ -32,6 +32,7 @@ mod extractor;
 mod keys;
 mod persister;
 mod rocksdb_backend;
+mod snapshot;
 mod state;
 
 pub use column_families::ColumnFamily;
@@ -43,6 +44,10 @@ pub use extractor::{
 pub use keys::{KeyEncoder, KeyPrefix};
 pub use persister::{validate_state, StatePersister};
 pub use rocksdb_backend::RocksDbBackend;
+pub use snapshot::{
+    SnapshotManager, SnapshotMetadata, SnapshotRestore, DEFAULT_CHUNK_SIZE,
+    MAX_SNAPSHOTS, SNAPSHOT_FORMAT,
+};
 pub use state::{
     AccountEntry, BalanceEntry, BlockMetaEntry, ChainState, CloidEntry, CoreState,
     EvmAccountEntry, EvmBlockHashEntry, EvmCodeEntry, EvmStateData, EvmStorageEntry,

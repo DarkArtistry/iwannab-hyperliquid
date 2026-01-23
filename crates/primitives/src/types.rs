@@ -155,6 +155,12 @@ pub struct Fill {
     pub taker_fee: RawAmount,
     pub timestamp: Timestamp,
     pub is_taker_buy: bool,
+    /// Realized PnL for maker (0 if opening position)
+    #[serde(default)]
+    pub realized_pnl_maker: SignedAmount,
+    /// Realized PnL for taker (0 if opening position)
+    #[serde(default)]
+    pub realized_pnl_taker: SignedAmount,
 }
 
 /// Liquidation event

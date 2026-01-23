@@ -154,6 +154,8 @@ impl MatchingEngine {
                 taker_fee: 0, // Calculated by engine
                 timestamp,
                 is_taker_buy: true,
+                realized_pnl_maker: 0, // Calculated by engine
+                realized_pnl_taker: 0, // Calculated by engine
             };
 
             fills.push(fill);
@@ -221,6 +223,8 @@ impl MatchingEngine {
                 taker_fee: 0,
                 timestamp,
                 is_taker_buy: false,
+                realized_pnl_maker: 0, // Calculated by engine
+                realized_pnl_taker: 0, // Calculated by engine
             };
 
             fills.push(fill);

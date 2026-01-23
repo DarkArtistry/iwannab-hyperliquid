@@ -25,12 +25,17 @@ serde_json = { workspace = true }
 # Cryptography
 sha3 = { workspace = true }
 k256 = { version = "0.13", features = ["ecdsa"] }
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+rand = { version = "0.8" }
 
 # Error handling
 thiserror = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
+
+# Encoding
+hex = "0.4"
 
 # CometBFT ABCI (optional feature)
 tendermint = { workspace = true, optional = true }

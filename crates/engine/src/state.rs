@@ -598,7 +598,57 @@ impl From<&EngineState> for EngineStateSnapshot {
 }
 
 impl EngineState {
-    /// Restore from snapshot
+    /// Create a snapshot of the current state for re-org handling
+    ///
+    /// This captures all consensus-critical state that needs to be reverted
+    /// during a blockchain reorganization.
+    pub fn snapshot(&self) -> EngineStateSnapshot {
+        EngineStateSnapshot::from(self)
+    }
+
+    /// Restore state from a snapshot in-place
+    ///
+    /// This replaces all current state with the snapshot's state.
+    /// Used during re-org to revert to a previous block's state.
+    pub fn restore(&mut self, snapshot: EngineStateSnapshot) {
+        // Clear existing state
+        self.accounts.clear();
+        self.positions.clear();
+        self.leverage.clear();
+        self.markets.clear();
+        self.orderbooks.clear();
+        self.orders.clear();
+        self.account_orders.clear();
+
+        // Restore from snapshot
+        for (addr, account) in snapshot.accounts {
+            self.accounts.insert(addr, account);
+        }
+
+        for (addr, market_id, position) in snapshot.positions {
+            self.positions
+                .entry(addr)
+                .or_default()
+                .insert(market_id, position);
+        }
+
+        for (addr, market_id, lev) in snapshot.leverage {
+            self.leverage.entry(addr).or_default().insert(market_id, lev);
+        }
+
+        for market in snapshot.markets {
+            self.add_market(market);
+        }
+
+        for order in snapshot.orders {
+            self.add_order(order);
+        }
+
+        self.insurance_fund = snapshot.insurance_fund;
+        self.next_order_id = snapshot.next_order_id;
+    }
+
+    /// Restore from snapshot (creates new instance)
     pub fn from_snapshot(snapshot: EngineStateSnapshot) -> Self {
         let mut state = Self::new();
 

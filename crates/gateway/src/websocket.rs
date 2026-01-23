@@ -236,6 +236,12 @@ impl WsManager {
         let tx = self.get_user_channel(user).await;
         let _ = tx.send(WsMessage::Fill { data: fill });
     }
+
+    /// Broadcast user position update
+    pub async fn broadcast_position(&self, user: &str, position: PositionUpdate) {
+        let tx = self.get_user_channel(user).await;
+        let _ = tx.send(WsMessage::Position { data: position });
+    }
 }
 
 impl Default for WsManager {

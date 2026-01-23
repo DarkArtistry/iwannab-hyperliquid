@@ -27,7 +27,8 @@ pub use spot::{
 };
 pub use types::*;
 pub use unified_state::{
-    new_shared_unified_state, SharedUnifiedState, UnifiedBalance, UnifiedState, ViewTransferError,
+    new_shared_unified_state, SharedUnifiedState, UnifiedBalance, UnifiedState, UnifiedStateSnapshot,
+    ViewTransferError,
 };
 pub use events::{
     BlockEvent, FillEvent, FundingAppliedEvent, LeverageUpdatedEvent, LiquidationEvent,

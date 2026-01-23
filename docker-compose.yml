@@ -28,9 +28,11 @@ services:
       - "26656:26656"  # P2P
       - "26657:26657"  # RPC
     volumes:
-      - cometbft_data:/cometbft
+      - ./infra/cometbft/data:/cometbft/data
       - ./infra/cometbft/config.toml:/cometbft/config/config.toml:ro
       - ./infra/cometbft/genesis.json:/cometbft/config/genesis.json:ro
+      - ./infra/cometbft/node_key.json:/cometbft/config/node_key.json:ro
+      - ./infra/cometbft/priv_validator_key.json:/cometbft/config/priv_validator_key.json:ro
     command: start --proxy_app=tcp://node:26658
     depends_on:
       - node

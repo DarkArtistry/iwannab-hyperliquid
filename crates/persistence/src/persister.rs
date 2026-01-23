@@ -595,4 +595,506 @@ mod tests {
         let result = validate_state(&state);
         assert!(result.is_err());
     }
+
+    // ============ Export/Import Tests ============
+
+    /// Create a comprehensive test state with all data types
+    fn create_comprehensive_test_state() -> PersistedState {
+        use hypercore_primitives::{Order, OrderSide, OrderStatus, OrderType, Position, TimeInForce};
+
+        let mut state = PersistedState::new();
+        state.height = 12345;
+        state.timestamp = 1706054400000; // 2024-01-24 00:00:00 UTC
+        state.app_hash = [0xab; 32];
+
+        // Add multiple balances for different accounts and tokens
+        let account1 = AccountAddress::from([1u8; 20]);
+        let account2 = AccountAddress::from([2u8; 20]);
+
+        state.core.balances.push(BalanceEntry {
+            account: account1,
+            token: 0, // USDC
+            balance: UnifiedBalanceData {
+                total: "100000000000".to_string(), // 100,000 USDC
+                core_view: "80000000000".to_string(),
+                evm_view: "20000000000".to_string(),
+            },
+        });
+        state.core.balances.push(BalanceEntry {
+            account: account1,
+            token: 1, // TEST
+            balance: UnifiedBalanceData {
+                total: "5000000000000000000000".to_string(), // 5,000 TEST
+                core_view: "5000000000000000000000".to_string(),
+                evm_view: "0".to_string(),
+            },
+        });
+        state.core.balances.push(BalanceEntry {
+            account: account2,
+            token: 0,
+            balance: UnifiedBalanceData {
+                total: "50000000000".to_string(),
+                core_view: "50000000000".to_string(),
+                evm_view: "0".to_string(),
+            },
+        });
+
+        // Add positions (using apply_fill to create them)
+        let mut pos1 = Position::new();
+        pos1.apply_fill(
+            hypercore_primitives::Decimal::size("0.5"),
+            hypercore_primitives::Decimal::price("65000"),
+            true, // is_buy (long)
+        );
+        state.core.positions.push(PositionEntry {
+            account: account1,
+            market: 0, // BTC-PERP
+            position: pos1,
+        });
+
+        let mut pos2 = Position::new();
+        pos2.apply_fill(
+            hypercore_primitives::Decimal::size("2.0"),
+            hypercore_primitives::Decimal::price("3500"),
+            false, // is_buy (short = sell)
+        );
+        state.core.positions.push(PositionEntry {
+            account: account2,
+            market: 1, // ETH-PERP
+            position: pos2,
+        });
+
+        // Add leverage settings
+        state.core.leverage.push(LeverageEntry {
+            account: account1,
+            market: 0,
+            leverage: 10,
+        });
+        state.core.leverage.push(LeverageEntry {
+            account: account2,
+            market: 1,
+            leverage: 20,
+        });
+
+        // Add orders
+        state.core.orders.push(OrderEntry {
+            market: 0,
+            order_id: 100,
+            order: Order {
+                id: 100,
+                owner: account1,
+                market_id: 0,
+                side: OrderSide::Buy,
+                price: hypercore_primitives::Decimal::price("64000"),
+                original_size: hypercore_primitives::Decimal::size("0.1"),
+                remaining_size: hypercore_primitives::Decimal::size("0.1"),
+                status: OrderStatus::Open,
+                order_type: OrderType::Limit { tif: TimeInForce::Gtc },
+                reduce_only: false,
+                post_only: false,
+                client_order_id: Some("test-order-1".to_string()),
+                timestamp: 1706054400000,
+            },
+        });
+
+        // Set next order ID
+        state.core.next_order_id = 101;
+
+        // Set insurance fund
+        state.core.insurance_fund = "1000000000".to_string(); // 1,000 USDC
+
+        // Add spot tokens
+        state.spot.tokens.push(SpotTokenEntry {
+            index: 0,
+            symbol: "USDC".to_string(),
+            name: "USD Coin".to_string(),
+            wei_decimals: 6,
+            sz_decimals: 2,
+            max_supply: "1000000000000000".to_string(),
+            deployer: AccountAddress::from([0u8; 20]),
+        });
+        state.spot.tokens.push(SpotTokenEntry {
+            index: 1,
+            symbol: "TEST".to_string(),
+            name: "Test Token".to_string(),
+            wei_decimals: 18,
+            sz_decimals: 4,
+            max_supply: "1000000000000000000000000000".to_string(),
+            deployer: AccountAddress::from([0u8; 20]),
+        });
+
+        // Set spot counters
+        state.spot.next_token_index = 2;
+        state.spot.next_market_id = 1;
+
+        // Add nonces
+        state.chain.nonces.push(NonceEntry {
+            account: account1,
+            nonce: 42,
+        });
+        state.chain.nonces.push(NonceEntry {
+            account: account2,
+            nonce: 15,
+        });
+
+        state
+    }
+
+    #[test]
+    fn test_json_serialization_roundtrip() {
+        // Test that PersistedState can be serialized to JSON and back
+        let original = create_comprehensive_test_state();
+
+        // Serialize to JSON
+        let json = serde_json::to_string_pretty(&original)
+            .expect("Failed to serialize state to JSON");
+
+        // Deserialize from JSON
+        let restored: PersistedState = serde_json::from_str(&json)
+            .expect("Failed to deserialize state from JSON");
+
+        // Verify all fields match
+        assert_eq!(restored.height, original.height);
+        assert_eq!(restored.timestamp, original.timestamp);
+        assert_eq!(restored.app_hash, original.app_hash);
+        assert_eq!(restored.schema_version, original.schema_version);
+
+        // Verify balances
+        assert_eq!(restored.core.balances.len(), original.core.balances.len());
+        for (orig, rest) in original.core.balances.iter().zip(restored.core.balances.iter()) {
+            assert_eq!(orig.account, rest.account);
+            assert_eq!(orig.token, rest.token);
+            assert_eq!(orig.balance.total, rest.balance.total);
+            assert_eq!(orig.balance.core_view, rest.balance.core_view);
+            assert_eq!(orig.balance.evm_view, rest.balance.evm_view);
+        }
+
+        // Verify positions
+        assert_eq!(restored.core.positions.len(), original.core.positions.len());
+
+        // Verify leverage
+        assert_eq!(restored.core.leverage.len(), original.core.leverage.len());
+
+        // Verify orders
+        assert_eq!(restored.core.orders.len(), original.core.orders.len());
+
+        // Verify spot tokens
+        assert_eq!(restored.spot.tokens.len(), original.spot.tokens.len());
+
+        // Verify nonces
+        assert_eq!(restored.chain.nonces.len(), original.chain.nonces.len());
+    }
+
+    #[test]
+    fn test_json_export_produces_valid_structure() {
+        let state = create_comprehensive_test_state();
+
+        // Serialize to JSON
+        let json = serde_json::to_string_pretty(&state)
+            .expect("Failed to serialize state");
+
+        // Parse as generic JSON to verify structure
+        let parsed: serde_json::Value = serde_json::from_str(&json)
+            .expect("Failed to parse JSON");
+
+        // Verify top-level structure
+        assert!(parsed.is_object());
+        assert!(parsed.get("schema_version").is_some());
+        assert!(parsed.get("height").is_some());
+        assert!(parsed.get("timestamp").is_some());
+        assert!(parsed.get("app_hash").is_some());
+        assert!(parsed.get("core").is_some());
+        assert!(parsed.get("spot").is_some());
+        assert!(parsed.get("evm").is_some());
+        assert!(parsed.get("chain").is_some());
+
+        // Verify nested structure
+        let core = parsed.get("core").unwrap();
+        assert!(core.get("balances").is_some());
+        assert!(core.get("positions").is_some());
+        assert!(core.get("orders").is_some());
+    }
+
+    #[test]
+    fn test_import_validates_state() {
+        // Valid state should pass validation
+        let valid_state = create_comprehensive_test_state();
+        assert!(valid_state.validate().is_ok());
+
+        // Invalid state should fail validation
+        let mut invalid_state = PersistedState::new();
+        invalid_state.height = 1;
+        invalid_state.core.balances.push(BalanceEntry {
+            account: AccountAddress::from([1u8; 20]),
+            token: 0,
+            balance: UnifiedBalanceData {
+                total: "100".to_string(),
+                core_view: "70".to_string(),
+                evm_view: "40".to_string(), // 70 + 40 = 110 != 100
+            },
+        });
+        assert!(invalid_state.validate().is_err());
+    }
+
+    #[test]
+    fn test_persist_load_comprehensive_state() {
+        let (backend, _temp_dir) = create_test_backend();
+        let persister = StatePersister::new(&backend);
+
+        let original = create_comprehensive_test_state();
+
+        // Persist state
+        persister.persist_state(&original).expect("Failed to persist state");
+
+        // Load state
+        let loaded = persister.load_state()
+            .expect("Failed to load state")
+            .expect("No state found");
+
+        // Verify height and timestamp
+        assert_eq!(loaded.height, original.height);
+        assert_eq!(loaded.timestamp, original.timestamp);
+
+        // Verify balances count
+        assert_eq!(loaded.core.balances.len(), original.core.balances.len());
+
+        // Verify positions count
+        assert_eq!(loaded.core.positions.len(), original.core.positions.len());
+
+        // Verify orders count
+        assert_eq!(loaded.core.orders.len(), original.core.orders.len());
+
+        // Verify nonces count
+        assert_eq!(loaded.chain.nonces.len(), original.chain.nonces.len());
+    }
+
+    #[test]
+    fn test_export_import_roundtrip_via_persistence() {
+        // This simulates the full export -> import workflow
+        let (backend1, _temp_dir1) = create_test_backend();
+        let (backend2, _temp_dir2) = create_test_backend();
+
+        let persister1 = StatePersister::new(&backend1);
+        let persister2 = StatePersister::new(&backend2);
+
+        // Create and persist original state
+        let original = create_comprehensive_test_state();
+        persister1.persist_state(&original).expect("Failed to persist");
+
+        // Load state (simulates export)
+        let exported = persister1.load_state()
+            .expect("Failed to load")
+            .expect("No state found");
+
+        // Serialize to JSON (export step)
+        let json = serde_json::to_string(&exported)
+            .expect("Failed to serialize");
+
+        // Deserialize from JSON (import step)
+        let imported: PersistedState = serde_json::from_str(&json)
+            .expect("Failed to deserialize");
+
+        // Validate imported state
+        imported.validate().expect("Imported state validation failed");
+
+        // Persist to new backend (import step)
+        persister2.persist_state(&imported).expect("Failed to persist imported state");
+
+        // Load from new backend to verify
+        let final_state = persister2.load_state()
+            .expect("Failed to load final state")
+            .expect("No final state found");
+
+        // Verify consistency
+        assert_eq!(final_state.height, original.height);
+        assert_eq!(final_state.timestamp, original.timestamp);
+        assert_eq!(final_state.core.balances.len(), original.core.balances.len());
+        assert_eq!(final_state.core.positions.len(), original.core.positions.len());
+        assert_eq!(final_state.core.orders.len(), original.core.orders.len());
+    }
+
+    #[test]
+    fn test_import_rejects_corrupted_json() {
+        // Test various forms of corrupted JSON
+        let test_cases = vec![
+            ("", "empty string"),
+            ("{}", "empty object"),
+            ("{\"height\": \"not_a_number\"}", "invalid type"),
+            ("not json at all", "invalid JSON syntax"),
+        ];
+
+        for (json, description) in test_cases {
+            let result: std::result::Result<PersistedState, _> = serde_json::from_str(json);
+            assert!(
+                result.is_err(),
+                "Should reject: {}",
+                description
+            );
+        }
+
+        // Test schema version mismatch separately (requires valid JSON structure)
+        let wrong_version_json = r#"{
+            "schema_version": 999,
+            "height": 1,
+            "timestamp": 0,
+            "app_hash": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+            "core": {"balances":[],"accounts":[],"positions":[],"leverage":[],"markets":[],"orders":[],"next_order_id":0,"insurance_fund":"0"},
+            "spot": {"tokens":[],"markets":[],"reserved":[],"orders":[],"next_token_index":0,"next_market_id":0,"next_order_id":0},
+            "evm": {"accounts":[],"storage":[],"code":[],"block_hashes":[]},
+            "chain": {"nonces":[],"blocks":[],"cloid_index":[]}
+        }"#;
+        let parsed: std::result::Result<PersistedState, _> = serde_json::from_str(wrong_version_json);
+        if let Ok(state) = parsed {
+            assert!(state.validate().is_err(), "Should reject wrong schema version");
+        }
+    }
+
+    #[test]
+    fn test_export_handles_empty_state() {
+        let (backend, _temp_dir) = create_test_backend();
+        let persister = StatePersister::new(&backend);
+
+        // Persist minimal state
+        let mut state = PersistedState::new();
+        state.height = 1;
+        state.timestamp = 1000;
+
+        persister.persist_state(&state).expect("Failed to persist");
+
+        // Load and serialize to JSON
+        let loaded = persister.load_state()
+            .expect("Failed to load")
+            .expect("No state found");
+
+        let json = serde_json::to_string_pretty(&loaded)
+            .expect("Failed to serialize");
+
+        // Should produce valid JSON even for empty state
+        let parsed: PersistedState = serde_json::from_str(&json)
+            .expect("Failed to deserialize");
+
+        assert_eq!(parsed.height, 1);
+        assert!(parsed.core.balances.is_empty());
+        assert!(parsed.core.positions.is_empty());
+        assert!(parsed.core.orders.is_empty());
+    }
+
+    #[test]
+    fn test_state_overwrite_on_import() {
+        let (backend, _temp_dir) = create_test_backend();
+        let persister = StatePersister::new(&backend);
+
+        // First persist some state
+        let mut state1 = PersistedState::new();
+        state1.height = 100;
+        state1.timestamp = 1000;
+        state1.core.balances.push(BalanceEntry {
+            account: AccountAddress::from([1u8; 20]),
+            token: 0,
+            balance: UnifiedBalanceData {
+                total: "500".to_string(),
+                core_view: "500".to_string(),
+                evm_view: "0".to_string(),
+            },
+        });
+        persister.persist_state(&state1).expect("Failed to persist state1");
+
+        // Then persist different state (simulating import overwrite)
+        let mut state2 = PersistedState::new();
+        state2.height = 200;
+        state2.timestamp = 2000;
+        state2.core.balances.push(BalanceEntry {
+            account: AccountAddress::from([2u8; 20]),
+            token: 1,
+            balance: UnifiedBalanceData {
+                total: "1000".to_string(),
+                core_view: "1000".to_string(),
+                evm_view: "0".to_string(),
+            },
+        });
+        persister.persist_state(&state2).expect("Failed to persist state2");
+
+        // Load and verify we have state2
+        let loaded = persister.load_state()
+            .expect("Failed to load")
+            .expect("No state found");
+
+        assert_eq!(loaded.height, 200, "Height should be from state2");
+        assert_eq!(loaded.timestamp, 2000, "Timestamp should be from state2");
+        // Note: balances accumulate in RocksDB, but height/timestamp reflect latest
+    }
+
+    #[test]
+    fn test_large_state_json_serialization() {
+        let mut state = PersistedState::new();
+        state.height = 1;
+        state.timestamp = 1000;
+
+        // Add many balances
+        for i in 0..100 {
+            let mut addr = [0u8; 20];
+            addr[0] = (i / 256) as u8;
+            addr[1] = (i % 256) as u8;
+
+            state.core.balances.push(BalanceEntry {
+                account: AccountAddress::from(addr),
+                token: 0,
+                balance: UnifiedBalanceData {
+                    total: format!("{}", 1000 * (i + 1)),
+                    core_view: format!("{}", 1000 * (i + 1)),
+                    evm_view: "0".to_string(),
+                },
+            });
+        }
+
+        // Serialize to JSON
+        let json = serde_json::to_string(&state)
+            .expect("Failed to serialize large state");
+
+        // Deserialize back
+        let restored: PersistedState = serde_json::from_str(&json)
+            .expect("Failed to deserialize large state");
+
+        assert_eq!(restored.core.balances.len(), 100);
+    }
+
+    #[test]
+    fn test_special_characters_in_client_order_id() {
+        use hypercore_primitives::{Order, OrderSide, OrderStatus, OrderType, TimeInForce};
+
+        let mut state = PersistedState::new();
+        state.height = 1;
+
+        // Test with special characters in client_order_id
+        state.core.orders.push(OrderEntry {
+            market: 0,
+            order_id: 1,
+            order: Order {
+                id: 1,
+                owner: AccountAddress::from([1u8; 20]),
+                market_id: 0,
+                side: OrderSide::Buy,
+                price: hypercore_primitives::Decimal::price("100"),
+                original_size: hypercore_primitives::Decimal::size("1"),
+                remaining_size: hypercore_primitives::Decimal::size("1"),
+                status: OrderStatus::Open,
+                order_type: OrderType::Limit { tif: TimeInForce::Gtc },
+                reduce_only: false,
+                post_only: false,
+                client_order_id: Some("test-🚀-order-\n\t\"special\"".to_string()),
+                timestamp: 1000,
+            },
+        });
+
+        // Should serialize and deserialize correctly
+        let json = serde_json::to_string(&state)
+            .expect("Failed to serialize");
+        let restored: PersistedState = serde_json::from_str(&json)
+            .expect("Failed to deserialize");
+
+        assert_eq!(
+            restored.core.orders[0].order.client_order_id,
+            Some("test-🚀-order-\n\t\"special\"".to_string())
+        );
+    }
 }

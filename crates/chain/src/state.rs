@@ -3,14 +3,21 @@
 //! Phase 2B: This module now integrates with the unified state model from Phase 2A.
 //! The AppState holds references to both perpetuals (Engine) and spot (SpotEngine)
 //! trading, all backed by a single UnifiedState for balance management.
+//!
+//! ## Re-org Support (Phase 7C)
+//!
+//! This module provides coordinated state snapshots for handling blockchain reorganizations.
+//! All three state layers (UnifiedState, EngineState, SpotEngineState) can be captured
+//! atomically and restored together when reverting to a previous block.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use hypercore_engine::{Engine, EngineConfig, EngineState, SpotEngine};
+use hypercore_engine::{Engine, EngineConfig, EngineState, EngineStateSnapshot, SpotEngine, SpotEngineStateSnapshot};
 use hypercore_primitives::{
     AccountAddress, BlockHeight, Decimal, MarketId, OrderId,
     SharedUnifiedState, Timestamp, TokenIndex, new_shared_unified_state,
+    UnifiedStateSnapshot,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
@@ -920,6 +927,253 @@ impl AppState {
             .transfer_to_core_view(user, token, amount)
             .map_err(|e| StateError::Internal(e.to_string()))
     }
+
+    // ========================================================================
+    // Re-org Support: State Snapshot & Restore (Phase 7C)
+    // ========================================================================
+
+    /// Create a coordinated snapshot of all state for re-org handling
+    ///
+    /// This captures the complete state of:
+    /// - UnifiedState (master balance sheet)
+    /// - EngineState (perpetual positions, orders, markets)
+    /// - SpotEngineState (spot tokens, markets, orders) if present
+    /// - AppState-specific fields (nonces, heights, etc.)
+    ///
+    /// The snapshot can be used to revert state during a blockchain reorganization.
+    pub async fn snapshot(&self) -> AppStateSnapshot {
+        // Snapshot unified state (balances)
+        let unified_snapshot = {
+            let state = self.unified_state.read().unwrap();
+            state.snapshot()
+        };
+
+        // Snapshot engine state (perp positions, orders)
+        let engine_snapshot = {
+            let state = self.engine.read().await;
+            state.snapshot()
+        };
+
+        // Snapshot spot engine state if present
+        let spot_engine_snapshot = if let Some(ref spot_engine) = self.spot_engine {
+            let spot = spot_engine.read().await;
+            Some(spot.state.snapshot())
+        } else {
+            None
+        };
+
+        AppStateSnapshot {
+            // Core snapshots for all three state layers
+            unified_snapshot,
+            engine_snapshot,
+            spot_engine_snapshot,
+            // AppState-specific fields
+            height: self.height,
+            timestamp: self.timestamp,
+            app_hash: self.app_hash,
+            nonces: self.nonces.clone(),
+            block_hashes: self.block_hashes.clone(),
+            block_metadata: self.block_metadata.clone(),
+            block_events: self.block_events.clone(),
+            cloid_to_oid: self.cloid_to_oid.clone(),
+            last_timestamp_nonces: self.last_timestamp_nonces.clone(),
+            next_trade_id: self.next_trade_id,
+        }
+    }
+
+    /// Restore state from a snapshot during re-org
+    ///
+    /// This atomically restores all three state layers:
+    /// - UnifiedState (balances)
+    /// - EngineState (perp state)
+    /// - SpotEngineState (spot state) if present
+    ///
+    /// After restoration, the state will be identical to when the snapshot was taken.
+    ///
+    /// WARNING: This is a destructive operation. Any state changes since the
+    /// snapshot was taken will be lost.
+    pub async fn restore(&mut self, snapshot: AppStateSnapshot) {
+        // Restore unified state (balances)
+        {
+            let mut state = self.unified_state.write().unwrap();
+            state.restore(snapshot.unified_snapshot);
+        }
+
+        // Restore engine state (perp positions, orders)
+        {
+            let mut state = self.engine.write().await;
+            state.restore(snapshot.engine_snapshot);
+        }
+
+        // Restore spot engine state if present
+        if let (Some(ref spot_engine), Some(spot_snapshot)) = (&self.spot_engine, snapshot.spot_engine_snapshot) {
+            let mut spot = spot_engine.write().await;
+            spot.state.restore(spot_snapshot);
+        }
+
+        // Restore AppState-specific fields
+        self.height = snapshot.height;
+        self.timestamp = snapshot.timestamp;
+        self.app_hash = snapshot.app_hash;
+        self.nonces = snapshot.nonces;
+        self.block_hashes = snapshot.block_hashes;
+        self.block_metadata = snapshot.block_metadata;
+        self.block_events = snapshot.block_events;
+        self.cloid_to_oid = snapshot.cloid_to_oid;
+        self.last_timestamp_nonces = snapshot.last_timestamp_nonces;
+        self.next_trade_id = snapshot.next_trade_id;
+
+        // Clear pending state (it's invalid after restore)
+        self.pending_txs.clear();
+        self.pending_block_events.clear();
+        self.unified_state_tree = None;
+        self.nonce_tree = None;
+
+        tracing::info!(
+            "State restored to height {} (app_hash: {})",
+            self.height,
+            hex::encode(&self.app_hash[..8])
+        );
+    }
+
+    /// Create a snapshot synchronously (blocking version)
+    ///
+    /// This is useful when you don't have an async context.
+    /// Internally uses blocking locks on async RwLocks.
+    pub fn snapshot_blocking(&self) -> AppStateSnapshot {
+        // Snapshot unified state (balances) - uses std::sync::RwLock
+        let unified_snapshot = {
+            let state = self.unified_state.read().unwrap();
+            state.snapshot()
+        };
+
+        // Snapshot engine state (perp positions, orders) - uses tokio::sync::RwLock
+        let engine_snapshot = {
+            let state = self.engine.blocking_read();
+            state.snapshot()
+        };
+
+        // Snapshot spot engine state if present
+        let spot_engine_snapshot = if let Some(ref spot_engine) = self.spot_engine {
+            let spot = spot_engine.blocking_read();
+            Some(spot.state.snapshot())
+        } else {
+            None
+        };
+
+        AppStateSnapshot {
+            unified_snapshot,
+            engine_snapshot,
+            spot_engine_snapshot,
+            height: self.height,
+            timestamp: self.timestamp,
+            app_hash: self.app_hash,
+            nonces: self.nonces.clone(),
+            block_hashes: self.block_hashes.clone(),
+            block_metadata: self.block_metadata.clone(),
+            block_events: self.block_events.clone(),
+            cloid_to_oid: self.cloid_to_oid.clone(),
+            last_timestamp_nonces: self.last_timestamp_nonces.clone(),
+            next_trade_id: self.next_trade_id,
+        }
+    }
+
+    /// Restore state from a snapshot synchronously (blocking version)
+    pub fn restore_blocking(&mut self, snapshot: AppStateSnapshot) {
+        // Restore unified state
+        {
+            let mut state = self.unified_state.write().unwrap();
+            state.restore(snapshot.unified_snapshot);
+        }
+
+        // Restore engine state
+        {
+            let mut state = self.engine.blocking_write();
+            state.restore(snapshot.engine_snapshot);
+        }
+
+        // Restore spot engine state if present
+        if let (Some(ref spot_engine), Some(spot_snapshot)) = (&self.spot_engine, snapshot.spot_engine_snapshot) {
+            let mut spot = spot_engine.blocking_write();
+            spot.state.restore(spot_snapshot);
+        }
+
+        // Restore AppState fields
+        self.height = snapshot.height;
+        self.timestamp = snapshot.timestamp;
+        self.app_hash = snapshot.app_hash;
+        self.nonces = snapshot.nonces;
+        self.block_hashes = snapshot.block_hashes;
+        self.block_metadata = snapshot.block_metadata;
+        self.block_events = snapshot.block_events;
+        self.cloid_to_oid = snapshot.cloid_to_oid;
+        self.last_timestamp_nonces = snapshot.last_timestamp_nonces;
+        self.next_trade_id = snapshot.next_trade_id;
+
+        // Clear pending state
+        self.pending_txs.clear();
+        self.pending_block_events.clear();
+        self.unified_state_tree = None;
+        self.nonce_tree = None;
+
+        tracing::info!(
+            "State restored (blocking) to height {} (app_hash: {})",
+            self.height,
+            hex::encode(&self.app_hash[..8])
+        );
+    }
+}
+
+/// Coordinated snapshot of all application state for re-org handling
+///
+/// This struct captures the complete state of all three layers:
+/// 1. **UnifiedState** - Master balance sheet (Core + EVM views)
+/// 2. **EngineState** - Perpetual trading state (positions, orders, markets)
+/// 3. **SpotEngineState** - Spot trading state (tokens, markets, orders)
+///
+/// Plus AppState-specific fields like nonces, heights, and metadata.
+///
+/// ## Usage
+///
+/// ```ignore
+/// // Take a snapshot before processing a block
+/// let snapshot = app_state.snapshot().await;
+///
+/// // Process transactions...
+/// // If we need to revert (e.g., re-org):
+/// app_state.restore(snapshot).await;
+/// ```
+#[derive(Debug, Clone)]
+pub struct AppStateSnapshot {
+    // Core snapshots for all three state layers
+    /// Snapshot of unified state (all balances)
+    pub unified_snapshot: UnifiedStateSnapshot,
+    /// Snapshot of engine state (perp positions, orders, markets)
+    pub engine_snapshot: EngineStateSnapshot,
+    /// Snapshot of spot engine state (optional - may not be present)
+    pub spot_engine_snapshot: Option<SpotEngineStateSnapshot>,
+
+    // AppState-specific fields
+    /// Block height at snapshot time
+    pub height: BlockHeight,
+    /// Timestamp at snapshot time
+    pub timestamp: Timestamp,
+    /// App hash at snapshot time
+    pub app_hash: [u8; 32],
+    /// Nonces at snapshot time
+    pub nonces: HashMap<AccountAddress, u64>,
+    /// Block hashes
+    pub block_hashes: HashMap<BlockHeight, [u8; 32]>,
+    /// Block metadata
+    pub block_metadata: HashMap<BlockHeight, BlockMeta>,
+    /// Block events
+    pub block_events: HashMap<BlockHeight, Vec<serde_json::Value>>,
+    /// Client order ID mappings
+    pub cloid_to_oid: HashMap<(AccountAddress, String), (MarketId, OrderId)>,
+    /// Last timestamp nonces
+    pub last_timestamp_nonces: HashMap<AccountAddress, u64>,
+    /// Next trade ID counter
+    pub next_trade_id: u64,
 }
 
 impl Default for AppState {
@@ -1756,6 +2010,410 @@ mod tests {
             assert_eq!(markets_roots[0], markets_roots[i], "markets_root not deterministic");
             assert_eq!(leverage_roots[0], leverage_roots[i], "leverage_root not deterministic");
             assert_eq!(scalars_hashes[0], scalars_hashes[i], "engine_scalars_hash not deterministic");
+        }
+    }
+
+    // ========================================================================
+    // Re-org Snapshot/Restore Tests (Phase 7C)
+    // ========================================================================
+
+    #[test]
+    fn test_unified_state_snapshot_restore() {
+        let mut state = AppState::new();
+        let user1 = AccountAddress::from([0x01u8; 20]);
+        let user2 = AccountAddress::from([0x02u8; 20]);
+
+        // Credit initial balances
+        {
+            let mut unified = state.unified_state.write().unwrap();
+            unified.credit(user1, 0, Decimal::from_raw(1000, 6));
+            unified.credit(user2, 0, Decimal::from_raw(2000, 6));
+        }
+
+        // Take snapshot
+        let snapshot = state.snapshot_blocking();
+
+        // Modify state after snapshot
+        {
+            let mut unified = state.unified_state.write().unwrap();
+            unified.credit(user1, 0, Decimal::from_raw(5000, 6)); // user1 now has 6000
+            unified.credit(user2, 1, Decimal::from_raw(500, 6));  // user2 gets new token
+        }
+
+        // Verify state was modified
+        let balance_before_restore = state.get_core_balance(user1, 0);
+        assert_eq!(balance_before_restore.raw(), 6000, "Balance should be 6000 after modification");
+
+        // Restore from snapshot
+        state.restore_blocking(snapshot);
+
+        // Verify state was reverted
+        let balance1 = state.get_core_balance(user1, 0);
+        let balance2 = state.get_core_balance(user2, 0);
+        let balance2_token1 = state.get_core_balance(user2, 1);
+
+        assert_eq!(balance1.raw(), 1000, "User1 balance should be restored to 1000");
+        assert_eq!(balance2.raw(), 2000, "User2 balance should be restored to 2000");
+        assert!(balance2_token1.is_zero(), "User2 token1 should not exist after restore");
+    }
+
+    #[test]
+    fn test_app_state_snapshot_restores_height_and_nonces() {
+        let mut state = AppState::new();
+        let user = AccountAddress::from([0x42u8; 20]);
+
+        // Process block 1
+        state.begin_block(1, 1000);
+        state.increment_nonce(user);
+        state.end_block();
+
+        // Take snapshot at block 1
+        let snapshot = state.snapshot_blocking();
+        assert_eq!(snapshot.height, 1);
+        assert_eq!(snapshot.nonces.get(&user), Some(&1));
+
+        // Process block 2
+        state.begin_block(2, 2000);
+        state.increment_nonce(user);
+        state.end_block();
+
+        // Verify state at block 2
+        assert_eq!(state.height, 2);
+        assert_eq!(state.get_nonce(&user), 2);
+
+        // Restore to block 1
+        state.restore_blocking(snapshot);
+
+        // Verify restoration
+        assert_eq!(state.height, 1);
+        assert_eq!(state.get_nonce(&user), 1);
+    }
+
+    #[test]
+    fn test_snapshot_captures_engine_state() {
+        let mut state = AppState::new();
+        let user = AccountAddress::from([0x42u8; 20]);
+
+        // Deposit to engine state
+        {
+            let mut engine = state.engine.blocking_write();
+            engine.deposit(user, 10000_000000); // $10,000
+        }
+
+        // Take snapshot
+        let snapshot = state.snapshot_blocking();
+
+        // Modify engine state after snapshot
+        {
+            let mut engine = state.engine.blocking_write();
+            engine.deposit(user, 5000_000000); // Add another $5,000
+        }
+
+        // Verify modification
+        {
+            let engine = state.engine.blocking_read();
+            let account = engine.get_account(user).unwrap();
+            assert_eq!(account.balance, 15000_000000);
+        }
+
+        // Restore from snapshot
+        state.restore_blocking(snapshot);
+
+        // Verify engine state was restored
+        {
+            let engine = state.engine.blocking_read();
+            let account = engine.get_account(user).unwrap();
+            assert_eq!(account.balance, 10000_000000, "Engine balance should be restored");
+        }
+    }
+
+    #[test]
+    fn test_snapshot_after_multiple_blocks() {
+        let mut state = AppState::new();
+        let user = AccountAddress::from([0x42u8; 20]);
+
+        // Process several blocks
+        for i in 1..=5 {
+            {
+                let mut unified = state.unified_state.write().unwrap();
+                unified.credit(user, 0, Decimal::from_raw(100, 6)); // Add 100 each block
+            }
+            state.begin_block(i, i * 1000);
+            state.increment_nonce(user);
+            state.end_block();
+        }
+
+        // Take snapshot at block 5
+        let snapshot_at_5 = state.snapshot_blocking();
+        assert_eq!(snapshot_at_5.height, 5);
+
+        // Process more blocks
+        for i in 6..=8 {
+            {
+                let mut unified = state.unified_state.write().unwrap();
+                unified.credit(user, 0, Decimal::from_raw(1000, 6)); // Add 1000 each block
+            }
+            state.begin_block(i, i * 1000);
+            state.increment_nonce(user);
+            state.end_block();
+        }
+
+        // Verify state at block 8
+        assert_eq!(state.height, 8);
+        let balance_at_8 = state.get_core_balance(user, 0);
+        assert_eq!(balance_at_8.raw(), 3500, "Balance at block 8: 5*100 + 3*1000 = 3500");
+
+        // Restore to block 5
+        state.restore_blocking(snapshot_at_5);
+
+        // Verify restoration
+        assert_eq!(state.height, 5);
+        let balance_restored = state.get_core_balance(user, 0);
+        assert_eq!(balance_restored.raw(), 500, "Balance should be 5*100 = 500");
+        assert_eq!(state.get_nonce(&user), 5);
+    }
+
+    #[test]
+    fn test_snapshot_restore_clears_pending_state() {
+        let mut state = AppState::new();
+        let user = AccountAddress::from([0x42u8; 20]);
+
+        // Process block 1
+        {
+            let mut unified = state.unified_state.write().unwrap();
+            unified.credit(user, 0, Decimal::from_raw(1000, 6));
+        }
+        state.begin_block(1, 1000);
+        state.end_block();
+
+        // Take snapshot
+        let snapshot = state.snapshot_blocking();
+
+        // Start processing block 2 (but don't complete it)
+        state.begin_block(2, 2000);
+        // Add some pending events (normally done during tx execution)
+        state.pending_block_events.push(serde_json::json!({"type": "test"}));
+
+        // Verify pending state exists
+        assert!(!state.pending_block_events.is_empty());
+        assert_eq!(state.height, 2);
+
+        // Restore from snapshot
+        state.restore_blocking(snapshot);
+
+        // Pending state should be cleared
+        assert!(state.pending_block_events.is_empty(), "Pending events should be cleared");
+        assert!(state.pending_txs.is_empty(), "Pending txs should be cleared");
+        assert_eq!(state.height, 1, "Height should be restored to 1");
+    }
+
+    #[test]
+    fn test_snapshot_determinism() {
+        // Two identical state sequences should produce identical snapshots
+        let setup_state = |state: &mut AppState| {
+            let user1 = AccountAddress::from([0x01u8; 20]);
+            let user2 = AccountAddress::from([0x02u8; 20]);
+
+            {
+                let mut unified = state.unified_state.write().unwrap();
+                unified.credit(user1, 0, Decimal::from_raw(1000, 6));
+                unified.credit(user2, 0, Decimal::from_raw(2000, 6));
+            }
+
+            state.increment_nonce(user1);
+            state.begin_block(1, 1000);
+            state.end_block();
+        };
+
+        let mut state1 = AppState::new();
+        let mut state2 = AppState::new();
+
+        setup_state(&mut state1);
+        setup_state(&mut state2);
+
+        let snapshot1 = state1.snapshot_blocking();
+        let snapshot2 = state2.snapshot_blocking();
+
+        // Core properties should match
+        assert_eq!(snapshot1.height, snapshot2.height);
+        assert_eq!(snapshot1.timestamp, snapshot2.timestamp);
+        assert_eq!(snapshot1.app_hash, snapshot2.app_hash);
+        assert_eq!(snapshot1.nonces, snapshot2.nonces);
+        assert_eq!(snapshot1.next_trade_id, snapshot2.next_trade_id);
+    }
+
+    #[test]
+    fn test_restore_preserves_app_hash_determinism() {
+        let mut state = AppState::new();
+        let user = AccountAddress::from([0x42u8; 20]);
+
+        // Process block 1
+        {
+            let mut unified = state.unified_state.write().unwrap();
+            unified.credit(user, 0, Decimal::from_raw(1000, 6));
+        }
+        state.begin_block(1, 1000);
+        let hash1 = state.end_block();
+
+        // Take snapshot
+        let snapshot = state.snapshot_blocking();
+
+        // Process block 2
+        {
+            let mut unified = state.unified_state.write().unwrap();
+            unified.credit(user, 0, Decimal::from_raw(500, 6));
+        }
+        state.begin_block(2, 2000);
+        let hash2 = state.end_block();
+
+        // Verify hashes are different
+        assert_ne!(hash1, hash2, "Block 1 and Block 2 should have different hashes");
+
+        // Restore to block 1
+        state.restore_blocking(snapshot);
+
+        // The app_hash from snapshot should match original
+        assert_eq!(state.app_hash, hash1, "Restored app_hash should match original");
+
+        // After restore, we should be at height 1
+        assert_eq!(state.height, 1);
+
+        // Now if we process block 2 again with THE SAME transactions/state changes,
+        // we should get the SAME hash as before
+        {
+            let mut unified = state.unified_state.write().unwrap();
+            unified.credit(user, 0, Decimal::from_raw(500, 6)); // Same change as before
+        }
+        state.begin_block(2, 2000); // Same height and timestamp
+        let hash2_replay = state.end_block();
+
+        // Determinism: same state changes should produce same hash
+        assert_eq!(hash2, hash2_replay, "Replayed block 2 should produce same hash");
+    }
+
+    #[test]
+    fn test_reorg_scenario_basic() {
+        // Simulate a basic re-org scenario:
+        // 1. Process blocks A, B, C
+        // 2. Revert to A
+        // 3. Process blocks B', C' (different chain)
+
+        let mut state = AppState::new();
+        let user = AccountAddress::from([0x42u8; 20]);
+
+        // Initial deposit
+        {
+            let mut unified = state.unified_state.write().unwrap();
+            unified.credit(user, 0, Decimal::from_raw(1000, 6));
+        }
+
+        // Block A (height 1)
+        state.begin_block(1, 1000);
+        state.increment_nonce(user);
+        let hash_a = state.end_block();
+
+        // SNAPSHOT: Take checkpoint at block A
+        let checkpoint_a = state.snapshot_blocking();
+
+        // Block B (height 2) - Original chain
+        {
+            let mut unified = state.unified_state.write().unwrap();
+            unified.credit(user, 0, Decimal::from_raw(100, 6)); // +100 on original chain
+        }
+        state.begin_block(2, 2000);
+        state.increment_nonce(user);
+        let _hash_b = state.end_block();
+
+        // Block C (height 3) - Original chain
+        {
+            let mut unified = state.unified_state.write().unwrap();
+            unified.credit(user, 0, Decimal::from_raw(100, 6)); // +100 on original chain
+        }
+        state.begin_block(3, 3000);
+        state.increment_nonce(user);
+        let _hash_c = state.end_block();
+
+        // At this point: balance = 1000 + 100 + 100 = 1200, nonce = 3
+        assert_eq!(state.get_core_balance(user, 0).raw(), 1200);
+        assert_eq!(state.get_nonce(&user), 3);
+
+        // RE-ORG: Revert to block A
+        state.restore_blocking(checkpoint_a);
+
+        // Verify we're back at block A
+        assert_eq!(state.height, 1);
+        assert_eq!(state.app_hash, hash_a);
+        assert_eq!(state.get_core_balance(user, 0).raw(), 1000);
+        assert_eq!(state.get_nonce(&user), 1);
+
+        // Block B' (height 2) - New chain with different transactions
+        {
+            let mut unified = state.unified_state.write().unwrap();
+            unified.credit(user, 0, Decimal::from_raw(500, 6)); // +500 on new chain (different!)
+        }
+        state.begin_block(2, 2000);
+        state.increment_nonce(user);
+        let hash_b_prime = state.end_block();
+
+        // Block C' (height 3) - New chain
+        {
+            let mut unified = state.unified_state.write().unwrap();
+            unified.credit(user, 0, Decimal::from_raw(500, 6)); // +500 on new chain
+        }
+        state.begin_block(3, 3000);
+        state.increment_nonce(user);
+        let _hash_c_prime = state.end_block();
+
+        // Final state on new chain: balance = 1000 + 500 + 500 = 2000
+        assert_eq!(state.get_core_balance(user, 0).raw(), 2000);
+        assert_eq!(state.get_nonce(&user), 3);
+
+        // Hashes should be different because transactions were different
+        assert_ne!(_hash_b, hash_b_prime, "Different transactions should produce different hashes");
+    }
+
+    #[test]
+    fn test_snapshot_multiple_users() {
+        let mut state = AppState::new();
+        let users: Vec<AccountAddress> = (0..10)
+            .map(|i| AccountAddress::from([i as u8; 20]))
+            .collect();
+
+        // Credit all users
+        for (i, user) in users.iter().enumerate() {
+            let mut unified = state.unified_state.write().unwrap();
+            unified.credit(*user, 0, Decimal::from_raw((i as i128 + 1) * 1000, 6));
+        }
+
+        // Process block
+        state.begin_block(1, 1000);
+        for user in &users {
+            state.increment_nonce(*user);
+        }
+        state.end_block();
+
+        // Take snapshot
+        let snapshot = state.snapshot_blocking();
+
+        // Modify all users
+        for (i, user) in users.iter().enumerate() {
+            let mut unified = state.unified_state.write().unwrap();
+            unified.credit(*user, 0, Decimal::from_raw(9999, 6));
+        }
+
+        // Restore
+        state.restore_blocking(snapshot);
+
+        // Verify all users were restored correctly
+        for (i, user) in users.iter().enumerate() {
+            let balance = state.get_core_balance(*user, 0);
+            assert_eq!(
+                balance.raw(),
+                (i as i128 + 1) * 1000,
+                "User {} balance should be restored",
+                i
+            );
+            assert_eq!(state.get_nonce(user), 1, "User {} nonce should be 1", i);
         }
     }
 }
