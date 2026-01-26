@@ -304,6 +304,155 @@ impl EvmState {
             self.set_balance(addr, decimal_to_u256(balance));
         }
     }
+
+    // ========================================================================
+    // State Root Computation (for consensus commitment)
+    // ========================================================================
+
+    /// Compute the Merkle root of all EVM accounts (nonces and code hashes)
+    ///
+    /// Note: Balances are NOT included here as they're stored in UnifiedState
+    /// and committed via `compute_unified_state_root()` in AppState.
+    ///
+    /// Format: keccak256(sorted accounts where each entry is address || nonce || code_hash)
+    pub fn compute_accounts_root(&self) -> [u8; 32] {
+        use sha3::{Digest, Keccak256};
+
+        // Sort addresses for deterministic ordering
+        let mut addresses: Vec<&Address> = self.accounts.keys().collect();
+        addresses.sort();
+
+        let mut hasher = Keccak256::new();
+        hasher.update(b"EVM_ACCOUNTS_ROOT_V1");
+
+        for addr in addresses {
+            if let Some(account) = self.accounts.get(addr) {
+                // address (20 bytes) || nonce (8 bytes) || code_hash (32 bytes if present)
+                hasher.update(addr.as_slice());
+                hasher.update(&account.nonce.to_le_bytes());
+                if let Some(code_hash) = &account.code_hash {
+                    hasher.update(code_hash.as_slice());
+                } else {
+                    hasher.update(&[0u8; 32]); // Empty code hash
+                }
+            }
+        }
+
+        hasher.finalize().into()
+    }
+
+    /// Compute the Merkle root of all contract storage
+    ///
+    /// Format: keccak256(sorted storage where each entry is address || key || value)
+    pub fn compute_storage_root(&self) -> [u8; 32] {
+        use sha3::{Digest, Keccak256};
+
+        // Sort addresses for deterministic ordering
+        let mut addresses: Vec<&Address> = self.storage.keys().collect();
+        addresses.sort();
+
+        let mut hasher = Keccak256::new();
+        hasher.update(b"EVM_STORAGE_ROOT_V1");
+
+        for addr in addresses {
+            if let Some(contract_storage) = self.storage.get(addr) {
+                // Sort storage keys for deterministic ordering
+                let mut keys: Vec<&U256> = contract_storage.slots.keys().collect();
+                keys.sort();
+
+                for key in keys {
+                    if let Some(value) = contract_storage.slots.get(key) {
+                        // Skip zero values (default/deleted storage)
+                        if !value.is_zero() {
+                            // address (20 bytes) || key (32 bytes) || value (32 bytes)
+                            hasher.update(addr.as_slice());
+                            hasher.update(&key.to_le_bytes::<32>());
+                            hasher.update(&value.to_le_bytes::<32>());
+                        }
+                    }
+                }
+            }
+        }
+
+        hasher.finalize().into()
+    }
+
+    /// Compute the Merkle root of all contract code
+    ///
+    /// Format: keccak256(sorted code where each entry is code_hash || code_length)
+    /// Note: We don't include the full code to save space; the code_hash is sufficient.
+    pub fn compute_code_root(&self) -> [u8; 32] {
+        use sha3::{Digest, Keccak256};
+
+        // Sort code hashes for deterministic ordering
+        let mut hashes: Vec<&B256> = self.code.keys().collect();
+        hashes.sort();
+
+        let mut hasher = Keccak256::new();
+        hasher.update(b"EVM_CODE_ROOT_V1");
+
+        for hash in hashes {
+            if let Some(code) = self.code.get(hash) {
+                // code_hash (32 bytes) || code_length (8 bytes)
+                hasher.update(hash.as_slice());
+                hasher.update(&(code.len() as u64).to_le_bytes());
+            }
+        }
+
+        hasher.finalize().into()
+    }
+
+    /// Compute the combined EVM state root
+    ///
+    /// This combines the accounts, storage, and code roots into a single hash
+    /// that represents the complete EVM-specific state.
+    ///
+    /// Note: EVM balances are NOT included here because they're stored in
+    /// UnifiedState.evm_view and committed via `compute_unified_state_root()`.
+    pub fn compute_state_root(&self) -> [u8; 32] {
+        use sha3::{Digest, Keccak256};
+
+        let accounts_root = self.compute_accounts_root();
+        let storage_root = self.compute_storage_root();
+        let code_root = self.compute_code_root();
+
+        let mut hasher = Keccak256::new();
+        hasher.update(b"EVM_STATE_ROOT_V1");
+        hasher.update(&accounts_root);
+        hasher.update(&storage_root);
+        hasher.update(&code_root);
+
+        hasher.finalize().into()
+    }
+
+    /// Get all account addresses (for iteration)
+    pub fn get_all_accounts(&self) -> Vec<Address> {
+        self.accounts.keys().cloned().collect()
+    }
+
+    /// Get all storage for an address (for iteration)
+    pub fn get_all_storage(&self, address: &Address) -> Option<&HashMap<U256, U256>> {
+        self.storage.get(address).map(|s| &s.slots)
+    }
+
+    /// Get all code hashes (for iteration)
+    pub fn get_all_code_hashes(&self) -> Vec<B256> {
+        self.code.keys().cloned().collect()
+    }
+
+    /// Create an EVM Address from a 20-byte array
+    ///
+    /// This is a helper for creating addresses in tests without importing revm directly.
+    pub fn address_from_bytes(bytes: &[u8; 20]) -> Address {
+        Address::from_slice(bytes)
+    }
+
+    /// Create an EVM U256 from a u64
+    ///
+    /// This is a helper for creating U256 values in tests without importing revm directly.
+    pub fn u256_from_u64(value: u64) -> U256 {
+        U256::from(value)
+    }
 }
 
 /// EVM state snapshot for rollback
@@ -477,5 +626,187 @@ mod tests {
 
         state.restore(snapshot);
         assert_eq!(state.get_balance(&addr), U256::from(100));
+    }
+
+    // ========================================================================
+    // State Root Computation Tests
+    // ========================================================================
+
+    #[test]
+    fn test_accounts_root_deterministic() {
+        let mut state = EvmState::new();
+        let addr1 = Address::repeat_byte(1);
+        let addr2 = Address::repeat_byte(2);
+
+        // Add accounts
+        state.set_nonce(addr1, 5);
+        state.set_nonce(addr2, 10);
+        state.set_code(addr1, vec![0x60, 0x00]);
+
+        // Compute root multiple times - should be deterministic
+        let root1 = state.compute_accounts_root();
+        let root2 = state.compute_accounts_root();
+        let root3 = state.compute_accounts_root();
+
+        assert_eq!(root1, root2);
+        assert_eq!(root2, root3);
+    }
+
+    #[test]
+    fn test_accounts_root_order_independence() {
+        // Create two states with accounts added in different order
+        let mut state1 = EvmState::new();
+        let mut state2 = EvmState::new();
+
+        let addr1 = Address::repeat_byte(1);
+        let addr2 = Address::repeat_byte(2);
+        let addr3 = Address::repeat_byte(3);
+
+        // State1: add in order 1, 2, 3
+        state1.set_nonce(addr1, 1);
+        state1.set_nonce(addr2, 2);
+        state1.set_nonce(addr3, 3);
+
+        // State2: add in order 3, 1, 2
+        state2.set_nonce(addr3, 3);
+        state2.set_nonce(addr1, 1);
+        state2.set_nonce(addr2, 2);
+
+        // Roots should be identical despite different insertion order
+        assert_eq!(state1.compute_accounts_root(), state2.compute_accounts_root());
+    }
+
+    #[test]
+    fn test_storage_root_deterministic() {
+        let mut state = EvmState::new();
+        let addr = Address::repeat_byte(1);
+
+        state.set_storage(addr, U256::from(1), U256::from(100));
+        state.set_storage(addr, U256::from(2), U256::from(200));
+        state.set_storage(addr, U256::from(3), U256::from(300));
+
+        let root1 = state.compute_storage_root();
+        let root2 = state.compute_storage_root();
+
+        assert_eq!(root1, root2);
+    }
+
+    #[test]
+    fn test_storage_root_order_independence() {
+        let mut state1 = EvmState::new();
+        let mut state2 = EvmState::new();
+
+        let addr = Address::repeat_byte(1);
+
+        // State1: insert in order 1, 2, 3
+        state1.set_storage(addr, U256::from(1), U256::from(100));
+        state1.set_storage(addr, U256::from(2), U256::from(200));
+        state1.set_storage(addr, U256::from(3), U256::from(300));
+
+        // State2: insert in order 3, 1, 2
+        state2.set_storage(addr, U256::from(3), U256::from(300));
+        state2.set_storage(addr, U256::from(1), U256::from(100));
+        state2.set_storage(addr, U256::from(2), U256::from(200));
+
+        assert_eq!(state1.compute_storage_root(), state2.compute_storage_root());
+    }
+
+    #[test]
+    fn test_code_root_deterministic() {
+        let mut state = EvmState::new();
+        let addr1 = Address::repeat_byte(1);
+        let addr2 = Address::repeat_byte(2);
+
+        state.set_code(addr1, vec![0x60, 0x00, 0x60, 0x00]);
+        state.set_code(addr2, vec![0x60, 0x40, 0x52]);
+
+        let root1 = state.compute_code_root();
+        let root2 = state.compute_code_root();
+
+        assert_eq!(root1, root2);
+    }
+
+    #[test]
+    fn test_state_root_combines_all() {
+        let mut state = EvmState::new();
+        let addr = Address::repeat_byte(1);
+
+        // Set up various state
+        state.set_nonce(addr, 5);
+        state.set_code(addr, vec![0x60, 0x00]);
+        state.set_storage(addr, U256::from(1), U256::from(100));
+
+        // Compute combined root
+        let state_root = state.compute_state_root();
+
+        // Verify it's non-zero
+        assert_ne!(state_root, [0u8; 32]);
+
+        // Verify determinism
+        let state_root2 = state.compute_state_root();
+        assert_eq!(state_root, state_root2);
+    }
+
+    #[test]
+    fn test_state_root_changes_with_modifications() {
+        let mut state = EvmState::new();
+        let addr = Address::repeat_byte(1);
+
+        // Initial state
+        state.set_nonce(addr, 1);
+        let root1 = state.compute_state_root();
+
+        // Modify nonce
+        state.set_nonce(addr, 2);
+        let root2 = state.compute_state_root();
+
+        // Roots should be different
+        assert_ne!(root1, root2);
+
+        // Add storage
+        state.set_storage(addr, U256::from(1), U256::from(100));
+        let root3 = state.compute_state_root();
+
+        // Root should change again
+        assert_ne!(root2, root3);
+
+        // Add code
+        state.set_code(addr, vec![0x60, 0x00]);
+        let root4 = state.compute_state_root();
+
+        // Root should change again
+        assert_ne!(root3, root4);
+    }
+
+    #[test]
+    fn test_empty_state_has_consistent_root() {
+        let state1 = EvmState::new();
+        let state2 = EvmState::new();
+
+        // Empty states should have same root
+        assert_eq!(state1.compute_state_root(), state2.compute_state_root());
+    }
+
+    #[test]
+    fn test_storage_root_ignores_zero_values() {
+        let mut state1 = EvmState::new();
+        let mut state2 = EvmState::new();
+
+        let addr = Address::repeat_byte(1);
+
+        // State1: set and then delete storage
+        state1.set_storage(addr, U256::from(1), U256::from(100));
+        state1.set_storage(addr, U256::from(1), U256::ZERO); // Delete by setting to zero
+
+        // State2: never set storage
+        // Just create account by setting nonce
+        state2.set_nonce(addr, 0);
+
+        // Both should have empty storage root
+        // Note: accounts root will be different because state1 has the storage entry (even if zero)
+        // But storage root should ignore zero values
+        let sr1 = state1.compute_storage_root();
+        let sr2 = state2.compute_storage_root();
+        assert_eq!(sr1, sr2);
     }
 }

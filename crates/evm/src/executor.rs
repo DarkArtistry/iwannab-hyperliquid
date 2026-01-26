@@ -523,13 +523,17 @@ impl EvmExecutor {
     }
 
     /// Get current state root (simplified - returns hash of serialized state)
+    /// Compute the EVM state root
+    ///
+    /// This computes a deterministic hash of all EVM-specific state:
+    /// - Account nonces and code hashes
+    /// - Contract storage
+    /// - Deployed contract code
+    ///
+    /// Note: EVM balances are NOT included here because they're stored in
+    /// UnifiedState.evm_view and committed separately via `compute_unified_state_root()`.
     pub fn state_root(&self) -> [u8; 32] {
-        // In production, this would compute a proper Merkle Patricia Trie root
-        // For now, return a hash of the current block number
-        let hash = Keccak256::digest(self.block_number.to_be_bytes());
-        let mut result = [0u8; 32];
-        result.copy_from_slice(&hash);
-        result
+        self.db.state.compute_state_root()
     }
 
     /// Commit state changes and advance block

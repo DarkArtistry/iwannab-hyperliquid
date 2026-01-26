@@ -28,6 +28,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use hypercore_chain::{AbciService, HyperCoreApp};
 #[cfg(feature = "persistence")]
 use hypercore_chain::{extract_state, restore_state, restore_chain_state};
+#[cfg(feature = "p2p")]
+use libp2p::Multiaddr;
 use hypercore_engine::{EngineState, SpotEngine};
 use hypercore_evm::{EvmExecutor, EvmRpcServer};
 use hypercore_gateway::{GatewayConfig, GatewayServer, RateLimitConfig, ValidationConfig, EventBroadcaster};
@@ -105,6 +107,21 @@ enum Commands {
         #[cfg(feature = "persistence")]
         #[arg(long, default_value = "./data/chain", env = "DATA_DIR")]
         data_dir: String,
+
+        /// Enable P2P attestation gossip (requires 'p2p' feature)
+        #[cfg(feature = "p2p")]
+        #[arg(long)]
+        enable_p2p_attestation: bool,
+
+        /// P2P listen address for attestation gossip
+        #[cfg(feature = "p2p")]
+        #[arg(long, default_value = "/ip4/0.0.0.0/tcp/26670", env = "P2P_LISTEN_ADDR")]
+        p2p_listen_addr: String,
+
+        /// Bootstrap peers for P2P attestation gossip (comma-separated multiaddrs)
+        #[cfg(feature = "p2p")]
+        #[arg(long, env = "P2P_BOOTSTRAP_PEERS")]
+        p2p_bootstrap_peers: Option<String>,
     },
 
     /// Initialize genesis state
@@ -166,6 +183,12 @@ async fn main() -> anyhow::Result<()> {
             enable_persistence,
             #[cfg(feature = "persistence")]
             data_dir,
+            #[cfg(feature = "p2p")]
+            enable_p2p_attestation,
+            #[cfg(feature = "p2p")]
+            p2p_listen_addr,
+            #[cfg(feature = "p2p")]
+            p2p_bootstrap_peers,
         } => {
             // Initialize logging
             init_logging(&log_level);
@@ -472,6 +495,116 @@ async fn main() -> anyhow::Result<()> {
                     }
                     #[cfg(not(feature = "persistence"))]
                     tracing::info!("Post-commit handler enabled with event broadcasting");
+
+                    // === P2P Attestation Gossip (optional) ===
+                    #[cfg(feature = "p2p")]
+                    if enable_p2p_attestation {
+                        use hypercore_chain::{
+                            AttestationGossip, GossipConfig, AttestationKeyPair,
+                            AttestationCollector, AttestationConfig,
+                            DivergenceHandler, DivergenceConfig, DivergencePolicy,
+                        };
+
+                        tracing::info!("Setting up P2P attestation gossip layer...");
+                        tracing::info!("P2P listen address: {}", p2p_listen_addr);
+
+                        // Parse bootstrap peers
+                        let bootstrap_peers: Vec<libp2p::Multiaddr> = p2p_bootstrap_peers
+                            .as_ref()
+                            .map(|s| {
+                                s.split(',')
+                                    .filter_map(|addr| addr.trim().parse().ok())
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+
+                        if !bootstrap_peers.is_empty() {
+                            tracing::info!("Bootstrap peers: {:?}", bootstrap_peers);
+                        }
+
+                        // Create attestation key pair (for signing our attestations)
+                        let attestation_key = AttestationKeyPair::generate();
+                        tracing::info!(
+                            "Generated attestation key: {}",
+                            attestation_key.public_key_hex()
+                        );
+
+                        // Create gossip configuration
+                        let gossip_config = GossipConfig {
+                            listen_addr: p2p_listen_addr.parse().expect("Invalid P2P listen address"),
+                            bootstrap_peers,
+                            ..Default::default()
+                        };
+
+                        // Create the gossip service
+                        match AttestationGossip::new(gossip_config).await {
+                            Ok((gossip, broadcast_tx, mut incoming_rx)) => {
+                                // Create attestation collector and divergence handler
+                                let (alert_tx, alert_rx) = tokio::sync::mpsc::channel(100);
+                                let collector = std::sync::Arc::new(AttestationCollector::new(
+                                    alert_tx,
+                                    AttestationConfig::default(),
+                                    Some(attestation_key.public_key()),
+                                ));
+
+                                // Register our own validator (for testing - in production, this comes from CometBFT)
+                                collector.add_validator(attestation_key.public_key(), 100).await;
+
+                                let handler = DivergenceHandler::new(DivergenceConfig {
+                                    policy: DivergencePolicy::Halt,
+                                    halt_only_on_minority: true,
+                                });
+
+                                // Wire up block producer with attestation
+                                block_producer = block_producer
+                                    .with_attestation(attestation_key, std::sync::Arc::clone(&collector))
+                                    .with_attestation_broadcast(broadcast_tx)
+                                    .with_halt_flag(handler.halted_flag());
+
+                                // Run the gossip service in a dedicated thread
+                                // (libp2p swarm may not be Send-safe across tokio spawns)
+                                std::thread::spawn(move || {
+                                    let rt = tokio::runtime::Builder::new_current_thread()
+                                        .enable_all()
+                                        .build()
+                                        .expect("Failed to create gossip runtime");
+
+                                    rt.block_on(async move {
+                                        tracing::info!("Starting P2P attestation gossip service...");
+                                        if let Err(e) = gossip.run().await {
+                                            tracing::error!("Attestation gossip error: {}", e);
+                                        }
+                                    });
+                                });
+
+                                // Spawn task to forward incoming attestations to collector
+                                let collector_for_incoming = std::sync::Arc::clone(&collector);
+                                tokio::spawn(async move {
+                                    while let Some(attestation) = incoming_rx.recv().await {
+                                        if let Err(e) = collector_for_incoming.process_attestation(attestation).await {
+                                            tracing::debug!("Failed to process incoming attestation: {}", e);
+                                        }
+                                    }
+                                });
+
+                                // Spawn divergence handler
+                                tokio::spawn(async move {
+                                    handler.run(alert_rx).await;
+                                });
+
+                                tracing::info!("P2P attestation gossip enabled");
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to create P2P attestation gossip: {}", e);
+                                tracing::warn!("Continuing without P2P attestation");
+                            }
+                        }
+                    }
+
+                    #[cfg(feature = "p2p")]
+                    if !enable_p2p_attestation {
+                        tracing::info!("P2P attestation gossip disabled");
+                    }
 
                     let _abci_service = AbciService::new(Arc::clone(&app));
                     tokio::spawn(async move {

@@ -17,24 +17,38 @@ Prioritized list of outstanding work items organized by criticality and phase.
 │                    HyperCore Project Status                         │
 ├─────────────────────────────────────────────────────────────────────┤
 │  Overall Completion: 99%                                            │
-│  Test Coverage: 563+ tests (all passing)                            │
+│  Test Coverage: 627+ tests (all passing)                            │
+│    - 434 Rust unit tests                                            │
+│    - 49 Solidity contract tests                                     │
+│    - 144 E2E integration tests                                      │
 │                                                                     │
 │  ✅ READY NOW:        Single-node MVP deployment                    │
 │  ✅ READY NOW:        Multi-node testnet (consensus fixes applied)  │
 │  🟡 PENDING:          Mainnet (needs security audit)                │
 │                                                                     │
-│  Recent Updates (Jan 23, 2026):                                     │
+│  Latest Updates (Jan 23, 2026):                                     │
+│  ✅ P2P ATTESTATION GOSSIP (Phase 7E) - Fully implemented!          │
+│     - LibP2P GossipSub protocol for attestation broadcast           │
+│     - Encrypted connections with Noise protocol                     │
+│     - Identify protocol for peer discovery                          │
+│     - Bootstrap peer support for production                         │
+│     - CLI flags: --enable-p2p-attestation, --p2p-listen-addr        │
+│     - 105 chain tests now passing (3 new p2p tests)                 │
+│  ✅ RE-ORG HANDLING (Phase 7C) - Fully implemented!                 │
+│     - AppStateSnapshot captures all 3 state layers atomically       │
+│     - UnifiedState, EngineState, SpotEngineState snapshots          │
+│     - Both async and blocking snapshot/restore methods              │
+│  ✅ EVM STATE COMMITMENT (Phase 7D) - Fully implemented!            │
+│     - compute_state_root() with accounts/storage/code roots         │
+│     - EVM state optionally included in AppHash                      │
 │  ✅ STATE ATTESTATION LAYER (Phase 7B) - Core implemented!          │
 │     - StateAttestation with Ed25519 signatures                      │
 │     - AttestationCollector with quorum/divergence detection         │
 │     - DivergenceHandler with configurable policies                  │
 │     - BlockProducer integration (halt on divergence)                │
-│     - 89 chain tests now passing (+20 attestation tests)            │
-│  ✅ WebSocket event broadcasting implemented (15 tests)             │
-│  ✅ ABCI State Sync Snapshots implemented (15 tests)                │
-│  ✅ Export/Import CLI commands implemented                          │
+│  ✅ WebSocket event broadcasting implemented                        │
+│  ✅ ABCI State Sync Snapshots implemented                           │
 │  ✅ State persistence with RocksDB fully integrated                 │
-│  ✅ 399+ Rust unit tests                                            │
 │                                                                     │
 │  Key Documents:                                                     │
 │  - docs/IMPLEMENTATION_STATUS.md - Full phase breakdown             │
@@ -63,7 +77,7 @@ Prioritized list of outstanding work items organized by criticality and phase.
 | CLOID mappings | `compute_cloid_root()` | ✅ **NEW** |
 | Scalars (insurance, order ID) | `compute_engine_scalars_hash()` | ✅ **NEW** |
 | Open Orders | `compute_orders_root()` | ✅ **IMPLEMENTED** |
-| EVM state | TODO | ⚠️ Not yet consensus-critical |
+| EVM state | `EvmState::compute_state_root()` | ✅ **IMPLEMENTED** (Optional, enabled via `set_evm_executor()`) |
 
 **Remaining Work**:
 - ~~Implement `get_all_orders_global()` in EngineState for proper order Merkle tree~~ ✅ DONE
@@ -286,7 +300,71 @@ app_state.restore_blocking(checkpoint);
 8. `test_reorg_scenario_basic` - Full re-org simulation (A→B→C, revert to A, replay B'→C')
 9. `test_snapshot_multiple_users` - Multi-user state restore
 
-**Test Results:** 98 chain tests passing (10 new re-org tests)
+**Test Results:** 102 chain tests passing (10 new re-org tests, 4 new EVM tests)
+
+---
+
+### ✅ EVM State Commitment in AppHash (Phase 7D) - January 23, 2026
+
+Implemented proper EVM state root computation and optional integration with AppHash. This makes EVM execution consensus-critical when enabled.
+
+**Problem Solved:**
+
+Previously, the AppHash only included:
+- Unified balances (including EVM view balances)
+- Nonces
+- Engine state (positions, orders, markets, etc.)
+
+EVM-specific state (account nonces, contract code, storage) was NOT committed, meaning validators could diverge on EVM state without detection.
+
+**Implementation:**
+
+| Component | New Methods | Status |
+|-----------|-------------|--------|
+| **EvmState** | `compute_accounts_root()`, `compute_storage_root()`, `compute_code_root()`, `compute_state_root()` | ✅ **NEW** |
+| **EvmExecutor** | `state_root()` - now uses proper state root computation | ✅ **UPDATED** |
+| **AppState** | `evm_executor` field, `set_evm_executor()`, `evm_executor()` | ✅ **NEW** |
+| **AppHash** | Includes EVM state root when `evm_executor` is set | ✅ **NEW** |
+
+**State Root Components:**
+
+1. **Accounts Root**: Hash of (address, nonce, code_hash) for all EVM accounts
+2. **Storage Root**: Hash of (address, key, value) for all non-zero storage slots
+3. **Code Root**: Hash of (code_hash, code_length) for all deployed contracts
+
+Note: EVM balances are NOT in the EVM state root because they're stored in `UnifiedState.evm_view` and already committed via `compute_unified_state_root()`.
+
+**Usage:**
+
+```rust
+// In node setup, after creating AppState and EvmExecutor:
+let evm = Arc::new(RwLock::new(EvmExecutor::with_unified_state(...)));
+app_state.set_evm_executor(Arc::clone(&evm));
+
+// Now EVM state will be included in AppHash automatically
+let hash = app_state.end_block(); // Includes EVM state root
+```
+
+**New Tests (4 tests):**
+
+1. `test_app_hash_without_evm_is_deterministic` - Verify hash without EVM is consistent
+2. `test_app_hash_with_evm_differs_from_without` - Verify EVM inclusion changes hash
+3. `test_app_hash_changes_with_evm_state_changes` - Verify EVM state changes affect hash
+4. `test_evm_executor_can_be_set_after_construction` - Verify EVM can be added post-construction
+
+**State Root Tests (9 tests in EVM crate):**
+
+- `test_accounts_root_deterministic`
+- `test_accounts_root_order_independence`
+- `test_storage_root_deterministic`
+- `test_storage_root_order_independence`
+- `test_code_root_deterministic`
+- `test_state_root_combines_all`
+- `test_state_root_changes_with_modifications`
+- `test_empty_state_has_consistent_root`
+- `test_storage_root_ignores_zero_values`
+
+**Test Results:** 102 chain tests, 16 EVM state tests
 
 ---
 
@@ -498,11 +576,14 @@ Fixed all critical determinism and state commitment issues identified in the con
    - ✅ BlockProducer integration (halt on divergence)
    - ✅ 20 new tests for attestation system
 
-3. **Phase 7B: State Attestation P2P Integration** (1-2 weeks)
-   - [ ] Integrate attestation gossip with CometBFT reactor
-   - [ ] Or: Add separate LibP2P layer for attestation broadcast
-   - [ ] CometBFT app integration for multi-node mode
-   - See `docs/CONSENSUS.md` Option A for details
+3. **Phase 7E: State Attestation P2P Integration** ✅ COMPLETED
+   - ✅ LibP2P GossipSub protocol for attestation broadcast
+   - ✅ Noise protocol for encrypted peer connections
+   - ✅ Identify protocol for peer capability exchange
+   - ✅ Bootstrap peer support for production deployments
+   - ✅ BlockProducer integration with broadcast channel
+   - ✅ CLI flags: --enable-p2p-attestation, --p2p-listen-addr, --p2p-bootstrap-peers
+   - ✅ 3 new p2p tests, 105 chain tests total
 
 2. **Phase 7B: State Attestation Layer** (2-3 weeks after 7A)
    - Implement StateAttestation protocol

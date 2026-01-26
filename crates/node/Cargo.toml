@@ -13,6 +13,7 @@ default = []
 cometbft = ["hypercore-chain/cometbft"]
 persistence = ["hypercore-persistence", "hypercore-chain/persistence"]
 indexer = ["hypercore-indexer"]
+p2p = ["hypercore-chain/p2p", "libp2p"]
 
 [dependencies]
 # Workspace crates
@@ -47,6 +48,9 @@ hex = { workspace = true }
 
 # Random (for mock price feed)
 rand = "0.8"
+
+# P2P (optional)
+libp2p = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

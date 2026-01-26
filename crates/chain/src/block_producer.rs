@@ -37,10 +37,13 @@ use tokio::sync::RwLock;
 use tokio::time::{interval, Instant};
 
 use crate::app::HyperCoreApp;
-use crate::attestation::AttestationKeyPair;
+use crate::attestation::{AttestationKeyPair, StateAttestation};
 use crate::attestation_collector::AttestationCollector;
 use crate::mempool::{Mempool, SharedMempool};
 use crate::tx::Transaction;
+
+/// Channel sender for broadcasting attestations to the P2P layer
+pub type AttestationBroadcastTx = tokio::sync::mpsc::Sender<StateAttestation>;
 
 /// Block production configuration
 #[derive(Debug, Clone)]
@@ -84,6 +87,8 @@ pub struct BlockProducer {
     attestation_collector: Option<Arc<AttestationCollector>>,
     /// External halt flag (can be set by divergence handler)
     halted: Option<Arc<AtomicBool>>,
+    /// Optional channel for broadcasting attestations to P2P layer
+    attestation_broadcast_tx: Option<AttestationBroadcastTx>,
 }
 
 impl BlockProducer {
@@ -102,6 +107,7 @@ impl BlockProducer {
             attestation_key: None,
             attestation_collector: None,
             halted: None,
+            attestation_broadcast_tx: None,
         }
     }
 
@@ -149,6 +155,15 @@ impl BlockProducer {
     /// When this flag is set to true, block production will stop.
     pub fn with_halt_flag(mut self, halted: Arc<AtomicBool>) -> Self {
         self.halted = Some(halted);
+        self
+    }
+
+    /// Set a channel for broadcasting attestations to the P2P layer
+    ///
+    /// When set, attestations will be sent through this channel after each block commit.
+    /// Connect this to `AttestationGossip` for network broadcast.
+    pub fn with_attestation_broadcast(mut self, tx: AttestationBroadcastTx) -> Self {
+        self.attestation_broadcast_tx = Some(tx);
         self
     }
 
@@ -305,15 +320,22 @@ impl BlockProducer {
             );
 
             // Process our own attestation (this allows the collector to track our vote)
-            // In a real network, we'd also broadcast this to other validators
             if let Err(e) = collector.process_attestation(attestation.clone()).await {
                 // This might fail if we're not registered as a validator (in tests)
                 tracing::debug!("Could not process own attestation: {}", e);
             }
 
-            // TODO: Broadcast attestation to other validators via P2P
-            // This would be done via a broadcast channel or P2P layer
-            // For now, attestation is just recorded locally
+            // Broadcast attestation to other validators via P2P layer
+            if let Some(ref broadcast_tx) = self.attestation_broadcast_tx {
+                if let Err(e) = broadcast_tx.send(attestation).await {
+                    tracing::warn!("Failed to broadcast attestation: {}", e);
+                } else {
+                    tracing::debug!(
+                        "Attestation for block {} sent to P2P layer",
+                        height
+                    );
+                }
+            }
         }
 
         Ok(result)

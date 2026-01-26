@@ -1028,8 +1028,14 @@ impl HyperCoreApp {
     }
 
     /// Commit state changes
+    ///
+    /// Returns the app hash that was computed during end_block.
+    /// Note: We return the stored hash rather than recomputing it because
+    /// compute_app_hash() includes self.app_hash (previous hash) as input,
+    /// and that field was already updated by end_block().
     pub fn commit(&mut self) -> [u8; 32] {
-        self.state.compute_app_hash()
+        self.state.commit();
+        self.state.app_hash
     }
 
     /// Get current height
@@ -1067,6 +1073,31 @@ impl HyperCoreApp {
     /// Get block events for a specific height (for WebSocket broadcasting)
     pub fn get_block_events(&self, height: BlockHeight) -> Vec<serde_json::Value> {
         self.state.get_block_events(height)
+    }
+
+    /// Get all block hashes (for persistence)
+    pub fn get_block_hashes(&self) -> &std::collections::HashMap<BlockHeight, [u8; 32]> {
+        self.state.get_all_block_hashes()
+    }
+
+    /// Create a snapshot of the current state (blocking version)
+    pub fn snapshot_blocking(&self) -> crate::state::AppStateSnapshot {
+        self.state.snapshot_blocking()
+    }
+
+    /// Restore state from a snapshot (blocking version)
+    pub fn restore_blocking(&mut self, snapshot: crate::state::AppStateSnapshot) {
+        self.state.restore_blocking(snapshot)
+    }
+
+    /// Generate a Merkle proof for a nonce entry
+    pub fn generate_nonce_proof(&self, address: &AccountAddress) -> Option<crate::merkle::MerkleProof> {
+        self.state.prove_nonce(*address)
+    }
+
+    /// Get the nonce Merkle root
+    pub fn get_nonce_root(&self) -> [u8; 32] {
+        self.state.get_nonce_root()
     }
 
     /// Query state (for ABCI Query)

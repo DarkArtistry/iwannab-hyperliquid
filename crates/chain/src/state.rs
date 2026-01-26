@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use hypercore_engine::{Engine, EngineConfig, EngineState, EngineStateSnapshot, SpotEngine, SpotEngineStateSnapshot};
+use hypercore_evm::EvmExecutor;
 use hypercore_primitives::{
     AccountAddress, BlockHeight, Decimal, MarketId, OrderId,
     SharedUnifiedState, Timestamp, TokenIndex, new_shared_unified_state,
@@ -45,6 +46,9 @@ pub type SharedSpotEngine = Arc<RwLock<SpotEngine>>;
 /// - `spot_engine`: Spot trading engine (HIP-1 tokens)
 ///
 /// Both engines read from the same UnifiedState, ensuring balance consistency.
+/// Type alias for shared EVM executor
+pub type SharedEvmExecutor = Arc<RwLock<EvmExecutor>>;
+
 pub struct AppState {
     /// Reference to unified state (master balance sheet)
     /// This is the single source of truth for all user balances
@@ -55,6 +59,9 @@ pub struct AppState {
     pub engine: SharedEngineState,
     /// Spot trading engine state
     pub spot_engine: Option<SharedSpotEngine>,
+    /// EVM executor (optional - for consensus-critical EVM state)
+    /// When set, EVM state will be included in the AppHash computation.
+    pub evm_executor: Option<SharedEvmExecutor>,
     /// Current block height
     pub height: BlockHeight,
     /// Last block timestamp
@@ -97,6 +104,7 @@ impl AppState {
             perp_engine: None, // Not initialized by default for test compatibility
             engine: Arc::new(RwLock::new(EngineState::new())),
             spot_engine: None,
+            evm_executor: None,
             height: 0,
             timestamp: 0,
             app_hash: [0u8; 32],
@@ -125,6 +133,7 @@ impl AppState {
             perp_engine: None, // Will be set separately if needed
             engine,
             spot_engine,
+            evm_executor: None,
             height: 0,
             timestamp: 0,
             app_hash: [0u8; 32],
@@ -155,6 +164,7 @@ impl AppState {
             perp_engine: Some(perp_engine),
             engine,
             spot_engine,
+            evm_executor: None,
             height: 0,
             timestamp: 0,
             app_hash: [0u8; 32],
@@ -175,6 +185,20 @@ impl AppState {
     /// Get the full perpetuals engine
     pub fn perp_engine(&self) -> Option<&SharedEngine> {
         self.perp_engine.as_ref()
+    }
+
+    /// Set the EVM executor for consensus-critical EVM state
+    ///
+    /// When set, EVM state (accounts, storage, code) will be included in the AppHash.
+    /// This makes EVM execution consensus-critical, meaning all validators must agree
+    /// on EVM state.
+    pub fn set_evm_executor(&mut self, evm: SharedEvmExecutor) {
+        self.evm_executor = Some(evm);
+    }
+
+    /// Get the EVM executor reference
+    pub fn evm_executor(&self) -> Option<&SharedEvmExecutor> {
+        self.evm_executor.as_ref()
     }
 
     /// Register a client order ID mapping
@@ -421,10 +445,17 @@ impl AppState {
         let scalars_hash = self.compute_engine_scalars_hash();
         hasher.update(&scalars_hash);
 
-        // TODO: Add EVM state roots when EVM execution becomes consensus-critical
-        // - EVM accounts root
-        // - EVM storage root
-        // - EVM code root
+        // === EVM State (Phase 7D) ===
+        // When EVM executor is set, include EVM state in consensus commitment.
+        // Note: EVM balances are already included via unified_state_root (evm_view).
+        // This adds: account nonces, code hashes, contract storage, and deployed code.
+        if let Some(ref evm) = self.evm_executor {
+            let evm_root = {
+                let executor = evm.blocking_read();
+                executor.state_root()
+            };
+            hasher.update(&evm_root);
+        }
 
         hasher.finalize().into()
     }
@@ -2415,5 +2446,153 @@ mod tests {
             );
             assert_eq!(state.get_nonce(user), 1, "User {} nonce should be 1", i);
         }
+    }
+
+    // ========================================================================
+    // EVM State Commitment Tests (Phase 7D)
+    // ========================================================================
+
+    #[test]
+    fn test_app_hash_without_evm_is_deterministic() {
+        // Without EVM executor, AppHash should be computed without EVM state
+        let mut state = AppState::new();
+        let user = AccountAddress::from([0x42u8; 20]);
+
+        {
+            let mut unified = state.unified_state.write().unwrap();
+            unified.credit(user, 0, Decimal::from_raw(1000, 6));
+        }
+
+        state.begin_block(1, 1000);
+        let hash1 = state.end_block();
+
+        // Same state should produce same hash
+        let mut state2 = AppState::new();
+        {
+            let mut unified = state2.unified_state.write().unwrap();
+            unified.credit(user, 0, Decimal::from_raw(1000, 6));
+        }
+        state2.begin_block(1, 1000);
+        let hash2 = state2.end_block();
+
+        assert_eq!(hash1, hash2, "Hashes without EVM should match");
+    }
+
+    #[test]
+    fn test_app_hash_with_evm_differs_from_without() {
+        use hypercore_evm::EvmExecutor;
+        use hypercore_primitives::new_shared_unified_state;
+        use hypercore_engine::EngineState;
+
+        let unified_state = new_shared_unified_state();
+        let engine = Arc::new(RwLock::new(EngineState::new()));
+        let user = AccountAddress::from([0x42u8; 20]);
+
+        // State without EVM
+        let mut state_without_evm = AppState::with_shared_state(
+            Arc::clone(&unified_state),
+            Arc::clone(&engine),
+            None,
+        );
+        {
+            let mut unified = state_without_evm.unified_state.write().unwrap();
+            unified.credit(user, 0, Decimal::from_raw(1000, 6));
+        }
+        state_without_evm.begin_block(1, 1000);
+        let hash_without = state_without_evm.end_block();
+
+        // Reset unified state
+        let unified_state2 = new_shared_unified_state();
+        let engine2 = Arc::new(RwLock::new(EngineState::new()));
+
+        // State with EVM (using fresh unified state for the EVM)
+        let evm = Arc::new(RwLock::new(EvmExecutor::with_unified_state(
+            Arc::clone(&engine2),
+            Arc::clone(&unified_state2),
+            1337,
+        )));
+
+        let mut state_with_evm = AppState::with_shared_state(
+            Arc::clone(&unified_state2),
+            Arc::clone(&engine2),
+            None,
+        );
+        state_with_evm.set_evm_executor(evm);
+        {
+            let mut unified = state_with_evm.unified_state.write().unwrap();
+            unified.credit(user, 0, Decimal::from_raw(1000, 6));
+        }
+        state_with_evm.begin_block(1, 1000);
+        let hash_with = state_with_evm.end_block();
+
+        // Even with empty EVM state, hashes should differ because EVM state root is included
+        assert_ne!(hash_without, hash_with, "Hash with EVM should differ from without");
+    }
+
+    #[test]
+    fn test_app_hash_changes_with_evm_state_changes() {
+        use hypercore_evm::EvmExecutor;
+
+        let unified_state = new_shared_unified_state();
+        let engine = Arc::new(RwLock::new(EngineState::new()));
+        let evm = Arc::new(RwLock::new(EvmExecutor::with_unified_state(
+            Arc::clone(&engine),
+            Arc::clone(&unified_state),
+            1337,
+        )));
+
+        let mut state = AppState::with_shared_state(
+            Arc::clone(&unified_state),
+            Arc::clone(&engine),
+            None,
+        );
+        state.set_evm_executor(Arc::clone(&evm));
+
+        // Block 1: Empty EVM state
+        state.begin_block(1, 1000);
+        let hash1 = state.end_block();
+
+        // Add EVM account with nonce using EVM internal types
+        {
+            let mut executor = evm.blocking_write();
+            // Create an address from bytes
+            let addr_bytes = [0x01u8; 20];
+            let addr = hypercore_evm::EvmState::address_from_bytes(&addr_bytes);
+            executor.state_mut().set_nonce(addr, 5);
+        }
+
+        // Block 2: EVM state has account with nonce
+        state.begin_block(2, 2000);
+        let hash2 = state.end_block();
+
+        assert_ne!(hash1, hash2, "AppHash should change when EVM state changes");
+    }
+
+    #[test]
+    fn test_evm_executor_can_be_set_after_construction() {
+        use hypercore_evm::EvmExecutor;
+
+        let unified_state = new_shared_unified_state();
+        let engine = Arc::new(RwLock::new(EngineState::new()));
+
+        let mut state = AppState::with_shared_state(
+            Arc::clone(&unified_state),
+            Arc::clone(&engine),
+            None,
+        );
+
+        // Initially no EVM executor
+        assert!(state.evm_executor().is_none());
+
+        // Set EVM executor
+        let evm = Arc::new(RwLock::new(EvmExecutor::with_unified_state(
+            Arc::clone(&engine),
+            Arc::clone(&unified_state),
+            1337,
+        )));
+        state.set_evm_executor(evm);
+
+        // Now EVM executor is set
+        assert!(state.evm_executor().is_some());
     }
 }

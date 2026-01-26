@@ -66,6 +66,14 @@ pub mod cometbft;
 #[cfg(feature = "persistence")]
 pub mod persistence_integration;
 
+// P2P attestation gossip layer (optional feature)
+#[cfg(feature = "p2p")]
+pub mod attestation_gossip;
+
+// Integration tests module
+#[cfg(test)]
+mod tests;
+
 pub use abci::AbciService;
 pub use app::HyperCoreApp;
 pub use attestation::{StateAttestation, AttestationKeyPair};
@@ -86,3 +94,7 @@ pub use cometbft::{CometBftApp, CometBftServer, Validator, ValidatorSet};
 // Re-export persistence integration types when feature is enabled
 #[cfg(feature = "persistence")]
 pub use persistence_integration::{extract_state, restore_state, restore_chain_state, RestoreError};
+
+// Re-export P2P gossip types when feature is enabled
+#[cfg(feature = "p2p")]
+pub use attestation_gossip::{AttestationGossip, GossipConfig, GossipError, GossipStats};
