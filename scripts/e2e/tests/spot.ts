@@ -179,8 +179,6 @@ export async function runSpotTests(ctx: TestContext): Promise<void> {
     logProgress(`Found ${orders?.length || 0} orders in TEST-USDC market`);
   });
 
-  // Test spot order placement using the stubbed signature verification
-  // The stub extracts the address from the r value of the signature
   await runTest(ctx, 'Place spot limit order', 'spot', 'Place a limit buy order on TEST-USDC', async () => {
     logProgress(`Placing limit buy order for TEST (market ID: ${testUsdcMarketId})...`);
 

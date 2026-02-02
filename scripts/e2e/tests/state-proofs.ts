@@ -125,9 +125,7 @@ export async function runStateProofTests(ctx: TestContext): Promise<void> {
     };
 
     if (proofResult.error) {
-      // User might not have balance yet - this is valid
-      logProgress(`No balance found (expected for new accounts): ${proofResult.error}`);
-      return;
+      throw new Error(`Alice should have a balance from genesis, but got error: ${proofResult.error}`);
     }
 
     if (!proofResult.balance) throw new Error('Missing balance in proof result');
@@ -157,8 +155,7 @@ export async function runStateProofTests(ctx: TestContext): Promise<void> {
     };
 
     if (proofResult.error) {
-      logProgress(`No balance found: ${proofResult.error}`);
-      return;
+      throw new Error(`Bob should have a balance from genesis, but got error: ${proofResult.error}`);
     }
 
     if (!proofResult.verified) throw new Error('Server-side proof verification failed');
@@ -181,8 +178,7 @@ export async function runStateProofTests(ctx: TestContext): Promise<void> {
     };
 
     if (proofResult.error) {
-      logProgress('No balance to verify - skipping client verification');
-      return;
+      throw new Error(`Cannot verify proof: ${proofResult.error}`);
     }
 
     if (!proofResult.proof?.leafHash || !proofResult.proof?.siblings || !proofResult.proof?.directions || !proofResult.root) {
@@ -281,21 +277,21 @@ export async function runStateProofTests(ctx: TestContext): Promise<void> {
     if (!('user' in proofResult)) throw new Error('Missing user field');
     if (!('token' in proofResult)) throw new Error('Missing token field');
 
-    if ('proof' in proofResult && proofResult.proof !== null) {
-      const proof = proofResult.proof as Record<string, unknown>;
-      if (!('leafHash' in proof)) throw new Error('Missing leafHash in proof');
-      if (!('leafIndex' in proof)) throw new Error('Missing leafIndex in proof');
-      if (!('siblings' in proof)) throw new Error('Missing siblings in proof');
-      if (!('directions' in proof)) throw new Error('Missing directions in proof');
-      if (!('proofHex' in proof)) throw new Error('Missing proofHex in proof');
-
-      if (!('root' in proofResult)) throw new Error('Missing root field');
-      if (!('verified' in proofResult)) throw new Error('Missing verified field');
-
-      logProgress('All proof fields present');
-    } else {
-      logProgress('No proof returned (user has no balance) - structure check skipped');
+    if (!('proof' in proofResult) || proofResult.proof === null) {
+      throw new Error('No proof returned for Alice USDC - Alice should have a balance');
     }
+
+    const proof = proofResult.proof as Record<string, unknown>;
+    if (!('leafHash' in proof)) throw new Error('Missing leafHash in proof');
+    if (!('leafIndex' in proof)) throw new Error('Missing leafIndex in proof');
+    if (!('siblings' in proof)) throw new Error('Missing siblings in proof');
+    if (!('directions' in proof)) throw new Error('Missing directions in proof');
+    if (!('proofHex' in proof)) throw new Error('Missing proofHex in proof');
+
+    if (!('root' in proofResult)) throw new Error('Missing root field');
+    if (!('verified' in proofResult)) throw new Error('Missing verified field');
+
+    logProgress('All proof fields present');
   });
 
   // Test 9: App hash derivation

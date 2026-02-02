@@ -49,7 +49,10 @@ export async function runPositionTests(ctx: TestContext): Promise<void> {
     };
 
     const { signature, nonce } = await signAction(action, TEST_ACCOUNTS.ALICE.privateKey);
-    await exchangeRequest(action, signature, nonce);
+    const result = await exchangeRequest(action, signature, nonce) as { status?: string };
+    if (result.status !== 'ok') {
+      throw new Error(`Update leverage failed: ${JSON.stringify(result)}`);
+    }
     logProgress('Leverage updated to 10x');
   });
 
@@ -59,9 +62,10 @@ export async function runPositionTests(ctx: TestContext): Promise<void> {
       marginSummary?: { totalMarginUsed?: string; totalNtlPos?: string };
     };
 
-    if (state.marginSummary) {
-      logProgress(`Margin used: $${state.marginSummary.totalMarginUsed}`);
-      logProgress(`Notional: $${state.marginSummary.totalNtlPos}`);
+    if (!state.marginSummary) {
+      throw new Error('No marginSummary in clearinghouseState response');
     }
+    logProgress(`Margin used: $${state.marginSummary.totalMarginUsed}`);
+    logProgress(`Notional: $${state.marginSummary.totalNtlPos}`);
   });
 }

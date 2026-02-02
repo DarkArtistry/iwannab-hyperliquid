@@ -98,6 +98,12 @@ enum Commands {
         #[arg(long, default_value = "info", env = "RUST_LOG")]
         log_level: String,
 
+        /// CometBFT RPC URL for broadcasting transactions (required in cometbft mode)
+        /// Each node should point to its local CometBFT instance's RPC endpoint.
+        #[cfg(feature = "cometbft")]
+        #[arg(long, env = "COMETBFT_RPC_URL")]
+        cometbft_rpc_url: Option<String>,
+
         /// Enable state persistence (requires 'persistence' feature)
         #[cfg(feature = "persistence")]
         #[arg(long)]
@@ -179,6 +185,8 @@ async fn main() -> anyhow::Result<()> {
             enable_indexer,
             database_url,
             log_level,
+            #[cfg(feature = "cometbft")]
+            cometbft_rpc_url,
             #[cfg(feature = "persistence")]
             enable_persistence,
             #[cfg(feature = "persistence")]
@@ -288,6 +296,12 @@ async fn main() -> anyhow::Result<()> {
             #[cfg(not(feature = "persistence"))]
             let should_init_genesis = true;
 
+            // Skip local genesis initialization in CometBFT mode.
+            // CometBFT's init_chain callback handles genesis from the consensus layer,
+            // initializing markets, tokens, and balances through the ABCI app.
+            #[cfg(feature = "cometbft")]
+            let should_init_genesis = should_init_genesis && !matches!(consensus_mode, ConsensusMode::CometBft);
+
             if should_init_genesis {
                 // Initialize with default markets
                 {
@@ -309,6 +323,33 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
+            // Create full perpetuals engine with matching for order execution.
+            // The Engine has its own EngineState (with orderbook, positions, fills)
+            // separate from the gateway's EngineState (which has mark prices).
+            // IMPORTANT: This must be created unconditionally so both single-node
+            // and CometBFT modes have a working perp engine. Markets are added here
+            // with default prices; in CometBFT mode, init_from_genesis also adds
+            // market metadata to the shared EngineState.
+            let perp_engine = {
+                use hypercore_engine::{Engine, EngineConfig};
+                let mut full_engine = Engine::with_unified_state(
+                    EngineConfig::default(),
+                    Arc::clone(&unified_state),
+                );
+                full_engine.add_market(
+                    hypercore_primitives::MarketConfig::btc_perp(),
+                    hypercore_primitives::Decimal::price("65000"),
+                    0,
+                );
+                full_engine.add_market(
+                    hypercore_primitives::MarketConfig::eth_perp(),
+                    hypercore_primitives::Decimal::price("3500"),
+                    0,
+                );
+                Arc::new(RwLock::new(full_engine))
+            };
+            tracing::info!("Initialized perp engine with matching (BTC-PERP, ETH-PERP)");
+
             // Create HyperCore application with SHARED unified state
             // This ensures all layers (SpotEngine, EVM, HyperCoreApp) use the same balance sheet.
             // Without this, USD transfers and other app-layer operations would fail due to
@@ -318,6 +359,10 @@ async fn main() -> anyhow::Result<()> {
                 Arc::clone(&engine),
                 Some(Arc::clone(&spot_engine)),
             )));
+            {
+                let mut app_guard = app.write().await;
+                app_guard.state.perp_engine = Some(Arc::clone(&perp_engine));
+            }
 
             // Create EVM executor with shared unified state
             let evm = Arc::new(RwLock::new(
@@ -325,7 +370,32 @@ async fn main() -> anyhow::Result<()> {
             ));
 
             // Create EVM RPC server
+            // In CometBFT mode, route eth_sendRawTransaction through consensus.
+            // Read operations (eth_call, eth_getBalance, etc.) still use the local executor.
+            #[cfg(feature = "cometbft")]
+            let evm_rpc = if matches!(consensus_mode, ConsensusMode::CometBft) {
+                let rpc_url = cometbft_rpc_url.clone().unwrap_or_else(|| {
+                    "http://localhost:26657".to_string()
+                });
+                tracing::info!("EVM RPC in CometBFT mode: broadcasting to {}", rpc_url);
+                EvmRpcServer::with_cometbft(Arc::clone(&evm), chain_id, rpc_url)
+            } else {
+                EvmRpcServer::new(Arc::clone(&evm), chain_id)
+            };
+            #[cfg(not(feature = "cometbft"))]
             let evm_rpc = EvmRpcServer::new(Arc::clone(&evm), chain_id);
+
+            // Extract shared EVM stores for CometBFT receipt storage
+            #[cfg(feature = "cometbft")]
+            let evm_shared_stores = if matches!(consensus_mode, ConsensusMode::CometBft) {
+                Some((
+                    evm_rpc.shared_receipts(),
+                    evm_rpc.shared_transactions(),
+                    evm_rpc.shared_block_number(),
+                ))
+            } else {
+                None
+            };
 
             // Create mempool for transaction submission
             let mempool = hypercore_chain::SharedMempool::new();
@@ -340,6 +410,37 @@ async fn main() -> anyhow::Result<()> {
                 rate_limit: RateLimitConfig::development(),
                 validation: ValidationConfig::default(),
             };
+
+            // In CometBFT mode, route transactions through CometBFT consensus.
+            // In single-node mode, execute transactions directly.
+            #[cfg(feature = "cometbft")]
+            let gateway = if matches!(consensus_mode, ConsensusMode::CometBft) {
+                let rpc_url = cometbft_rpc_url.clone().unwrap_or_else(|| {
+                    tracing::warn!("No COMETBFT_RPC_URL provided, defaulting to http://localhost:26657");
+                    "http://localhost:26657".to_string()
+                });
+                tracing::info!("CometBFT RPC URL for tx routing: {}", rpc_url);
+                let tx_router = hypercore_gateway::TxRouter::CometBft(
+                    hypercore_gateway::CometBftRpcClient::new(rpc_url),
+                );
+                GatewayServer::with_cometbft(
+                    gateway_config,
+                    Arc::clone(&engine),
+                    Arc::clone(&spot_engine),
+                    mempool.clone(),
+                    Arc::clone(&app),
+                    tx_router,
+                )
+            } else {
+                GatewayServer::new(
+                    gateway_config,
+                    Arc::clone(&engine),
+                    Arc::clone(&spot_engine),
+                    mempool.clone(),
+                    Arc::clone(&app),
+                )
+            };
+            #[cfg(not(feature = "cometbft"))]
             let gateway = GatewayServer::new(
                 gateway_config,
                 Arc::clone(&engine),
@@ -615,12 +716,23 @@ async fn main() -> anyhow::Result<()> {
 
                 #[cfg(feature = "cometbft")]
                 ConsensusMode::CometBft => {
-                    // Start CometBFT ABCI server for multi-node consensus
+                    // Start CometBFT ABCI server for multi-node consensus.
+                    // The ABCI app uses the SAME shared engine/spot_engine/unified_state
+                    // as the gateway, so info queries return up-to-date state after
+                    // CometBFT's FinalizeBlock executes transactions.
                     use hypercore_chain::{CometBftApp, CometBftServer};
 
-                    // Create a new HyperCoreApp for CometBFT (it needs ownership)
-                    let cometbft_hypercore_app = HyperCoreApp::new();
-                    let cometbft_app = CometBftApp::new(cometbft_hypercore_app);
+                    let mut cometbft_hypercore_app = HyperCoreApp::with_shared_state(
+                        Arc::clone(&unified_state),
+                        Arc::clone(&engine),
+                        Some(Arc::clone(&spot_engine)),
+                    );
+                    cometbft_hypercore_app.state.perp_engine = Some(Arc::clone(&perp_engine));
+                    let mut cometbft_app = CometBftApp::new(cometbft_hypercore_app)
+                        .with_evm_executor(Arc::clone(&evm));
+                    if let Some((receipts, transactions, block_number)) = evm_shared_stores {
+                        cometbft_app = cometbft_app.with_evm_receipt_store(receipts, transactions, block_number);
+                    }
                     let server = CometBftServer::new(cometbft_app);
 
                     tokio::task::spawn_blocking(move || {
@@ -683,16 +795,27 @@ async fn main() -> anyhow::Result<()> {
             }
 
             // Start price feed updater (mock for devnet)
-            let price_engine = Arc::clone(&engine);
-            let _price_handle = tokio::spawn(async move {
-                mock_price_feed(price_engine).await;
-            });
+            // In CometBFT mode, skip mock price feed - it causes lock contention
+            // with the ABCI app and price updates should come through consensus.
+            #[cfg(feature = "cometbft")]
+            let _is_cometbft = matches!(consensus_mode, ConsensusMode::CometBft);
+            #[cfg(not(feature = "cometbft"))]
+            let _is_cometbft = false;
 
-            // Start funding rate processor
-            let funding_engine = Arc::clone(&engine);
-            let _funding_handle = tokio::spawn(async move {
-                funding_processor(funding_engine).await;
-            });
+            if !_is_cometbft {
+                let price_engine = Arc::clone(&engine);
+                let _price_handle = tokio::spawn(async move {
+                    mock_price_feed(price_engine).await;
+                });
+
+                // Start funding rate processor
+                let funding_engine = Arc::clone(&engine);
+                let _funding_handle = tokio::spawn(async move {
+                    funding_processor(funding_engine).await;
+                });
+            } else {
+                tracing::info!("Skipping mock price feed and funding processor in CometBFT mode");
+            }
 
             // Wait for services
             tokio::select! {

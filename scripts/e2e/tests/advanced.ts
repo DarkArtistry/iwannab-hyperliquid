@@ -59,22 +59,15 @@ export async function runAdvancedTests(ctx: TestContext): Promise<void> {
 
     const { signature, nonce } = await signAction(withdrawAction, TEST_ACCOUNTS.ALICE.privateKey);
 
-    try {
-      const result = (await exchangeRequest(withdrawAction, signature, nonce)) as {
-        status?: string;
-        error?: string;
-      };
+    const result = (await exchangeRequest(withdrawAction, signature, nonce)) as {
+      status?: string;
+      error?: string;
+    };
 
-      if (result.status === 'ok') {
-        logProgress('Withdraw request accepted');
-      } else {
-        // Withdraw might be stubbed/disabled - that's acceptable
-        logProgress(`Withdraw response: ${result.error || 'handled'}`);
-      }
-    } catch (e) {
-      // Server might reject withdraw in dev mode - that's acceptable
-      logProgress('Withdraw endpoint handled (may be disabled in dev mode)');
+    if (result.status !== 'ok') {
+      throw new Error(`Withdraw request failed: ${result.error || JSON.stringify(result)}`);
     }
+    logProgress('Withdraw request accepted');
   });
 
   // =========================================================================
@@ -93,8 +86,16 @@ export async function runAdvancedTests(ctx: TestContext): Promise<void> {
     const positionSize = parseFloat(btcPosition?.position?.szi || '0');
 
     if (Math.abs(positionSize) > 0) {
-      logProgress(`Charlie has position size ${positionSize}, skipping test`);
-      return;
+      // Close position first so we can properly test reduce-only rejection
+      logProgress(`Charlie has position size ${positionSize}, closing before test...`);
+      const closeAction = {
+        type: 'order',
+        orders: [{ a: 0, b: positionSize > 0 ? false : true, p: positionSize > 0 ? '50000' : '80000', s: Math.abs(positionSize).toString(), r: true, t: { limit: { tif: 'Gtc' } } }],
+        grouping: 'na',
+      };
+      const { signature: closeSig, nonce: closeNonce } = await signAction(closeAction, TEST_ACCOUNTS.CHARLIE.privateKey);
+      await exchangeRequest(closeAction, closeSig, closeNonce);
+      await sleep(500);
     }
 
     // Try to place a reduce-only order
@@ -119,21 +120,20 @@ export async function runAdvancedTests(ctx: TestContext): Promise<void> {
       response?: { data?: { statuses?: Array<{ error?: string; resting?: unknown }> } };
     };
 
-    // Check if order was rejected
+    // Reduce-only order without a position must be rejected
     const statuses = result.response?.data?.statuses || [];
     const wasRejected = statuses.some((s) => s.error);
 
-    if (wasRejected) {
-      logProgress('Reduce-only order correctly rejected (no position to reduce)');
-    } else if (statuses.some((s) => s.resting)) {
-      // If order rested, it might match later - cancel it
-      logProgress('Order rested (reduce-only enforcement may be at match time)');
-      const cancelAction = { type: 'cancelAll' };
-      const { signature: cancelSig, nonce: cancelNonce } = await signAction(cancelAction, TEST_ACCOUNTS.CHARLIE.privateKey);
-      await exchangeRequest(cancelAction, cancelSig, cancelNonce);
-    } else {
-      logProgress('Reduce-only handled (implementation-specific behavior)');
+    if (!wasRejected) {
+      // Clean up if order somehow rested
+      if (statuses.some((s) => s.resting)) {
+        const cancelAction = { type: 'cancelAll' };
+        const { signature: cancelSig, nonce: cancelNonce } = await signAction(cancelAction, TEST_ACCOUNTS.CHARLIE.privateKey);
+        await exchangeRequest(cancelAction, cancelSig, cancelNonce);
+      }
+      throw new Error('Reduce-only order should have been rejected with no existing position');
     }
+    logProgress('Reduce-only order correctly rejected (no position to reduce)');
   });
 
   // =========================================================================
@@ -166,16 +166,14 @@ export async function runAdvancedTests(ctx: TestContext): Promise<void> {
       response?: { data?: { statuses?: Array<{ filled?: { totalSz?: string }; error?: string }> } };
     };
 
-    // Check if they matched (self-trade) or were prevented
+    // Verify self-trade was prevented - orders from same account must not match
     const statuses = result.response?.data?.statuses || [];
     const filled = statuses.find((s) => s.filled);
 
     if (filled && parseFloat(filled.filled?.totalSz || '0') > 0) {
-      // Self-trade occurred - some exchanges allow this
-      logProgress('Self-trade allowed (exchange policy dependent)');
-    } else {
-      logProgress('Self-trade prevented or orders did not match');
+      throw new Error('Self-trade occurred - orders from the same account should not match each other');
     }
+    logProgress('Self-trade prevented or orders did not match');
 
     // Cleanup
     const cancelAction = { type: 'cancelAll' };
@@ -202,18 +200,24 @@ export async function runAdvancedTests(ctx: TestContext): Promise<void> {
       const result = (await exchangeRequest(invalidAction, signature, nonce)) as {
         status?: string;
         error?: string;
+        response?: { data?: { statuses?: Array<{ error?: string }> } };
       };
 
-      if (result.status === 'ok') {
+      // Check both top-level error and per-order statuses
+      const statuses = result.response?.data?.statuses || [];
+      const orderError = statuses.find((s) => s.error);
+
+      if (result.status === 'ok' && !orderError) {
         throw new Error('Invalid price should have been rejected');
       }
-      logProgress(`Invalid price correctly rejected: ${result.error || 'validation error'}`);
+      logProgress(`Invalid price correctly rejected: ${result.error || orderError?.error || 'validation error'}`);
     } catch (e) {
       const msg = (e as Error).message;
-      if (msg.includes('rejected')) {
+      if (msg.includes('should have been rejected')) {
         throw e;
       }
-      logProgress('Invalid price format correctly rejected');
+      // HTTP error (400/422) counts as rejection
+      logProgress(`Invalid price format rejected with error: ${msg}`);
     }
   });
 
@@ -236,25 +240,27 @@ export async function runAdvancedTests(ctx: TestContext): Promise<void> {
       };
 
       if (result.status === 'ok') {
-        // Check if order statuses contain error or if it was handled
         const statuses = result.response?.data?.statuses || [];
-        if (statuses.some((s) => s.error)) {
-          logProgress('Negative size rejected in order status');
-        } else if (statuses.some((s) => s.resting)) {
-          // Server accepted the order - cancel it
-          logProgress('Server accepted negative size (no validation) - cleaning up');
+        if (statuses.some((s) => s.resting)) {
+          // Clean up and fail - negative size should never be accepted
           const cancelAction = { type: 'cancelAll' };
           const { signature: cancelSig, nonce: cancelNonce } = await signAction(cancelAction, TEST_ACCOUNTS.ALICE.privateKey);
           await exchangeRequest(cancelAction, cancelSig, cancelNonce);
-        } else {
-          // No statuses but still OK - likely handled silently
-          logProgress('Negative size handled (implementation-specific)');
+          throw new Error('Server accepted order with negative size - missing validation');
         }
+        // Order rejected in status or silently dropped - either is correct
+        const orderError = statuses.find((s) => s.error);
+        logProgress(`Negative size rejected: ${orderError?.error || 'order not created'}`);
       } else {
         logProgress(`Negative size rejected: ${result.error || 'validation error'}`);
       }
     } catch (e) {
-      logProgress('Negative size caused error (acceptable)');
+      const msg = (e as Error).message;
+      if (msg.includes('missing validation')) {
+        throw e;
+      }
+      // HTTP error (400/422) counts as rejection
+      logProgress(`Negative size correctly rejected: ${msg}`);
     }
   });
 
@@ -278,19 +284,20 @@ export async function runAdvancedTests(ctx: TestContext): Promise<void> {
       };
 
       const statuses = result.response?.data?.statuses || [];
-      const hasError = statuses.some((s) => s.error) || result.status !== 'ok' || result.error;
+      const orderError = statuses.find((s) => s.error);
+      const hasError = orderError || result.status !== 'ok' || result.error;
 
-      if (hasError) {
-        logProgress('Invalid market ID correctly rejected');
-      } else {
+      if (!hasError) {
         throw new Error('Invalid market ID should have been rejected');
       }
+      logProgress(`Invalid market ID correctly rejected: ${result.error || orderError?.error || 'validation error'}`);
     } catch (e) {
       const msg = (e as Error).message;
-      if (msg.includes('rejected')) {
+      if (msg.includes('should have been rejected')) {
         throw e;
       }
-      logProgress('Invalid market correctly handled');
+      // HTTP error (400/422) counts as rejection
+      logProgress(`Invalid market correctly rejected with error: ${msg}`);
     }
   });
 
@@ -301,45 +308,35 @@ export async function runAdvancedTests(ctx: TestContext): Promise<void> {
   await runTest(ctx, 'Query funding rate', 'advanced', 'Retrieve current funding rate for BTC-PERP', async () => {
     logProgress('Fetching funding rate...');
 
-    try {
-      const funding = (await infoRequest('fundingHistory', { coin: 'BTC-PERP', startTime: 0 })) as {
-        coin?: string;
-        fundingRate?: string;
-        premium?: string;
-        time?: number;
-      }[];
+    const funding = (await infoRequest('fundingHistory', { coin: 'BTC-PERP', startTime: 0 })) as {
+      coin?: string;
+      fundingRate?: string;
+      premium?: string;
+      time?: number;
+    }[];
 
-      if (Array.isArray(funding)) {
-        logProgress(`Found ${funding.length} funding rate entries`);
-        if (funding.length > 0) {
-          const latest = funding[funding.length - 1];
-          logProgress(`Latest: rate=${latest.fundingRate}, premium=${latest.premium}`);
-        }
-      } else {
-        logProgress('Funding history returned (format varies)');
-      }
-    } catch {
-      logProgress('Funding rate endpoint handled');
+    if (!Array.isArray(funding)) {
+      throw new Error(`Expected array for fundingHistory, got ${typeof funding}`);
+    }
+    logProgress(`Found ${funding.length} funding rate entries`);
+    if (funding.length > 0) {
+      const latest = funding[funding.length - 1];
+      logProgress(`Latest: rate=${latest.fundingRate}, premium=${latest.premium}`);
     }
   });
 
   await runTest(ctx, 'Query user funding payments', 'advanced', 'Retrieve funding payments for user', async () => {
     logProgress('Fetching user funding payments...');
 
-    try {
-      const payments = (await infoRequest('userFunding', {
-        user: TEST_ACCOUNTS.ALICE.address,
-        startTime: 0,
-      })) as unknown[];
+    const payments = (await infoRequest('userFundingHistory', {
+      user: TEST_ACCOUNTS.ALICE.address,
+      startTime: 0,
+    })) as unknown[];
 
-      if (Array.isArray(payments)) {
-        logProgress(`Found ${payments.length} funding payment entries`);
-      } else {
-        logProgress('Funding payments response received');
-      }
-    } catch {
-      logProgress('User funding endpoint handled');
+    if (!Array.isArray(payments)) {
+      throw new Error(`Expected array for userFunding, got ${typeof payments}`);
     }
+    logProgress(`Found ${payments.length} funding payment entries`);
   });
 
   // =========================================================================
@@ -393,14 +390,21 @@ export async function runAdvancedTests(ctx: TestContext): Promise<void> {
       response?: { data?: { statuses?: Array<{ filled?: { totalSz?: string } }> } };
     };
 
-    // Check if orders matched
+    // Verify orders matched
     const statuses = buyResult.response?.data?.statuses || [];
     const filled = statuses.find((s) => s.filled);
 
     if (filled && parseFloat(filled.filled?.totalSz || '0') > 0) {
       logProgress(`Orders matched! Filled size: ${filled.filled?.totalSz} TEST`);
     } else {
-      logProgress('Orders placed (may be resting)');
+      // Check fills as fallback
+      await sleep(500);
+      const fills = (await infoRequest('userFills', { user: TEST_ACCOUNTS.ALICE.address })) as Array<{ coin?: string }>;
+      const spotFills = fills.filter((f) => f.coin === 'TEST-USDC');
+      if (spotFills.length === 0) {
+        throw new Error('Spot orders did not match: no fills found for TEST-USDC');
+      }
+      logProgress(`Spot fill verified via userFills: ${spotFills.length} fill(s)`);
     }
 
     // Cleanup any remaining orders
@@ -441,11 +445,10 @@ export async function runAdvancedTests(ctx: TestContext): Promise<void> {
       error?: string;
     };
 
-    if (result.status === 'ok') {
-      logProgress(`Successfully set leverage to ${maxLeverage}x`);
-    } else {
-      logProgress(`Leverage update result: ${result.error || 'handled'}`);
+    if (result.status !== 'ok') {
+      throw new Error(`Failed to set leverage to ${maxLeverage}x: ${result.error || JSON.stringify(result)}`);
     }
+    logProgress(`Successfully set leverage to ${maxLeverage}x`);
 
     // Restore to default leverage
     const restoreAction = {
@@ -469,16 +472,25 @@ export async function runAdvancedTests(ctx: TestContext): Promise<void> {
     };
 
     const { signature, nonce } = await signAction(invalidLeverageAction, TEST_ACCOUNTS.ALICE.privateKey);
-    const result = (await exchangeRequest(invalidLeverageAction, signature, nonce)) as {
-      status?: string;
-      error?: string;
-    };
 
-    if (result.status !== 'ok' || result.error) {
-      logProgress('Excessive leverage correctly rejected');
-    } else {
-      // Some implementations cap at max instead of rejecting
-      logProgress('Leverage was capped or accepted (implementation-dependent)');
+    try {
+      const result = (await exchangeRequest(invalidLeverageAction, signature, nonce)) as {
+        status?: string;
+        error?: string;
+      };
+
+      if (result.status !== 'ok' || result.error) {
+        logProgress('Excessive leverage correctly rejected via response');
+      } else {
+        throw new Error('Leverage 100x should have been rejected but was accepted');
+      }
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (message.includes('400') || message.includes('Invalid leverage') || message.includes('Validation error')) {
+        logProgress('Excessive leverage correctly rejected with validation error');
+      } else {
+        throw err;
+      }
     }
   });
 
@@ -518,57 +530,55 @@ export async function runAdvancedTests(ctx: TestContext): Promise<void> {
     const positionAfterOpen = stateAfterOpen.assetPositions?.find((ap) => ap.position?.asset === 0);
     const sizeAfterOpen = parseFloat(positionAfterOpen?.position?.szi || '0');
 
-    if (Math.abs(sizeAfterOpen) > 0) {
-      logProgress(`Position opened: ${sizeAfterOpen} BTC`);
-
-      // Step 3: Close the position (Alice sells to close long)
-      const closeAction = {
-        type: 'order',
-        orders: [
-          {
-            a: 0,
-            b: false, // Sell to close long
-            p: '64000', // Below market to ensure fill
-            s: Math.abs(sizeAfterOpen).toString(),
-            r: true, // Reduce-only
-            t: { limit: { tif: 'Gtc' } },
-          },
-        ],
-        grouping: 'na',
-      };
-
-      const { signature: closeSig, nonce: closeNonce } = await signAction(closeAction, TEST_ACCOUNTS.ALICE.privateKey);
-      await exchangeRequest(closeAction, closeSig, closeNonce);
-
-      await sleep(100);
-
-      // Bob buys to match Alice's closing sell
-      const matchAction = {
-        type: 'order',
-        orders: [{ a: 0, b: true, p: '64000', s: Math.abs(sizeAfterOpen).toString(), r: false, t: { limit: { tif: 'Gtc' } } }],
-        grouping: 'na',
-      };
-      const { signature: matchSig, nonce: matchNonce } = await signAction(matchAction, TEST_ACCOUNTS.BOB.privateKey);
-      await exchangeRequest(matchAction, matchSig, matchNonce);
-
-      await sleep(200);
-
-      // Step 4: Verify position is closed
-      const stateAfterClose = (await infoRequest('clearinghouseState', { user: TEST_ACCOUNTS.ALICE.address })) as {
-        assetPositions?: Array<{ position?: { asset: number; szi?: string } }>;
-      };
-
-      const positionAfterClose = stateAfterClose.assetPositions?.find((ap) => ap.position?.asset === 0);
-      const sizeAfterClose = parseFloat(positionAfterClose?.position?.szi || '0');
-
-      if (Math.abs(sizeAfterClose) < Math.abs(sizeAfterOpen)) {
-        logProgress(`Position reduced/closed: ${sizeAfterClose} BTC`);
-      } else {
-        logProgress('Position close order placed');
-      }
-    } else {
-      logProgress('Orders may not have matched - no position opened');
+    if (Math.abs(sizeAfterOpen) === 0) {
+      throw new Error('Position should have been opened after matching buy/sell orders');
     }
+    logProgress(`Position opened: ${sizeAfterOpen} BTC`);
+
+    // Step 3: Close the position (Alice sells to close long)
+    const closeAction = {
+      type: 'order',
+      orders: [
+        {
+          a: 0,
+          b: false, // Sell to close long
+          p: '64000', // Below market to ensure fill
+          s: Math.abs(sizeAfterOpen).toString(),
+          r: true, // Reduce-only
+          t: { limit: { tif: 'Gtc' } },
+        },
+      ],
+      grouping: 'na',
+    };
+
+    const { signature: closeSig, nonce: closeNonce } = await signAction(closeAction, TEST_ACCOUNTS.ALICE.privateKey);
+    await exchangeRequest(closeAction, closeSig, closeNonce);
+
+    await sleep(100);
+
+    // Bob buys to match Alice's closing sell
+    const matchAction = {
+      type: 'order',
+      orders: [{ a: 0, b: true, p: '64000', s: Math.abs(sizeAfterOpen).toString(), r: false, t: { limit: { tif: 'Gtc' } } }],
+      grouping: 'na',
+    };
+    const { signature: matchSig, nonce: matchNonce } = await signAction(matchAction, TEST_ACCOUNTS.BOB.privateKey);
+    await exchangeRequest(matchAction, matchSig, matchNonce);
+
+    await sleep(200);
+
+    // Step 4: Verify position is closed
+    const stateAfterClose = (await infoRequest('clearinghouseState', { user: TEST_ACCOUNTS.ALICE.address })) as {
+      assetPositions?: Array<{ position?: { asset: number; szi?: string } }>;
+    };
+
+    const positionAfterClose = stateAfterClose.assetPositions?.find((ap) => ap.position?.asset === 0);
+    const sizeAfterClose = parseFloat(positionAfterClose?.position?.szi || '0');
+
+    if (Math.abs(sizeAfterClose) >= Math.abs(sizeAfterOpen)) {
+      throw new Error(`Position should have been reduced: was ${sizeAfterOpen}, still ${sizeAfterClose}`);
+    }
+    logProgress(`Position reduced/closed: ${sizeAfterClose} BTC`);
 
     // Cleanup
     for (const account of [TEST_ACCOUNTS.ALICE, TEST_ACCOUNTS.BOB]) {
@@ -659,19 +669,17 @@ export async function runAdvancedTests(ctx: TestContext): Promise<void> {
     };
 
     const statuses = result.response?.data?.statuses || [];
-    const hasError = statuses.some((s) => s.error) || result.status !== 'ok';
+    const orderError = statuses.find((s) => s.error);
+    const hasError = orderError || result.status !== 'ok';
 
-    if (hasError) {
-      logProgress('Dust order correctly rejected (below minimum size)');
-    } else if (statuses.some((s) => s.resting)) {
-      logProgress('Very small order accepted (no minimum size enforcement)');
-      // Cancel the order
+    if (!hasError && statuses.some((s) => s.resting)) {
+      // Clean up the dust order
       const cancelAction = { type: 'cancelAll' };
       const { signature: cancelSig, nonce: cancelNonce } = await signAction(cancelAction, TEST_ACCOUNTS.ALICE.privateKey);
       await exchangeRequest(cancelAction, cancelSig, cancelNonce);
-    } else {
-      logProgress('Dust amount handled');
+      throw new Error('Dust order (0.0000001 BTC) should have been rejected below minimum size');
     }
+    logProgress(`Dust order correctly rejected: ${result.error || orderError?.error || 'below minimum size'}`);
   });
 
   // =========================================================================

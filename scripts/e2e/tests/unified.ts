@@ -321,8 +321,7 @@ export async function runUnifiedStateTests(ctx: TestContext): Promise<void> {
 
     const testBefore = balancesBefore.balances.find((b) => b.tokenIndex === 1);
     if (!testBefore) {
-      logProgress('TEST token balance not found, skipping...');
-      return;
+      throw new Error('TEST token balance not found in unified balances - node initialization may have failed');
     }
 
     logProgress(`TEST before: total=${testBefore.total}, core=${testBefore.coreView}, evm=${testBefore.evmView}`);
@@ -342,13 +341,14 @@ export async function runUnifiedStateTests(ctx: TestContext): Promise<void> {
       response?: { data?: { newCoreView: string; newEvmView: string; total: string } };
     };
 
-    if (result.status === 'ok' && result.response?.data) {
+    if (result.status !== 'ok') {
+      throw new Error(`TEST view transfer failed: ${JSON.stringify(result)}`);
+    }
+    if (result.response?.data) {
       logProgress(`TEST transfer successful:`);
       logProgress(`  New Core View: ${result.response.data.newCoreView}`);
       logProgress(`  New EVM View: ${result.response.data.newEvmView}`);
       logProgress(`  Total: ${result.response.data.total} (should be unchanged)`);
-    } else {
-      logProgress('TEST transfer may have failed or token not initialized - test passes if USDC works');
     }
   });
 
@@ -541,13 +541,7 @@ export async function runUnifiedStateTests(ctx: TestContext): Promise<void> {
         throw new Error('EVM RPC returned empty result');
       }
     } catch (e) {
-      const error = e as Error;
-      if (error.name === 'AbortError' || error.message.includes('fetch')) {
-        logProgress(`EVM RPC not available (${error.message}) - skipping EVM balance verification`);
-        // Don't fail the test if EVM RPC is not running
-      } else {
-        throw e;
-      }
+      throw e;
     }
 
     // Clean up: transfer back to Core view
@@ -733,8 +727,7 @@ export async function runUnifiedStateTests(ctx: TestContext): Promise<void> {
     logProgress(`Charlie's total: ${totalBalance}, available: ${initialAvailable}`);
 
     if (totalBalance < 100) {
-      logProgress('Insufficient balance for this test, skipping...');
-      return;
+      throw new Error(`Charlie has insufficient balance: ${totalBalance} USDC (expected >= 100)`);
     }
 
     // Place a buy order to reserve significant balance
@@ -913,8 +906,7 @@ export async function runUnifiedStateTests(ctx: TestContext): Promise<void> {
     const testToken = spotBalances.find((b) => b.tokenIndex === 1);
 
     if (!testToken || parseFloat(testToken.available) < 10) {
-      logProgress('Insufficient TEST tokens for this test, skipping...');
-      return;
+      throw new Error(`Bob has insufficient TEST tokens: ${testToken?.available || '0'} (expected >= 10)`);
     }
 
     const transferAmount = '5'; // 5 TEST tokens
@@ -1042,8 +1034,7 @@ export async function runUnifiedStateTests(ctx: TestContext): Promise<void> {
     const usdcBal = balances.find((b) => b.tokenIndex === 0);
 
     if (!usdcBal || parseFloat(usdcBal.available) < 50) {
-      logProgress('Insufficient balance for exact transfer test, skipping...');
-      return;
+      throw new Error(`Bob has insufficient USDC: ${usdcBal?.available || '0'} (expected >= 50)`);
     }
 
     // Transfer exactly 50 USDC (a round number for precision)

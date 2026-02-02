@@ -13,3 +13,4 @@ pub mod blockchain_growth;
 pub mod consensus;
 pub mod security;
 pub mod stress;
+pub mod multi_node_integration;

@@ -220,14 +220,11 @@ export async function runRiskTests(ctx: TestContext): Promise<void> {
     logProgress(`Total balance: $${totalBalance.toFixed(2)}`);
     logProgress(`Core view (trading) balance: $${coreViewBalance.toFixed(2)}`);
 
-    // Genesis should provide $100,000 USDC in coreView
+    // Genesis should provide funded accounts
     if (totalBalance < 1000) {
-      logProgress('WARNING: Total balance is low - devnet may not be initialized with genesis balances');
-      logProgress('Expected ~100,000 USDC from genesis initialization');
-      // Continue with tests - some may still work
-    } else {
-      logProgress(`Account properly funded: $${totalBalance.toFixed(2)}`);
+      throw new Error(`Alice total balance too low ($${totalBalance.toFixed(2)}), expected >= $1000 from genesis`);
     }
+    logProgress(`Account properly funded: $${totalBalance.toFixed(2)}`);
   });
 
   await runTest(ctx, 'Verify account funding (Bob)', 'risk', 'Bob should also have funded coreView', async () => {
@@ -239,7 +236,7 @@ export async function runRiskTests(ctx: TestContext): Promise<void> {
     logProgress(`Bob total: $${totalBalance.toFixed(2)}, coreView: $${coreViewBalance.toFixed(2)}`);
 
     if (totalBalance < 1000) {
-      logProgress('WARNING: Bob total balance is low');
+      throw new Error(`Bob total balance too low ($${totalBalance.toFixed(2)}), expected >= $1000 from genesis`);
     }
   });
 
@@ -399,7 +396,7 @@ export async function runRiskTests(ctx: TestContext): Promise<void> {
       if (found && order) {
         logProgress(`Order found by cloid in ${durationMs}ms, ID: ${order.oid}`);
       } else {
-        logProgress(`Order not resting (may have been filled or rejected). Duration: ${durationMs}ms`);
+        throw new Error(`Order not found by cloid ${cloid} after 5s - order may have been rejected`);
       }
     }
   });
@@ -511,7 +508,7 @@ export async function runRiskTests(ctx: TestContext): Promise<void> {
 
     // Verify at least one fill occurred
     if (!aliceFillFound && !bobFillFound) {
-      logProgress('NOTE: No fills found - orders may not have matched');
+      throw new Error('No fills found for either Alice or Bob - orders did not match');
     }
   });
 
@@ -562,7 +559,7 @@ export async function runRiskTests(ctx: TestContext): Promise<void> {
     }
 
     if (batchOrders.length < 3) {
-      logProgress('NOTE: Not all batch orders found - some may have been filled or rejected');
+      throw new Error(`Expected 3 batch orders in book, found only ${batchOrders.length}`);
     }
   });
 
@@ -644,8 +641,7 @@ export async function runRiskTests(ctx: TestContext): Promise<void> {
     logProgress(`Initial coreView balance: $${initialBalance.toFixed(2)}`);
 
     if (initialBalance < 100) {
-      logProgress('Insufficient balance for this test, skipping trade');
-      return;
+      throw new Error(`Insufficient balance for trade test: $${initialBalance.toFixed(2)} (expected >= $100)`);
     }
 
     // Place a small trade (Bob sell, Alice buy)

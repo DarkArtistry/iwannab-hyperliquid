@@ -57,18 +57,24 @@ export async function runMarketDataTests(ctx: TestContext): Promise<void> {
 
   await runTest(ctx, 'Get funding rates', 'market-data', 'Retrieve current funding rate for perpetual markets', async () => {
     logProgress('Fetching funding rates...');
-    await infoRequest('fundingHistory', { coin: MARKETS.BTC_PERP });
-    logProgress('Funding rate data retrieved');
+    const funding = await infoRequest('fundingHistory', { coin: MARKETS.BTC_PERP });
+    if (!Array.isArray(funding)) {
+      throw new Error(`Expected array for fundingHistory, got ${typeof funding}`);
+    }
+    logProgress(`Funding rate data retrieved: ${funding.length} entries`);
   });
 
   await runTest(ctx, 'Get candles (1h)', 'market-data', 'Retrieve OHLCV candlestick data', async () => {
     logProgress('Fetching 1h candles...');
-    await infoRequest('candleSnapshot', {
+    const candles = await infoRequest('candleSnapshot', {
       coin: MARKETS.BTC_PERP,
       interval: '1h',
       startTime: Date.now() - 86400000,
       endTime: Date.now(),
     });
-    logProgress('Candle data retrieved');
+    if (!Array.isArray(candles)) {
+      throw new Error(`Expected array for candleSnapshot, got ${typeof candles}`);
+    }
+    logProgress(`Candle data retrieved: ${candles.length} candles`);
   });
 }

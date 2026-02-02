@@ -45,7 +45,10 @@ export async function runAccountTests(ctx: TestContext): Promise<void> {
 
   await runTest(ctx, 'Get user funding (Alice)', 'account', 'Retrieve funding payment history', async () => {
     logProgress('Fetching funding history...');
-    await infoRequest('userFundingHistory', { user: TEST_ACCOUNTS.ALICE.address });
-    logProgress('Funding history retrieved');
+    const funding = await infoRequest('userFundingHistory', { user: TEST_ACCOUNTS.ALICE.address });
+    if (!Array.isArray(funding)) {
+      throw new Error(`Expected array for userFundingHistory, got ${typeof funding}`);
+    }
+    logProgress(`Funding history retrieved: ${funding.length} entries`);
   });
 }

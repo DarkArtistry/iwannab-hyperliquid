@@ -1,0 +1,185 @@
+{
+  "genesis_time": "2026-02-02T09:25:49.000000000Z",
+  "chain_id": "hypercore-5v-test",
+  "initial_height": "1",
+  "consensus_params": {
+    "block": {
+      "max_bytes": "22020096",
+      "max_gas": "-1"
+    },
+    "evidence": {
+      "max_age_num_blocks": "100000",
+      "max_age_duration": "172800000000000",
+      "max_bytes": "1048576"
+    },
+    "validator": {
+      "pub_key_types": ["ed25519"]
+    },
+    "version": {
+      "app": "0"
+    },
+    "abci": {
+      "vote_extensions_enable_height": "0"
+    }
+  },
+  "validators": [
+    {
+      "address": "6DFACA234A99C1430D4A676DF49B1F13A46C0A65",
+      "pub_key": {
+        "type": "tendermint/PubKeyEd25519",
+        "value": "Gn0Do67lm9HvplryJ50g86fu7Vni3IRSJtjYRBrAk+E="
+      },
+      "power": "10",
+      "name": "validator-0"
+    },
+    {
+      "address": "96EEDE6DF74A2582F76CA06DF265A9F65E85A83B",
+      "pub_key": {
+        "type": "tendermint/PubKeyEd25519",
+        "value": "ugRktvcqDC0xp//G/vwkJCJWEpyX9OoEpKXBo8xOS9Y="
+      },
+      "power": "10",
+      "name": "validator-1"
+    },
+    {
+      "address": "DB556E6C4886C0E8CA80D24A1E4DF603D467796E",
+      "pub_key": {
+        "type": "tendermint/PubKeyEd25519",
+        "value": "7V+bVOtyYH5BL6H5vIY7oca9iDkpp9o9yBvGNdygQ8o="
+      },
+      "power": "10",
+      "name": "validator-2"
+    },
+    {
+      "address": "643CDC1F7BA17F467E7CC462B895D6666CE7DFD3",
+      "pub_key": {
+        "type": "tendermint/PubKeyEd25519",
+        "value": "HpISqRBlgnNybmPQt/XSTaJLllS2/lRwmCdaQfws7W0="
+      },
+      "power": "10",
+      "name": "validator-3"
+    },
+    {
+      "address": "24277B5DE4ED2B63A99B6D1342806A4F03DB883E",
+      "pub_key": {
+        "type": "tendermint/PubKeyEd25519",
+        "value": "2qfoegBm/6ZT9bKeEh2/PfuLFp4mU0YBtCcHB0Vnhq8="
+      },
+      "power": "10",
+      "name": "validator-4"
+    }
+  ],
+  "app_hash": "",
+  "app_state": {
+    "chain_id": "hypercore-5v-test",
+    "markets": [
+      {
+        "id": 0,
+        "symbol": "BTC-PERP",
+        "max_leverage": 50,
+        "initial_mark_price": "65000"
+      },
+      {
+        "id": 1,
+        "symbol": "ETH-PERP",
+        "max_leverage": 50,
+        "initial_mark_price": "3500"
+      }
+    ],
+    "spot_tokens": [
+      {
+        "index": 1,
+        "name": "Test Token",
+        "symbol": "TEST",
+        "wei_decimals": 18,
+        "sz_decimals": 4,
+        "max_supply": "1000000000"
+      }
+    ],
+    "balances": [
+      {
+        "address": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+        "token": 0,
+        "amount": "100000000000000",
+        "view": "core"
+      },
+      {
+        "address": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+        "token": 0,
+        "amount": "100000000000000",
+        "view": "core"
+      },
+      {
+        "address": "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC",
+        "token": 0,
+        "amount": "100000000000000",
+        "view": "core"
+      },
+      {
+        "address": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+        "token": 0,
+        "amount": "100000000000000",
+        "view": "evm"
+      },
+      {
+        "address": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+        "token": 0,
+        "amount": "100000000000000",
+        "view": "evm"
+      },
+      {
+        "address": "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC",
+        "token": 0,
+        "amount": "100000000000000",
+        "view": "evm"
+      }
+    ],
+    "validators": [
+    {
+      "address": "6DFACA234A99C1430D4A676DF49B1F13A46C0A65",
+      "pub_key": {
+        "type": "tendermint/PubKeyEd25519",
+        "value": "Gn0Do67lm9HvplryJ50g86fu7Vni3IRSJtjYRBrAk+E="
+      },
+      "power": "10",
+      "name": "validator-0"
+    },
+    {
+      "address": "96EEDE6DF74A2582F76CA06DF265A9F65E85A83B",
+      "pub_key": {
+        "type": "tendermint/PubKeyEd25519",
+        "value": "ugRktvcqDC0xp//G/vwkJCJWEpyX9OoEpKXBo8xOS9Y="
+      },
+      "power": "10",
+      "name": "validator-1"
+    },
+    {
+      "address": "DB556E6C4886C0E8CA80D24A1E4DF603D467796E",
+      "pub_key": {
+        "type": "tendermint/PubKeyEd25519",
+        "value": "7V+bVOtyYH5BL6H5vIY7oca9iDkpp9o9yBvGNdygQ8o="
+      },
+      "power": "10",
+      "name": "validator-2"
+    },
+    {
+      "address": "643CDC1F7BA17F467E7CC462B895D6666CE7DFD3",
+      "pub_key": {
+        "type": "tendermint/PubKeyEd25519",
+        "value": "HpISqRBlgnNybmPQt/XSTaJLllS2/lRwmCdaQfws7W0="
+      },
+      "power": "10",
+      "name": "validator-3"
+    },
+    {
+      "address": "24277B5DE4ED2B63A99B6D1342806A4F03DB883E",
+      "pub_key": {
+        "type": "tendermint/PubKeyEd25519",
+        "value": "2qfoegBm/6ZT9bKeEh2/PfuLFp4mU0YBtCcHB0Vnhq8="
+      },
+      "power": "10",
+      "name": "validator-4"
+    }
+    ]
+  }
+}

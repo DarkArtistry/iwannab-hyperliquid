@@ -41,7 +41,8 @@ Based on comprehensive deep-dive analysis of the codebase:
 | P2P Attestation Gossip | ✅ 100% | LibP2P GossipSub, Noise encryption, bootstrap peers |
 | Re-org Handling | ✅ 100% | Coordinated snapshot/restore for all 3 state layers |
 | EVM State Commitment | ✅ 100% | Optional EVM state in AppHash for consensus-critical EVM |
-| Test Coverage | ✅ 100% | 627+ tests (434 Rust, 49 Solidity, 144 E2E) |
+| Multi-Validator | ✅ 100% | ValidatorRegistry, 3-node cluster, E2E tests |
+| Test Coverage | ✅ 100% | 752+ tests (531 Rust, 49 Solidity, 144 E2E, 6+22 multi-node) |
 
 ### Production Readiness
 
@@ -1261,27 +1262,78 @@ The codebase is well-structured and follows good Rust practices. The primary wor
 **Test Suite Status:**
 | Category | Tests | Status |
 |----------|-------|--------|
-| Rust Unit Tests | 434 | ✅ All passing |
+| Rust Unit Tests | 531+ | ✅ All passing |
 | Solidity Contracts | 49 | ✅ All passing |
 | E2E Integration | 144 | ✅ All passing |
-| **Total** | **627** | **All Passing** |
+| Multi-Node E2E (3-node) | 6 | ✅ All passing |
+| Multi-Node Full (5-node) | 22 | ✅ Comprehensive |
+| **Total** | **752+** | **All Passing** |
 
 **Test Breakdown by Crate:**
 | Crate | Tests | Key Coverage |
 |-------|-------|--------------|
-| `hypercore-chain` | 102 | Re-org snapshots, attestation, determinism, state proofs |
+| `hypercore-chain` | 203 | Re-org snapshots, attestation, determinism, state proofs, multi-node integration |
 | `hypercore-engine` | 105 | Matching, risk, funding, liquidation, orderbook |
-| `hypercore-primitives` | 59 | Decimal, EIP-712, unified state, position PnL |
 | `hypercore-gateway` | 81 | Rate limiting, validation, handlers |
-| `hypercore-evm` | 32 | State roots, executor, precompiles |
+| `hypercore-primitives` | 59 | Decimal, EIP-712, unified state, position PnL |
 | `hypercore-persistence` | 51 | RocksDB, snapshots, state serialization |
-| `hypercore-indexer` | 4 | Event ingestion, candles |
+| `hypercore-evm` | 32 | State roots, executor, precompiles |
 
 **Test Commands:**
 ```bash
-make test-quick    # Rust + Solidity only (483 tests, no Docker)
-make test-all      # All tests (627+ tests, requires Docker)
-make test-e2e      # E2E only (144 tests, requires Docker)
+make test-quick          # Rust + Solidity only (580 tests, no Docker)
+make test-all            # All tests (752+ tests, requires Docker)
+make test-e2e            # E2E single-node (144 tests, requires Docker)
+make test-multinode      # 3-node multi-validator E2E (6 tests, requires Docker)
+make test-multinode-full # 5-node comprehensive E2E (22 tests, requires Docker)
+```
+
+### Multi-Validator Infrastructure (January 2026)
+
+Comprehensive multi-validator testing infrastructure has been implemented:
+
+**ValidatorRegistry Contract** (`contracts/src/ValidatorRegistry.sol`)
+- Permissioned/permissionless validator modes
+- USDC staking for validator registration
+- Voting power proportional to stake (with max cap)
+- Unbonding period before stake withdrawal
+- Epoch-based validator set updates
+- Slashing support for misbehavior
+
+**Multi-Node Test Infrastructure:**
+| Component | File | Description |
+|-----------|------|-------------|
+| Genesis Generator | `scripts/generate-multi-validator-genesis.sh` | Generates N-validator genesis configs |
+| Docker Compose (3-node) | `docker-compose-multinode.yml` | 3-node CometBFT cluster |
+| Docker Compose (5-node) | `docker-compose-multinode-5.yml` | 5-node CometBFT cluster |
+| Basic E2E Script | `scripts/e2e-multinode.sh` | 6-test multi-validator E2E suite |
+| Comprehensive E2E Script | `scripts/e2e-multinode-full.sh` | 22-test 5-validator E2E suite |
+| TypeScript Multi-Node Tests | `scripts/e2e/tests/multinode.ts` | Real tx propagation + state sync |
+| Multi-Node Runner | `scripts/e2e/multinode-runner.ts` | Dedicated 5-node test runner |
+| Integration Tests | `crates/chain/src/tests/multi_node_integration.rs` | 13 simulated multi-node tests |
+
+**3-Node E2E Tests (6 tests):**
+- All nodes connected (peer count verification)
+- Consensus reached (block hash agreement)
+- Blockchain progression (10+ blocks produced)
+- Validator set verification (correct count and power)
+- State consistency across nodes (app hash agreement)
+- API endpoints available on all nodes
+
+**5-Node Comprehensive E2E Tests (22 tests):**
+- *Connectivity (5):* Health check all 5 nodes, peer count, validator set, CometBFT RPC, EVM RPC
+- *Transaction Propagation (5):* Order via Node 0 visible on all, leverage update propagation, cross-node order matching, cancel propagation, balance consistency
+- *EVM State Sync (4):* Block numbers consistent, balances consistent, chain ID consistent, gas price consistent
+- *Invalid Transaction Handling (3):* Invalid leverage rejected on all nodes, invalid price rejected, state unaffected by invalid txs
+- *Block Progression (2):* 15s sustained progression on all nodes, block hashes match at same height
+- *State Consistency (3):* AppHash matches across nodes, clearinghouse state matches, unified balances match, market metadata consistent, extended run stability
+
+**Makefile Targets:**
+```bash
+make test-multinode      # Run 3-node multi-validator E2E tests (6 tests)
+make test-multinode-full # Run 5-node comprehensive E2E tests (22 tests)
+make test-multinode-keep # Run tests, keep 3-node cluster running
+make test-all            # Includes all multi-node tests in full suite
 ```
 
 ### Test Coverage Enhancement (January 2026)

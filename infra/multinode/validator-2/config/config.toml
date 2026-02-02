@@ -1,0 +1,34 @@
+# CometBFT Configuration for validator-2
+
+proxy_app = "tcp://node-2:26658"
+moniker = "validator-2"
+
+[rpc]
+laddr = "tcp://0.0.0.0:26657"
+cors_allowed_origins = ["*"]
+
+[p2p]
+laddr = "tcp://0.0.0.0:26656"
+persistent_peers = "f5eddff0aea59442a66ced4b09457951b9387884@cometbft-0:26656,ea4a0721b6c184a22fe1a2b88fcd8caeb10d99b8@cometbft-1:26656,5ae033c211285de987977eb1b0fc5d49ef7b6c71@cometbft-3:26656,facd4811213e9e02a3529542b407448d3b6e098f@cometbft-4:26656"
+addr_book_strict = false
+allow_duplicate_ip = true
+
+[mempool]
+size = 5000
+cache_size = 10000
+
+[consensus]
+timeout_propose = "1s"
+timeout_propose_delta = "500ms"
+timeout_prevote = "1s"
+timeout_prevote_delta = "500ms"
+timeout_precommit = "1s"
+timeout_precommit_delta = "500ms"
+timeout_commit = "1s"
+
+[statesync]
+enable = false
+
+[instrumentation]
+prometheus = true
+prometheus_listen_addr = ":26660"

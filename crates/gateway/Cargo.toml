@@ -36,6 +36,9 @@ alloy-primitives = { workspace = true }
 hex = "0.4"
 sha3 = { workspace = true }
 
+# HTTP client (for CometBFT RPC broadcast in multi-node mode)
+reqwest = { workspace = true }
+
 # Error handling
 thiserror = { workspace = true }
 

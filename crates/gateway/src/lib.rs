@@ -14,6 +14,7 @@ pub mod event_broadcaster;
 pub mod handlers;
 pub mod rate_limit;
 pub mod server;
+pub mod tx_router;
 pub mod validation;
 pub mod websocket;
 
@@ -21,5 +22,6 @@ pub use api::{InfoRequest, ExchangeRequest, ApiResponse};
 pub use event_broadcaster::{EventBroadcaster, SharedEventBroadcaster};
 pub use rate_limit::{RateLimiter, RateLimitConfig};
 pub use server::{GatewayConfig, GatewayServer};
+pub use tx_router::{TxRouter, CometBftRpcClient, TxRouterError};
 pub use validation::{ValidationConfig, ValidationError, Validator};
 pub use websocket::{WsManager, WsMessage, WsSubscription};

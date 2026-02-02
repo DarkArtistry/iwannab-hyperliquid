@@ -1,0 +1,233 @@
+# Multi-Node HyperCore Cluster Configuration
+#
+# This docker-compose file creates a 3-validator HyperCore network for:
+# - Testing consensus with multiple validators
+# - Verifying blockchain progression
+# - Testing validator set changes
+# - Network partition scenarios
+#
+# Usage:
+#   1. Generate validator configs: ./scripts/generate-multi-validator-genesis.sh 3
+#   2. Start cluster: docker compose -f docker-compose-multinode.yml up
+#   3. Check status: docker compose -f docker-compose-multinode.yml ps
+#
+# Network topology:
+#   cometbft-0 <---> cometbft-1 <---> cometbft-2
+#       |               |               |
+#     node-0          node-1          node-2
+#
+# Ports per validator (base + validator_id * 10):
+#   - P2P: 26656, 26666, 26676
+#   - RPC: 26657, 26667, 26677
+#   - ABCI: 26658, 26668, 26678
+#   - EVM: 8545, 8555, 8565
+#   - HTTP: 3000, 3010, 3020
+
+services:
+  # ============================================================================
+  # PostgreSQL (shared for all nodes in test environment)
+  # ============================================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: hypercore-postgres
+    environment:
+      POSTGRES_USER: hypercore
+      POSTGRES_PASSWORD: hypercore
+      POSTGRES_DB: hypercore
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hypercore"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - hypercore-multinode
+
+  # ============================================================================
+  # Validator 0
+  # ============================================================================
+  node-0:
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile.node
+    container_name: hypercore-node-0
+    ports:
+      - "26658:26658"  # ABCI
+      - "8545:8545"    # EVM JSON-RPC
+      - "3000:3000"    # HTTP API
+    environment:
+      RUST_LOG: info,hypercore=debug
+      DATABASE_URL: postgres://hypercore:hypercore@postgres:5432/hypercore
+      ABCI_ADDR: 0.0.0.0:26658
+      EVM_RPC_ADDR: 0.0.0.0:8545
+      HTTP_ADDR: 0.0.0.0:3000
+      CONSENSUS_MODE: comet-bft
+      COMETBFT_RPC_URL: http://cometbft-0:26657
+      VALIDATOR_ID: "0"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - hypercore-multinode
+
+  cometbft-0:
+    image: cometbft/cometbft:v0.38.5
+    container_name: hypercore-cometbft-0
+    ports:
+      - "26656:26656"  # P2P
+      - "26657:26657"  # RPC
+    volumes:
+      - ./infra/multinode/validator-0/data:/cometbft/data
+      - ./infra/multinode/validator-0/config/config.toml:/cometbft/config/config.toml:ro
+      - ./infra/multinode/validator-0/config/genesis.json:/cometbft/config/genesis.json:ro
+      - ./infra/multinode/validator-0/config/node_key.json:/cometbft/config/node_key.json:ro
+      - ./infra/multinode/validator-0/config/priv_validator_key.json:/cometbft/config/priv_validator_key.json:ro
+    command: start --proxy_app=tcp://node-0:26658
+    depends_on:
+      - node-0
+    networks:
+      - hypercore-multinode
+
+  # ============================================================================
+  # Validator 1
+  # ============================================================================
+  node-1:
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile.node
+    container_name: hypercore-node-1
+    ports:
+      - "26668:26658"  # ABCI
+      - "8555:8545"    # EVM JSON-RPC
+      - "3010:3000"    # HTTP API
+    environment:
+      RUST_LOG: info,hypercore=debug
+      DATABASE_URL: postgres://hypercore:hypercore@postgres:5432/hypercore
+      ABCI_ADDR: 0.0.0.0:26658
+      EVM_RPC_ADDR: 0.0.0.0:8545
+      HTTP_ADDR: 0.0.0.0:3000
+      CONSENSUS_MODE: comet-bft
+      COMETBFT_RPC_URL: http://cometbft-1:26657
+      VALIDATOR_ID: "1"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - hypercore-multinode
+
+  cometbft-1:
+    image: cometbft/cometbft:v0.38.5
+    container_name: hypercore-cometbft-1
+    ports:
+      - "26666:26656"  # P2P
+      - "26667:26657"  # RPC
+    volumes:
+      - ./infra/multinode/validator-1/data:/cometbft/data
+      - ./infra/multinode/validator-1/config/config.toml:/cometbft/config/config.toml:ro
+      - ./infra/multinode/validator-1/config/genesis.json:/cometbft/config/genesis.json:ro
+      - ./infra/multinode/validator-1/config/node_key.json:/cometbft/config/node_key.json:ro
+      - ./infra/multinode/validator-1/config/priv_validator_key.json:/cometbft/config/priv_validator_key.json:ro
+    command: start --proxy_app=tcp://node-1:26658
+    depends_on:
+      - node-1
+      - cometbft-0
+    networks:
+      - hypercore-multinode
+
+  # ============================================================================
+  # Validator 2
+  # ============================================================================
+  node-2:
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile.node
+    container_name: hypercore-node-2
+    ports:
+      - "26678:26658"  # ABCI
+      - "8565:8545"    # EVM JSON-RPC
+      - "3020:3000"    # HTTP API
+    environment:
+      RUST_LOG: info,hypercore=debug
+      DATABASE_URL: postgres://hypercore:hypercore@postgres:5432/hypercore
+      ABCI_ADDR: 0.0.0.0:26658
+      EVM_RPC_ADDR: 0.0.0.0:8545
+      HTTP_ADDR: 0.0.0.0:3000
+      CONSENSUS_MODE: comet-bft
+      COMETBFT_RPC_URL: http://cometbft-2:26657
+      VALIDATOR_ID: "2"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - hypercore-multinode
+
+  cometbft-2:
+    image: cometbft/cometbft:v0.38.5
+    container_name: hypercore-cometbft-2
+    ports:
+      - "26676:26656"  # P2P
+      - "26677:26657"  # RPC
+    volumes:
+      - ./infra/multinode/validator-2/data:/cometbft/data
+      - ./infra/multinode/validator-2/config/config.toml:/cometbft/config/config.toml:ro
+      - ./infra/multinode/validator-2/config/genesis.json:/cometbft/config/genesis.json:ro
+      - ./infra/multinode/validator-2/config/node_key.json:/cometbft/config/node_key.json:ro
+      - ./infra/multinode/validator-2/config/priv_validator_key.json:/cometbft/config/priv_validator_key.json:ro
+    command: start --proxy_app=tcp://node-2:26658
+    depends_on:
+      - node-2
+      - cometbft-0
+    networks:
+      - hypercore-multinode
+
+  # ============================================================================
+  # Test Runner (optional - for automated integration tests)
+  # ============================================================================
+  test-runner:
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile.test-runner
+    container_name: hypercore-test-runner
+    environment:
+      NODE_0_RPC: http://node-0:3000
+      NODE_1_RPC: http://node-1:3000
+      NODE_2_RPC: http://node-2:3000
+      COMETBFT_0_RPC: http://cometbft-0:26657
+      COMETBFT_1_RPC: http://cometbft-1:26657
+      COMETBFT_2_RPC: http://cometbft-2:26657
+    depends_on:
+      - cometbft-0
+      - cometbft-1
+      - cometbft-2
+    networks:
+      - hypercore-multinode
+    profiles:
+      - test
+
+networks:
+  hypercore-multinode:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  validator_0_data:
+  validator_1_data:
+  validator_2_data:

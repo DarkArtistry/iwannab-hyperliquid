@@ -26,7 +26,7 @@ pub use state::{BlockMetadata, EngineState, EngineStateSnapshot};
 
 use hypercore_primitives::{
     AccountAddress, Decimal, Error, Fill, Market, MarketConfig, MarketId, Order, OrderId,
-    OrderRequest, OrderSide, Position, Result, Timestamp,
+    OrderRequest, OrderSide, Position, Result, SharedUnifiedState, Timestamp,
 };
 use std::collections::HashMap;
 
@@ -62,6 +62,8 @@ pub struct Engine {
     pub risk: RiskEngine,
     pub funding: FundingEngine,
     pub liquidation: LiquidationEngine,
+    /// Shared unified state for reading account balances (USDC margin)
+    pub unified_state: Option<SharedUnifiedState>,
 }
 
 impl Engine {
@@ -74,7 +76,15 @@ impl Engine {
             funding: FundingEngine::new(config.funding_interval_secs, config.max_funding_rate),
             liquidation: LiquidationEngine::new(config.liquidation_partial_ratio),
             config,
+            unified_state: None,
         }
+    }
+
+    /// Create a new engine with shared unified state for balance lookups
+    pub fn with_unified_state(config: EngineConfig, unified_state: SharedUnifiedState) -> Self {
+        let mut engine = Self::new(config);
+        engine.unified_state = Some(unified_state);
+        engine
     }
 
     /// Initialize a market
@@ -108,6 +118,16 @@ impl Engine {
 
         // Create account if needed, then get a clone of its state for validation
         self.state.get_or_create_account_mut(account);
+
+        // Sync account balance from unified state (source of truth for USDC margin)
+        if let Some(ref us) = self.unified_state {
+            let unified = us.read().unwrap();
+            let core_balance = unified.get_core_view(account, 0); // USDC (token 0)
+            if let Some(acc) = self.state.get_account_mut(account) {
+                acc.balance = core_balance.raw();
+            }
+        }
+
         let account_state = self.state.get_account(account).unwrap().clone();
 
         // Create position if needed, then get a clone for validation
@@ -388,12 +408,25 @@ impl Engine {
             );
         }
 
-        // Update balances (fees)
+        // Update balances (fees) in Engine's internal state
         if let Some(maker_state) = self.state.get_account_mut(fill.maker) {
             maker_state.balance -= fill.maker_fee;
         }
         if let Some(taker_state) = self.state.get_account_mut(fill.taker) {
             taker_state.balance -= fill.taker_fee as i128;
+        }
+
+        // Deduct fees from unified state (source of truth)
+        if let Some(ref us) = self.unified_state {
+            let mut unified = us.write().unwrap();
+            if fill.maker_fee > 0 {
+                let fee = Decimal::from_raw(fill.maker_fee, Decimal::USDC_DECIMALS);
+                unified.debit_core(fill.maker, 0, fee);
+            }
+            if fill.taker_fee > 0 {
+                let fee = Decimal::from_raw(fill.taker_fee as i128, Decimal::USDC_DECIMALS);
+                unified.debit_core(fill.taker, 0, fee);
+            }
         }
 
         // Update market state
@@ -402,6 +435,9 @@ impl Engine {
             // Update mark price (simplified - in production use EWMA)
             market.state.mark_price = Decimal::from_raw(fill.price as i128, Decimal::PRICE_DECIMALS);
         }
+
+        // Record fill for queryability (userFills, recentTrades)
+        self.state.record_fill(fill.clone());
 
         Ok(())
     }

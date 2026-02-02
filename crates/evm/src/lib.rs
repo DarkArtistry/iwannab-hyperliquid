@@ -21,4 +21,5 @@ pub use executor::{EvmExecutor, EvmTransaction, EvmExecutionResult, EvmLog, EvmE
 pub use precompiles::{HyperCorePrecompiles, PrecompileAddress};
 pub use state::EvmState;
 pub use core_writer::{CoreWriterAction, ActionQueue};
-pub use rpc::EvmRpcServer;
+pub use rpc::{EvmRpcServer, EvmRpcState, decode_raw_transaction, TransactionReceipt, TransactionObject};
+pub use revm::primitives::B256;

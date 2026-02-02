@@ -143,13 +143,13 @@ print_test_result() {
 
     if [ "$status" == "pass" ]; then
         echo -e "  ${GREEN}✓${NC} ${WHITE}$name${NC} ${CYAN}($duration)${NC}"
-        ((TESTS_PASSED++))
+        TESTS_PASSED=$((TESTS_PASSED + 1))
     elif [ "$status" == "fail" ]; then
         echo -e "  ${RED}✗${NC} ${WHITE}$name${NC} ${RED}($duration)${NC}"
-        ((TESTS_FAILED++))
+        TESTS_FAILED=$((TESTS_FAILED + 1))
     else
         echo -e "  ${YELLOW}○${NC} ${WHITE}$name${NC} ${YELLOW}(skipped)${NC}"
-        ((TESTS_SKIPPED++))
+        TESTS_SKIPPED=$((TESTS_SKIPPED + 1))
     fi
 
     if [ -n "$description" ] && [ "$VERBOSE" == true ]; then
@@ -326,7 +326,7 @@ wait_for_services() {
         fi
 
         sleep $HEALTH_CHECK_INTERVAL
-        ((checks++))
+        checks=$((checks + 1))
     done
 
     if [ "$all_healthy" == true ]; then

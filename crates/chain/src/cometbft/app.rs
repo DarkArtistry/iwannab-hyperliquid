@@ -20,6 +20,33 @@ use crate::app::HyperCoreApp;
 use crate::tx::Transaction;
 use super::validators::ValidatorSet;
 
+use hypercore_evm::{EvmExecutor, decode_raw_transaction, B256, TransactionReceipt, TransactionObject};
+use tokio::sync::RwLock as TokioRwLock;
+use std::collections::HashMap;
+use sha3::{Digest, Keccak256};
+
+/// Acquire a write lock on a tokio RwLock with retry (for sync/blocking contexts).
+///
+/// In FinalizeBlock (which runs on a spawn_blocking thread), blocking_write() can
+/// deadlock if an EVM RPC handler concurrently holds a read lock. This helper uses
+/// try_write() with short sleeps, matching the pattern in app.rs for perp/spot engines.
+fn acquire_tokio_write_with_retry<'a, T>(lock: &'a TokioRwLock<T>, label: &str) -> Option<tokio::sync::RwLockWriteGuard<'a, T>> {
+    if let Ok(guard) = lock.try_write() {
+        return Some(guard);
+    }
+    for attempt in 1..=100 {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        if let Ok(guard) = lock.try_write() {
+            if attempt > 5 {
+                tracing::debug!("{}: acquired write lock after {} retries", label, attempt);
+            }
+            return Some(guard);
+        }
+    }
+    tracing::error!("{}: failed to acquire write lock after 100 retries", label);
+    None
+}
+
 /// CometBFT Application wrapper
 ///
 /// This wraps the HyperCoreApp and implements the tendermint_abci::Application trait.
@@ -38,6 +65,14 @@ struct CometBftAppInner {
     validators: ValidatorSet,
     /// Chain ID from InitChain
     chain_id: String,
+    /// EVM executor for raw EVM transaction execution during consensus
+    evm_executor: Option<Arc<TokioRwLock<EvmExecutor>>>,
+    /// Shared EVM receipt store (populated by FinalizeBlock, read by EVM RPC)
+    evm_receipts: Option<Arc<TokioRwLock<HashMap<B256, TransactionReceipt>>>>,
+    /// Shared EVM transaction store
+    evm_transactions: Option<Arc<TokioRwLock<HashMap<B256, TransactionObject>>>>,
+    /// Shared EVM block number counter
+    evm_block_number: Option<Arc<TokioRwLock<u64>>>,
 }
 
 impl CometBftApp {
@@ -48,8 +83,37 @@ impl CometBftApp {
                 app,
                 validators: ValidatorSet::new(),
                 chain_id: String::new(),
+                evm_executor: None,
+                evm_receipts: None,
+                evm_transactions: None,
+                evm_block_number: None,
             })),
         }
+    }
+
+    /// Set the EVM executor for consensus-driven EVM transaction execution
+    ///
+    /// When set, the ABCI app can process raw EVM transactions that are
+    /// broadcast directly (not wrapped in a HyperCore Transaction envelope).
+    pub fn with_evm_executor(self, executor: Arc<TokioRwLock<EvmExecutor>>) -> Self {
+        self.inner.write().evm_executor = Some(executor);
+        self
+    }
+
+    /// Set shared EVM receipt/transaction stores so FinalizeBlock can populate
+    /// receipts that the EVM RPC server returns via eth_getTransactionReceipt.
+    pub fn with_evm_receipt_store(
+        self,
+        receipts: Arc<TokioRwLock<HashMap<B256, TransactionReceipt>>>,
+        transactions: Arc<TokioRwLock<HashMap<B256, TransactionObject>>>,
+        block_number: Arc<TokioRwLock<u64>>,
+    ) -> Self {
+        let mut inner = self.inner.write();
+        inner.evm_receipts = Some(receipts);
+        inner.evm_transactions = Some(transactions);
+        inner.evm_block_number = Some(block_number);
+        drop(inner);
+        self
     }
 
     /// Get the current block height
@@ -114,45 +178,69 @@ impl Application for CometBftApp {
     }
 
     /// CheckTx - validate transaction for mempool
+    ///
+    /// Handles two transaction formats:
+    /// 1. JSON-encoded HyperCore Transaction (orders, cancels, transfers, etc.)
+    /// 2. Raw RLP-encoded EVM transactions (from eth_sendRawTransaction)
     fn check_tx(&self, request: RequestCheckTx) -> ResponseCheckTx {
-        let tx: Transaction = match serde_json::from_slice(&request.tx) {
-            Ok(tx) => tx,
-            Err(e) => {
-                return ResponseCheckTx {
+        // Try JSON-encoded HyperCore Transaction first
+        if let Ok(tx) = serde_json::from_slice::<Transaction>(&request.tx) {
+            let inner = self.inner.read();
+            return match inner.app.check_tx(&tx) {
+                Ok(()) => ResponseCheckTx {
+                    code: 0,
+                    data: Vec::new().into(),
+                    log: "OK".to_string(),
+                    info: String::new(),
+                    gas_wanted: 1,
+                    gas_used: 1,
+                    events: Vec::new(),
+                    codespace: String::new(),
+                },
+                Err(e) => ResponseCheckTx {
                     code: 1,
                     data: Vec::new().into(),
-                    log: format!("Failed to decode transaction: {}", e),
+                    log: e.to_string(),
+                    info: String::new(),
+                    gas_wanted: 0,
+                    gas_used: 0,
+                    events: Vec::new(),
+                    codespace: "app".to_string(),
+                },
+            };
+        }
+
+        // Try raw EVM transaction (RLP-encoded)
+        match decode_raw_transaction(&request.tx) {
+            Ok(evm_tx) => {
+                tracing::debug!(
+                    "CheckTx: raw EVM tx from {:?}, nonce={}, gas_limit={}",
+                    evm_tx.from, evm_tx.nonce, evm_tx.gas_limit
+                );
+                // Basic validation: tx decoded successfully, sender recovered
+                ResponseCheckTx {
+                    code: 0,
+                    data: Vec::new().into(),
+                    log: "OK (EVM)".to_string(),
+                    info: String::new(),
+                    gas_wanted: evm_tx.gas_limit as i64,
+                    gas_used: 0,
+                    events: Vec::new(),
+                    codespace: String::new(),
+                }
+            }
+            Err(_) => {
+                ResponseCheckTx {
+                    code: 1,
+                    data: Vec::new().into(),
+                    log: "Failed to decode as HyperCore Transaction or raw EVM transaction".to_string(),
                     info: String::new(),
                     gas_wanted: 0,
                     gas_used: 0,
                     events: Vec::new(),
                     codespace: "encoding".to_string(),
-                };
+                }
             }
-        };
-
-        let inner = self.inner.read();
-        match inner.app.check_tx(&tx) {
-            Ok(()) => ResponseCheckTx {
-                code: 0,
-                data: Vec::new().into(),
-                log: "OK".to_string(),
-                info: String::new(),
-                gas_wanted: 1,
-                gas_used: 1,
-                events: Vec::new(),
-                codespace: String::new(),
-            },
-            Err(e) => ResponseCheckTx {
-                code: 1,
-                data: Vec::new().into(),
-                log: e.to_string(),
-                info: String::new(),
-                gas_wanted: 0,
-                gas_used: 0,
-                events: Vec::new(),
-                codespace: "app".to_string(),
-            },
         }
     }
 
@@ -200,21 +288,24 @@ impl Application for CometBftApp {
     }
 
     /// ProcessProposal - validate block proposal
+    ///
+    /// Accepts proposals containing valid HyperCore Transactions and/or raw EVM transactions.
     fn process_proposal(&self, request: RequestProcessProposal) -> ResponseProcessProposal {
         let inner = self.inner.read();
 
-        // Validate all transactions in the proposal
         for tx_bytes in &request.txs {
-            let tx: Transaction = match serde_json::from_slice(tx_bytes) {
-                Ok(tx) => tx,
-                Err(_) => {
+            // Try JSON-encoded HyperCore Transaction
+            if let Ok(tx) = serde_json::from_slice::<Transaction>(tx_bytes) {
+                if inner.app.check_tx(&tx).is_err() {
                     return ResponseProcessProposal {
                         status: ProposalStatus::Reject as i32,
                     };
                 }
-            };
+                continue;
+            }
 
-            if inner.app.check_tx(&tx).is_err() {
+            // Try raw EVM transaction
+            if decode_raw_transaction(tx_bytes).is_err() {
                 return ResponseProcessProposal {
                     status: ProposalStatus::Reject as i32,
                 };
@@ -227,6 +318,10 @@ impl Application for CometBftApp {
     }
 
     /// FinalizeBlock - finalize block and return results
+    ///
+    /// Handles two transaction formats:
+    /// 1. JSON-encoded HyperCore Transaction (orders, cancels, transfers, etc.)
+    /// 2. Raw RLP-encoded EVM transactions (from eth_sendRawTransaction)
     fn finalize_block(&self, request: RequestFinalizeBlock) -> ResponseFinalizeBlock {
         let mut inner = self.inner.write();
 
@@ -242,59 +337,194 @@ impl Application for CometBftApp {
         let mut events = Vec::new();
 
         for tx_bytes in request.txs {
-            let tx: Transaction = match serde_json::from_slice(&tx_bytes) {
-                Ok(tx) => tx,
-                Err(e) => {
+            // Try JSON-encoded HyperCore Transaction first
+            if let Ok(tx) = serde_json::from_slice::<Transaction>(&tx_bytes) {
+                match inner.app.execute_tx(&tx, timestamp) {
+                    Ok(tx_result) => {
+                        let tx_events: Vec<tendermint_proto::abci::Event> = tx_result.events.iter().map(|e| {
+                            tendermint_proto::abci::Event {
+                                r#type: e.r#type.clone(),
+                                attributes: e.attributes.iter().map(|a| {
+                                    tendermint_proto::abci::EventAttribute {
+                                        key: a.key.clone(),
+                                        value: a.value.clone(),
+                                        index: true,
+                                    }
+                                }).collect(),
+                            }
+                        }).collect();
+                        events.extend(tx_events.clone());
+                        tx_results.push(tendermint_proto::abci::ExecTxResult {
+                            code: 0,
+                            data: Vec::new().into(),
+                            log: "OK".to_string(),
+                            info: String::new(),
+                            gas_wanted: 1,
+                            gas_used: tx_result.gas_used as i64,
+                            events: tx_events,
+                            codespace: String::new(),
+                        });
+                    }
+                    Err(e) => {
+                        tx_results.push(tendermint_proto::abci::ExecTxResult {
+                            code: 1,
+                            data: Vec::new().into(),
+                            log: e.to_string(),
+                            info: String::new(),
+                            gas_wanted: 0,
+                            gas_used: 0,
+                            events: Vec::new(),
+                            codespace: "app".to_string(),
+                        });
+                    }
+                }
+                continue;
+            }
+
+            // Try raw EVM transaction (RLP-encoded)
+            match decode_raw_transaction(&tx_bytes) {
+                Ok(evm_tx) => {
+                    if let Some(ref executor) = inner.evm_executor {
+                        // Acquire write lock with retry to avoid deadlock with EVM RPC readers
+                        let Some(mut exec) = acquire_tokio_write_with_retry(executor, "EVM executor (FinalizeBlock)") else {
+                            tx_results.push(tendermint_proto::abci::ExecTxResult {
+                                code: 1,
+                                data: Vec::new().into(),
+                                log: "EVM executor lock contention (100 retries exhausted)".to_string(),
+                                info: String::new(),
+                                gas_wanted: evm_tx.gas_limit as i64,
+                                gas_used: 0,
+                                events: Vec::new(),
+                                codespace: "evm".to_string(),
+                            });
+                            continue;
+                        };
+                        match exec.execute_tx(&evm_tx) {
+                            Ok(result) => {
+                                exec.commit();
+
+                                // Compute tx hash and store receipt for EVM RPC
+                                let tx_hash = B256::from_slice(&Keccak256::digest(&tx_bytes));
+                                let block_height = request.height as u64;
+                                let block_hex = format!("0x{:x}", block_height);
+                                let block_hash = format!("0x{}", "a".repeat(64));
+                                let sender_hex = format!("0x{}", hex::encode(evm_tx.from.as_slice()));
+                                let to_hex = evm_tx.to.map(|a| format!("0x{}", hex::encode(a.as_slice())));
+                                let tx_hash_hex = format!("0x{}", hex::encode(tx_hash.as_slice()));
+
+                                if let Some(ref receipts_store) = inner.evm_receipts {
+                                    let receipt = TransactionReceipt {
+                                        transaction_hash: tx_hash_hex.clone(),
+                                        transaction_index: "0x0".to_string(),
+                                        block_hash: block_hash.clone(),
+                                        block_number: block_hex.clone(),
+                                        from: sender_hex.clone(),
+                                        to: to_hex.clone(),
+                                        cumulative_gas_used: format!("0x{:x}", result.gas_used),
+                                        effective_gas_price: format!("0x{:x}", evm_tx.gas_price),
+                                        gas_used: format!("0x{:x}", result.gas_used),
+                                        contract_address: None,
+                                        logs: vec![],
+                                        logs_bloom: format!("0x{}", "0".repeat(512)),
+                                        tx_type: "0x2".to_string(),
+                                        status: if result.success { "0x1".to_string() } else { "0x0".to_string() },
+                                    };
+                                    if let Some(mut store) = acquire_tokio_write_with_retry(receipts_store, "EVM receipts store") {
+                                        store.insert(tx_hash, receipt);
+                                    }
+                                }
+                                if let Some(ref txs_store) = inner.evm_transactions {
+                                    let tx_obj = TransactionObject {
+                                        block_hash: Some(block_hash),
+                                        block_number: Some(block_hex),
+                                        from: sender_hex,
+                                        gas: format!("0x{:x}", evm_tx.gas_limit),
+                                        gas_price: format!("0x{:x}", evm_tx.gas_price),
+                                        hash: tx_hash_hex,
+                                        input: format!("0x{}", hex::encode(&evm_tx.data)),
+                                        nonce: format!("0x{:x}", evm_tx.nonce),
+                                        to: to_hex,
+                                        transaction_index: Some("0x0".to_string()),
+                                        value: format!("0x{:x}", evm_tx.value),
+                                        v: "0x1".to_string(),
+                                        r: format!("0x{}", "0".repeat(64)),
+                                        s: format!("0x{}", "0".repeat(64)),
+                                        tx_type: "0x2".to_string(),
+                                    };
+                                    if let Some(mut store) = acquire_tokio_write_with_retry(txs_store, "EVM transactions store") {
+                                        store.insert(tx_hash, tx_obj);
+                                    }
+                                }
+
+                                let evm_event = tendermint_proto::abci::Event {
+                                    r#type: "evm_raw_tx".to_string(),
+                                    attributes: vec![
+                                        tendermint_proto::abci::EventAttribute {
+                                            key: "sender".to_string(),
+                                            value: format!("{:?}", evm_tx.from),
+                                            index: true,
+                                        },
+                                        tendermint_proto::abci::EventAttribute {
+                                            key: "success".to_string(),
+                                            value: result.success.to_string(),
+                                            index: true,
+                                        },
+                                        tendermint_proto::abci::EventAttribute {
+                                            key: "gas_used".to_string(),
+                                            value: result.gas_used.to_string(),
+                                            index: true,
+                                        },
+                                    ],
+                                };
+                                events.push(evm_event.clone());
+
+                                tx_results.push(tendermint_proto::abci::ExecTxResult {
+                                    code: if result.success { 0 } else { 1 },
+                                    data: Vec::new().into(),
+                                    log: if result.success { "OK (EVM)".to_string() } else { "EVM execution reverted".to_string() },
+                                    info: String::new(),
+                                    gas_wanted: evm_tx.gas_limit as i64,
+                                    gas_used: result.gas_used as i64,
+                                    events: vec![evm_event],
+                                    codespace: String::new(),
+                                });
+                            }
+                            Err(e) => {
+                                tx_results.push(tendermint_proto::abci::ExecTxResult {
+                                    code: 1,
+                                    data: Vec::new().into(),
+                                    log: format!("EVM execution error: {}", e),
+                                    info: String::new(),
+                                    gas_wanted: evm_tx.gas_limit as i64,
+                                    gas_used: 0,
+                                    events: Vec::new(),
+                                    codespace: "evm".to_string(),
+                                });
+                            }
+                        }
+                    } else {
+                        tx_results.push(tendermint_proto::abci::ExecTxResult {
+                            code: 1,
+                            data: Vec::new().into(),
+                            log: "EVM executor not available".to_string(),
+                            info: String::new(),
+                            gas_wanted: 0,
+                            gas_used: 0,
+                            events: Vec::new(),
+                            codespace: "evm".to_string(),
+                        });
+                    }
+                }
+                Err(_) => {
                     tx_results.push(tendermint_proto::abci::ExecTxResult {
                         code: 1,
                         data: Vec::new().into(),
-                        log: format!("Failed to decode: {}", e),
+                        log: "Failed to decode as HyperCore Transaction or raw EVM transaction".to_string(),
                         info: String::new(),
                         gas_wanted: 0,
                         gas_used: 0,
                         events: Vec::new(),
                         codespace: "encoding".to_string(),
-                    });
-                    continue;
-                }
-            };
-
-            match inner.app.execute_tx(&tx, timestamp) {
-                Ok(tx_result) => {
-                    let tx_events: Vec<tendermint_proto::abci::Event> = tx_result.events.iter().map(|e| {
-                        tendermint_proto::abci::Event {
-                            r#type: e.r#type.clone(),
-                            attributes: e.attributes.iter().map(|a| {
-                                tendermint_proto::abci::EventAttribute {
-                                    key: a.key.clone(),
-                                    value: a.value.clone(),
-                                    index: true,
-                                }
-                            }).collect(),
-                        }
-                    }).collect();
-                    events.extend(tx_events.clone());
-                    tx_results.push(tendermint_proto::abci::ExecTxResult {
-                        code: 0,
-                        data: Vec::new().into(),
-                        log: "OK".to_string(),
-                        info: String::new(),
-                        gas_wanted: 1,
-                        gas_used: tx_result.gas_used as i64,
-                        events: tx_events,
-                        codespace: String::new(),
-                    });
-                }
-                Err(e) => {
-                    tx_results.push(tendermint_proto::abci::ExecTxResult {
-                        code: 1,
-                        data: Vec::new().into(),
-                        log: e.to_string(),
-                        info: String::new(),
-                        gas_wanted: 0,
-                        gas_used: 0,
-                        events: Vec::new(),
-                        codespace: "app".to_string(),
                     });
                 }
             }
@@ -313,6 +543,13 @@ impl Application for CometBftApp {
                 power: v.power,
             })
             .collect();
+
+        // Update shared EVM block number to match CometBFT height
+        if let Some(ref block_num) = inner.evm_block_number {
+            if let Some(mut bn) = acquire_tokio_write_with_retry(block_num, "EVM block number") {
+                *bn = request.height as u64;
+            }
+        }
 
         // Commit and get app hash
         let app_hash = inner.app.commit();

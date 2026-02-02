@@ -151,6 +151,29 @@ pnpm test:integration  # 86 tests
 
 See [QUICK_START.md](QUICK_START.md) for detailed setup instructions.
 
+### 5. Run Multi-Validator Testnet
+
+```bash
+# Generate 3-validator genesis configuration
+./scripts/generate-multi-validator-genesis.sh 3
+
+# Start the multi-validator cluster
+docker-compose -f docker-compose-multinode.yml up -d
+
+# Run multi-validator E2E tests
+make test-multinode
+
+# Or keep the cluster running after tests
+make test-multinode-keep
+```
+
+**Multi-Validator Endpoints:**
+| Validator | HTTP API | EVM RPC | CometBFT RPC |
+|-----------|----------|---------|--------------|
+| Node 0 | localhost:3000 | localhost:8545 | localhost:26657 |
+| Node 1 | localhost:3010 | localhost:8555 | localhost:26667 |
+| Node 2 | localhost:3020 | localhost:8565 | localhost:26677 |
+
 ## Repository Structure
 
 ```
@@ -247,10 +270,12 @@ contract MyStrategy {
 
 | Component | Tests | Description |
 |-----------|-------|-------------|
-| Rust Unit Tests | 298 | Core engine, chain, gateway, primitives |
-| Solidity Contracts | 49 | CoreWriter, HyperCore integration |
-| E2E Integration | 135 | Full system integration (requires Docker) |
-| **Total** | **482** | **All Passing** |
+| Rust Unit Tests | 531+ | Core engine, chain, gateway, primitives, multi-node |
+| Solidity Contracts | 49 | CoreWriter, HyperCore, ValidatorRegistry |
+| E2E Integration | 144 | Full system integration (requires Docker) |
+| Multi-Node E2E (3-node) | 6 | Multi-validator consensus tests |
+| Multi-Node Full (5-node) | 22 | Comprehensive tx propagation + state sync |
+| **Total** | **752+** | **All Passing** |
 
 ### Running Tests
 
@@ -258,19 +283,21 @@ contract MyStrategy {
 # Quick tests - Rust + Solidity only (no Docker required)
 make test-quick
 
-# All tests - Rust + Solidity + E2E (starts Docker services)
+# All tests - Rust + Solidity + E2E + Multi-Node (starts Docker services)
 make test-all
 
 # Individual test commands
-make test              # Rust unit tests only (298 tests)
-make test-contracts    # Solidity tests only (49 tests)
-make test-e2e          # E2E integration only (135 tests)
+make test               # Rust unit tests only (531+ tests)
+make test-contracts     # Solidity tests only (49 tests)
+make test-e2e           # E2E single-node integration (144 tests)
+make test-multinode     # 3-node multi-validator E2E (6 tests)
+make test-multinode-full  # 5-node comprehensive E2E (22 tests)
 
 # Crate-specific tests
-make test-engine       # Engine (matching, risk, funding)
-make test-chain        # Chain (Merkle, consensus, state)
-make test-gateway      # Gateway (rate limit, validation)
-make test-primitives   # Primitives (types, EIP-712)
+make test-engine        # Engine (matching, risk, funding - 105 tests)
+make test-chain         # Chain (Merkle, consensus, state, multi-node - 203 tests)
+make test-gateway       # Gateway (rate limit, validation - 81 tests)
+make test-primitives    # Primitives (types, EIP-712 - 59 tests)
 ```
 
 ### Test Categories
@@ -436,7 +463,7 @@ This is a development implementation. See [docs/IMPLEMENTATION_STATUS.md](docs/I
 | Phase 4A | Persistence Infrastructure (RocksDB) | ✅ Complete |
 | Phase 4B | State Save/Restore | ✅ Complete |
 
-**482 total tests passing** (298 Rust + 135 E2E + 49 Solidity) - See [TODO.md](TODO.md) for the development roadmap.
+**752+ total tests passing** (531 Rust + 144 E2E + 49 Solidity + 6+22 Multi-Node) - See [TODO.md](TODO.md) for the development roadmap.
 
 ## Contributing
 

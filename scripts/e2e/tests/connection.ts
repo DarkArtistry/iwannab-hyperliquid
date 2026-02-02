@@ -17,7 +17,9 @@ export async function runConnectionTests(ctx: TestContext): Promise<void> {
     logProgress('Sending GET /health request...');
     const response = await fetch(`${CONFIG.GATEWAY_URL}/health`);
     if (!response.ok) throw new Error(`Health check failed: ${response.status}`);
-    logProgress('Gateway is healthy');
+    const body = await response.text();
+    if (!body || body.length === 0) throw new Error('Health check returned empty response');
+    logProgress(`Gateway is healthy: ${body}`);
   });
 
   await runTest(ctx, 'Info endpoint available', 'connection', 'Verify /info POST endpoint accepts requests', async () => {
@@ -47,7 +49,11 @@ export async function runConnectionTests(ctx: TestContext): Promise<void> {
       body: JSON.stringify({ jsonrpc: '2.0', method: 'eth_chainId', params: [], id: 1 }),
     });
     if (!response.ok) throw new Error(`EVM RPC failed: ${response.status}`);
-    const data = (await response.json()) as { result?: string };
-    logProgress(`Chain ID: ${parseInt(data.result || '0', 16)}`);
+    const data = (await response.json()) as { result?: string; error?: { message: string } };
+    if (data.error) throw new Error(`EVM RPC error: ${data.error.message}`);
+    if (!data.result) throw new Error('EVM RPC returned no chain ID');
+    const chainId = parseInt(data.result, 16);
+    if (chainId !== CONFIG.CHAIN_ID) throw new Error(`Expected chain ID ${CONFIG.CHAIN_ID}, got ${chainId}`);
+    logProgress(`Chain ID: ${chainId}`);
   });
 }

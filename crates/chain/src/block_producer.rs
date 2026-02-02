@@ -347,7 +347,8 @@ impl BlockProducer {
 
         // Check transaction is valid
         {
-            let app = self.app.blocking_read();
+            let app = self.app.try_read()
+                .map_err(|_| BlockProducerError::Production("App lock contention during tx validation".to_string()))?;
             if let Err(e) = app.check_tx(&tx) {
                 return Err(BlockProducerError::InvalidTx(e.to_string()));
             }

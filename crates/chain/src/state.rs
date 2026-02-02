@@ -400,6 +400,11 @@ impl AppState {
     /// ## Determinism
     /// This function is fully deterministic. All inputs are sorted before hashing.
     /// No floating point, no SystemTime, no HashMap iteration (sorted).
+    ///
+    /// ## Lock Strategy
+    /// Acquires the engine read lock ONCE for all engine state root computations.
+    /// Uses try_read() with retries to handle concurrent writers (e.g., mock_price_feed task)
+    /// without calling blocking_read() which panics inside a tokio runtime.
     pub fn compute_app_hash(&self) -> [u8; 32] {
         use sha3::{Digest, Keccak256};
 
@@ -419,31 +424,32 @@ impl AppState {
         hasher.update(&nonce_root);
 
         // === Engine State (Phase 3C-extended) ===
-        // These were previously missing, causing potential undetected divergence
+        // Acquire engine lock ONCE for all engine state computations.
+        // This prevents TryLockError panics when concurrent tasks (e.g., price feed)
+        // briefly hold the engine write lock.
+        {
+            let engine = self.acquire_engine_read();
 
-        // Positions
-        let positions_root = self.compute_positions_root();
-        hasher.update(&positions_root);
+            // Positions
+            hasher.update(&Self::positions_root_from_engine(&engine));
 
-        // Open orders
-        let orders_root = self.compute_orders_root();
-        hasher.update(&orders_root);
+            // Open orders
+            hasher.update(&Self::orders_root_from_engine(&engine));
 
-        // Market state (prices, funding, OI)
-        let markets_root = self.compute_markets_root();
-        hasher.update(&markets_root);
+            // Market state (prices, funding, OI)
+            hasher.update(&Self::markets_root_from_engine(&engine));
 
-        // Leverage settings
-        let leverage_root = self.compute_leverage_root();
-        hasher.update(&leverage_root);
+            // Leverage settings
+            hasher.update(&Self::leverage_root_from_engine(&engine));
 
-        // Client order ID mappings
+            // Scalar values (insurance fund, next order ID)
+            hasher.update(&Self::scalars_hash_from_engine(&engine));
+        }
+        // Engine lock released here before acquiring EVM lock
+
+        // Client order ID mappings (no engine lock needed)
         let cloid_root = self.compute_cloid_root();
         hasher.update(&cloid_root);
-
-        // Scalar values (insurance fund, next order ID)
-        let scalars_hash = self.compute_engine_scalars_hash();
-        hasher.update(&scalars_hash);
 
         // === EVM State (Phase 7D) ===
         // When EVM executor is set, include EVM state in consensus commitment.
@@ -451,13 +457,48 @@ impl AppState {
         // This adds: account nonces, code hashes, contract storage, and deployed code.
         if let Some(ref evm) = self.evm_executor {
             let evm_root = {
-                let executor = evm.blocking_read();
+                let executor = evm.try_read()
+                    .expect("EVM executor lock should not be held during state commitment");
                 executor.state_root()
             };
             hasher.update(&evm_root);
         }
 
         hasher.finalize().into()
+    }
+
+    /// Acquire engine read lock with retry for concurrent writer contention.
+    ///
+    /// Uses try_read() (not blocking_read()) so it works inside a tokio runtime.
+    /// Retries briefly to handle concurrent writers like mock_price_feed that hold
+    /// the engine write lock for microseconds.
+    fn acquire_engine_read(&self) -> tokio::sync::RwLockReadGuard<'_, EngineState> {
+        // Fast path: usually succeeds immediately when no concurrent writer
+        if let Ok(guard) = self.engine.try_read() {
+            return guard;
+        }
+
+        // Slow path: retry with spin-loop hints for concurrent writer contention.
+        // The price feed write lock is held for <1ms, so a few thousand spins suffice.
+        for _ in 0..10_000 {
+            std::hint::spin_loop();
+            if let Ok(guard) = self.engine.try_read() {
+                return guard;
+            }
+        }
+
+        // Very slow path: sleep-based retry for extended contention
+        for _ in 0..100 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            if let Ok(guard) = self.engine.try_read() {
+                return guard;
+            }
+        }
+
+        panic!(
+            "Failed to acquire engine read lock for state commitment after retries. \
+             A concurrent writer has held the lock for >100ms."
+        );
     }
 
     /// Build Merkle tree of unified state and return the root
@@ -530,18 +571,54 @@ impl AppState {
     // These methods compute Merkle roots for consensus-critical EngineState
     // components that were previously missing from the AppHash commitment.
 
-    /// Compute Merkle root of all positions
-    ///
-    /// Key: address (20 bytes) || market_id (1 byte) = 21 bytes
-    /// Value: size (16 bytes) || entry_notional (16 bytes) || realized_pnl (16 bytes) || funding_index (16 bytes) = 64 bytes
+    /// Compute Merkle root of all positions.
+    /// Public API — acquires engine lock. For use outside compute_app_hash().
     pub fn compute_positions_root(&self) -> [u8; 32] {
-        // Use try_read() to handle both sync and async contexts
-        // This can panic if a write lock is held, but should not happen at end_block
         let engine = self.engine.try_read()
             .expect("Engine lock should not be held during state commitment");
-        let all_positions = engine.get_all_positions_global();
+        Self::positions_root_from_engine(&engine)
+    }
 
-        // Flatten and sort for deterministic ordering
+    /// Compute Merkle root of all open orders.
+    /// Public API — acquires engine lock. For use outside compute_app_hash().
+    pub fn compute_orders_root(&self) -> [u8; 32] {
+        let engine = self.engine.try_read()
+            .expect("Engine lock should not be held during state commitment");
+        Self::orders_root_from_engine(&engine)
+    }
+
+    /// Compute Merkle root of all markets.
+    /// Public API — acquires engine lock. For use outside compute_app_hash().
+    pub fn compute_markets_root(&self) -> [u8; 32] {
+        let engine = self.engine.try_read()
+            .expect("Engine lock should not be held during state commitment");
+        Self::markets_root_from_engine(&engine)
+    }
+
+    /// Compute Merkle root of leverage settings.
+    /// Public API — acquires engine lock. For use outside compute_app_hash().
+    pub fn compute_leverage_root(&self) -> [u8; 32] {
+        let engine = self.engine.try_read()
+            .expect("Engine lock should not be held during state commitment");
+        Self::leverage_root_from_engine(&engine)
+    }
+
+    /// Compute hash of engine scalar values.
+    /// Public API — acquires engine lock. For use outside compute_app_hash().
+    pub fn compute_engine_scalars_hash(&self) -> [u8; 32] {
+        let engine = self.engine.try_read()
+            .expect("Engine lock should not be held during state commitment");
+        Self::scalars_hash_from_engine(&engine)
+    }
+
+    // === Internal engine root computation (no lock acquisition) ===
+    //
+    // These static methods compute Merkle roots from a pre-acquired EngineState reference.
+    // Used by compute_app_hash() which acquires the lock once via acquire_engine_read().
+
+    /// Positions root: Key = address (20) || market_id (1), Value = size || entry || pnl || funding
+    fn positions_root_from_engine(engine: &EngineState) -> [u8; 32] {
+        let all_positions = engine.get_all_positions_global();
         let mut entries: Vec<_> = all_positions
             .iter()
             .flat_map(|(addr, positions)| {
@@ -557,7 +634,6 @@ impl AppState {
                 key.extend_from_slice(addr.as_slice());
                 key.push(*market_id);
 
-                // Use entry_notional instead of entry_price (entry_price is computed)
                 let mut value = Vec::with_capacity(64);
                 value.extend_from_slice(&pos.size.raw().to_le_bytes());
                 value.extend_from_slice(&pos.entry_notional.raw().to_le_bytes());
@@ -571,35 +647,24 @@ impl AppState {
         MerkleTree::from_entries(&merkle_entries).root()
     }
 
-    /// Compute Merkle root of all open orders
-    ///
-    /// Key: market_id (1 byte) || order_id (8 bytes) = 9 bytes
-    /// Value: owner (20) || side (1) || price (16) || size (16) || remaining (16) = 69 bytes
-    pub fn compute_orders_root(&self) -> [u8; 32] {
-        let engine = self.engine.try_read()
-            .expect("Engine lock should not be held during state commitment");
+    /// Orders root: Key = market_id (1) || order_id (8), Value = owner || side || price || sizes
+    fn orders_root_from_engine(engine: &EngineState) -> [u8; 32] {
         let all_orders = engine.get_all_orders_global();
-
-        // Flatten all orders and sort for deterministic ordering
         let mut entries: Vec<_> = all_orders
             .iter()
             .flat_map(|(market_id, orders)| {
                 orders.iter().map(move |(order_id, order)| (*market_id, *order_id, order))
             })
             .collect();
-
-        // Sort by (market_id, order_id) for deterministic ordering
         entries.sort_by_key(|(mid, oid, _)| (*mid, *oid));
 
         let merkle_entries: Vec<(Vec<u8>, Vec<u8>)> = entries
             .iter()
             .map(|(market_id, order_id, order)| {
-                // Key: market_id (1 byte) || order_id (8 bytes)
                 let mut key = Vec::with_capacity(9);
                 key.push(*market_id);
                 key.extend_from_slice(&order_id.to_le_bytes());
 
-                // Value: owner (20) || side (1) || price (16) || original_size (16) || remaining_size (16)
                 let mut value = Vec::with_capacity(69);
                 value.extend_from_slice(order.owner.as_slice());
                 value.push(match order.side {
@@ -617,16 +682,9 @@ impl AppState {
         MerkleTree::from_entries(&merkle_entries).root()
     }
 
-    /// Compute Merkle root of all markets
-    ///
-    /// Key: market_id (1 byte)
-    /// Value: mark_price (16) || index_price (16) || funding_rate (16) || oi_long (16) || oi_short (16) = 80 bytes
-    pub fn compute_markets_root(&self) -> [u8; 32] {
-        let engine = self.engine.try_read()
-            .expect("Engine lock should not be held during state commitment");
+    /// Markets root: Key = market_id (1), Value = prices || funding || OI
+    fn markets_root_from_engine(engine: &EngineState) -> [u8; 32] {
         let markets = engine.get_all_markets();
-
-        // Sort by market ID for deterministic ordering
         let mut market_vec: Vec<_> = markets.iter().collect();
         market_vec.sort_by_key(|m| m.id());
 
@@ -649,16 +707,9 @@ impl AppState {
         MerkleTree::from_entries(&merkle_entries).root()
     }
 
-    /// Compute Merkle root of leverage settings
-    ///
-    /// Key: address (20 bytes) || market_id (1 byte) = 21 bytes
-    /// Value: leverage (1 byte)
-    pub fn compute_leverage_root(&self) -> [u8; 32] {
-        let engine = self.engine.try_read()
-            .expect("Engine lock should not be held during state commitment");
+    /// Leverage root: Key = address (20) || market_id (1), Value = leverage (1)
+    fn leverage_root_from_engine(engine: &EngineState) -> [u8; 32] {
         let all_leverage = engine.get_all_leverage_global();
-
-        // Flatten and sort for deterministic ordering
         let mut entries: Vec<_> = all_leverage
             .iter()
             .flat_map(|(addr, markets)| {
@@ -681,6 +732,15 @@ impl AppState {
             .collect();
 
         MerkleTree::from_entries(&merkle_entries).root()
+    }
+
+    /// Engine scalars hash: insurance_fund + next_order_id
+    fn scalars_hash_from_engine(engine: &EngineState) -> [u8; 32] {
+        use sha3::{Digest, Keccak256};
+        let mut hasher = Keccak256::new();
+        hasher.update(&engine.insurance_fund.to_le_bytes());
+        hasher.update(&engine.peek_next_order_id().to_le_bytes());
+        hasher.finalize().into()
     }
 
     /// Compute Merkle root of CLOID mappings
@@ -713,22 +773,6 @@ impl AppState {
             .collect();
 
         MerkleTree::from_entries(&merkle_entries).root()
-    }
-
-    /// Compute a single hash for scalar engine state values
-    ///
-    /// Includes: insurance_fund, next_order_id
-    pub fn compute_engine_scalars_hash(&self) -> [u8; 32] {
-        use sha3::{Digest, Keccak256};
-
-        let engine = self.engine.try_read()
-            .expect("Engine lock should not be held during state commitment");
-
-        let mut hasher = Keccak256::new();
-        hasher.update(&engine.insurance_fund.to_le_bytes());
-        hasher.update(&engine.peek_next_order_id().to_le_bytes());
-
-        hasher.finalize().into()
     }
 
     /// End block processing and compute app hash

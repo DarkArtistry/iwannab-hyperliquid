@@ -236,6 +236,10 @@ pub struct EvmRpcState {
     pub receipts: Arc<RwLock<HashMap<B256, TransactionReceipt>>>,
     /// Transactions by hash
     pub transactions: Arc<RwLock<HashMap<B256, TransactionObject>>>,
+    /// CometBFT RPC URL for broadcasting (None = direct execution mode)
+    pub cometbft_rpc_url: Option<String>,
+    /// HTTP client for CometBFT RPC
+    pub http_client: reqwest::Client,
 }
 
 impl EvmRpcState {
@@ -252,7 +256,15 @@ impl EvmRpcState {
             pending_txs: Arc::new(RwLock::new(HashMap::new())),
             receipts: Arc::new(RwLock::new(HashMap::new())),
             transactions: Arc::new(RwLock::new(HashMap::new())),
+            cometbft_rpc_url: None,
+            http_client: reqwest::Client::new(),
         }
+    }
+
+    pub fn with_cometbft(executor: Arc<RwLock<EvmExecutor>>, chain_id: u64, cometbft_rpc_url: String) -> Self {
+        let mut state = Self::new(executor, chain_id);
+        state.cometbft_rpc_url = Some(cometbft_rpc_url);
+        state
     }
 }
 
@@ -360,6 +372,32 @@ impl EvmRpcServer {
         Self {
             state: Arc::new(EvmRpcState::new(executor, chain_id)),
         }
+    }
+
+    /// Create EVM RPC server in CometBFT mode
+    ///
+    /// In this mode, `eth_sendRawTransaction` broadcasts to CometBFT
+    /// instead of executing directly. Read operations (eth_call, etc.)
+    /// still use the local executor.
+    pub fn with_cometbft(executor: Arc<RwLock<EvmExecutor>>, chain_id: u64, cometbft_rpc_url: String) -> Self {
+        Self {
+            state: Arc::new(EvmRpcState::with_cometbft(executor, chain_id, cometbft_rpc_url)),
+        }
+    }
+
+    /// Get shared receipts store (for CometBFT ABCI app to populate after FinalizeBlock)
+    pub fn shared_receipts(&self) -> Arc<RwLock<HashMap<B256, TransactionReceipt>>> {
+        Arc::clone(&self.state.receipts)
+    }
+
+    /// Get shared transactions store
+    pub fn shared_transactions(&self) -> Arc<RwLock<HashMap<B256, TransactionObject>>> {
+        Arc::clone(&self.state.transactions)
+    }
+
+    /// Get shared block number counter
+    pub fn shared_block_number(&self) -> Arc<RwLock<u64>> {
+        Arc::clone(&self.state.block_number)
     }
 
     /// Start the RPC server
@@ -596,108 +634,28 @@ impl EthApiServer for EvmRpcServer {
 
         let raw_tx = parse_bytes(&data)?;
 
-        // Decode the RLP-encoded transaction
-        // For now, we'll use a simplified approach - in production, use alloy-rlp
+        // Compute transaction hash
         let tx_hash = {
             use sha3::{Digest, Keccak256};
             let hash = Keccak256::digest(&raw_tx);
             B256::from_slice(&hash)
         };
 
-        // Try to decode as EIP-1559 or legacy transaction
+        // Validate by decoding the transaction
         let evm_tx = decode_raw_transaction(&raw_tx).map_err(|e| {
             ErrorObject::owned(ErrorCode::InvalidParams.code(), format!("Invalid transaction: {}", e), None::<()>)
         })?;
 
-        // Execute the transaction
-        let mut executor = self.state.executor.write().await;
-        let result = executor.execute_tx(&evm_tx).map_err(|e| {
-            ErrorObject::owned(3, format!("execution error: {}", e), None::<()>)
-        })?;
+        // === CometBFT Mode: broadcast to consensus instead of executing locally ===
+        if let Some(ref cometbft_url) = self.state.cometbft_rpc_url {
+            return self.broadcast_to_cometbft(cometbft_url, &raw_tx, &tx_hash, &evm_tx).await;
+        }
 
-        // Store transaction and receipt
-        let block_number = *self.state.block_number.read().await;
-        let block_timestamp = *self.state.block_timestamp.read().await;
-
-        let tx_obj = TransactionObject {
-            block_hash: Some(format!("0x{}", "0".repeat(64))),
-            block_number: Some(format_u64(block_number)),
-            from: format_address(&evm_tx.from),
-            gas: format_u64(evm_tx.gas_limit),
-            gas_price: format_u64(evm_tx.gas_price),
-            hash: format_b256(&tx_hash),
-            input: format_bytes(&evm_tx.data),
-            nonce: format_u64(evm_tx.nonce),
-            to: evm_tx.to.map(|a| format_address(&a)),
-            transaction_index: Some("0x0".to_string()),
-            value: format_u256(evm_tx.value),
-            v: "0x1b".to_string(),
-            r: format!("0x{}", "0".repeat(64)),
-            s: format!("0x{}", "0".repeat(64)),
-            tx_type: "0x0".to_string(),
-        };
-
-        // Use contract address from execution result, or calculate if not provided
-        let contract_address = if evm_tx.to.is_none() && result.success {
-            result.contract_address.or_else(|| {
-                // Fallback: calculate contract address from sender and nonce
-                Some(calculate_contract_address(&evm_tx.from, evm_tx.nonce))
-            })
-        } else {
-            None
-        };
-
-        debug!("Transaction executed: to={:?}, success={}, contract_address={:?}",
-               evm_tx.to, result.success, contract_address);
-
-        let receipt = TransactionReceipt {
-            transaction_hash: format_b256(&tx_hash),
-            transaction_index: "0x0".to_string(),
-            block_hash: format!("0x{}", "0".repeat(64)),
-            block_number: format_u64(block_number),
-            from: format_address(&evm_tx.from),
-            to: evm_tx.to.map(|a| format_address(&a)),
-            cumulative_gas_used: format_u64(result.gas_used),
-            effective_gas_price: format_u64(evm_tx.gas_price),
-            gas_used: format_u64(result.gas_used),
-            contract_address: contract_address.map(|a| format_address(&a)),
-            logs: result.logs.iter().enumerate().map(|(i, log)| LogEntry {
-                address: format_address(&log.address),
-                topics: log.topics.iter().map(|t| format_bytes(t)).collect(),
-                data: format_bytes(&log.data),
-                block_number: format_u64(block_number),
-                transaction_hash: format_b256(&tx_hash),
-                transaction_index: "0x0".to_string(),
-                block_hash: format!("0x{}", "0".repeat(64)),
-                log_index: format_u64(i as u64),
-                removed: false,
-            }).collect(),
-            logs_bloom: format!("0x{}", "0".repeat(512)),
-            tx_type: "0x0".to_string(),
-            status: if result.success { "0x1".to_string() } else { "0x0".to_string() },
-        };
-
-        // Store receipt and transaction
-        self.state.receipts.write().await.insert(tx_hash, receipt);
-        self.state.transactions.write().await.insert(tx_hash, tx_obj);
-
-        // Commit state changes
-        executor.commit();
-
-        // Increment block number for next tx
-        *self.state.block_number.write().await += 1;
-        *self.state.block_timestamp.write().await = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        info!("Transaction executed: {} (success: {})", format_b256(&tx_hash), result.success);
-
-        Ok(format_b256(&tx_hash))
+        // === Direct Mode: execute locally (single-node) ===
+        self.execute_locally(&raw_tx, &tx_hash, &evm_tx).await
     }
 
-    async fn get_transaction_receipt(&self, hash: String) -> RpcResult<Option<TransactionReceipt>> {
-        let hash = parse_b256(&hash)?;
+    async fn get_transaction_receipt(&self, hash: String) -> RpcResult<Option<TransactionReceipt>> {        let hash = parse_b256(&hash)?;
         let receipts = self.state.receipts.read().await;
         Ok(receipts.get(&hash).cloned())
     }
@@ -785,8 +743,217 @@ impl EthApiServer for EvmRpcServer {
     }
 }
 
+/// Helper methods for EVM RPC server (not part of the JSON-RPC trait)
+impl EvmRpcServer {
+    /// Broadcast raw EVM transaction to CometBFT for consensus ordering
+    async fn broadcast_to_cometbft(
+        &self,
+        cometbft_url: &str,
+        raw_tx: &[u8],
+        tx_hash: &B256,
+        evm_tx: &EvmTransaction,
+    ) -> RpcResult<String> {
+        info!("Broadcasting EVM tx {} to CometBFT at {}", format_b256(tx_hash), cometbft_url);
+
+        // Base64-encode the raw transaction bytes for CometBFT's broadcast_tx_sync
+        let tx_base64 = base64_encode(raw_tx);
+
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "broadcast_tx_sync",
+            "params": {
+                "tx": tx_base64
+            }
+        });
+
+        let response = self.state.http_client
+            .post(cometbft_url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ErrorObject::owned(
+                -32000,
+                format!("Failed to broadcast to CometBFT: {}", e),
+                None::<()>,
+            ))?;
+
+        let status = response.status();
+        let text = response.text().await
+            .map_err(|e| ErrorObject::owned(
+                -32000,
+                format!("Failed to read CometBFT response: {}", e),
+                None::<()>,
+            ))?;
+
+        if !status.is_success() {
+            return Err(ErrorObject::owned(
+                -32000,
+                format!("CometBFT HTTP {}: {}", status, text),
+                None::<()>,
+            ));
+        }
+
+        // Parse CometBFT response
+        let resp: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| ErrorObject::owned(
+                -32000,
+                format!("Invalid CometBFT response: {}", e),
+                None::<()>,
+            ))?;
+
+        // Check for RPC-level error
+        if let Some(error) = resp.get("error") {
+            let msg = error.get("message").and_then(|m| m.as_str()).unwrap_or("unknown error");
+            return Err(ErrorObject::owned(-32000, format!("CometBFT error: {}", msg), None::<()>));
+        }
+
+        // Check for CheckTx rejection (code != 0)
+        if let Some(result) = resp.get("result") {
+            let code = result.get("code").and_then(|c| c.as_u64()).unwrap_or(0);
+            if code != 0 {
+                let log = result.get("log").and_then(|l| l.as_str()).unwrap_or("");
+                return Err(ErrorObject::owned(
+                    -32000,
+                    format!("Transaction rejected by consensus: {}", log),
+                    None::<()>,
+                ));
+            }
+        }
+
+        // Store as pending transaction for tracking
+        self.state.pending_txs.write().await.insert(*tx_hash, PendingTransaction {
+            hash: *tx_hash,
+            tx: evm_tx.clone(),
+            raw: raw_tx.to_vec(),
+        });
+
+        info!("EVM tx {} broadcast to CometBFT (pending consensus)", format_b256(tx_hash));
+        Ok(format_b256(tx_hash))
+    }
+
+    /// Execute EVM transaction locally (single-node direct mode)
+    async fn execute_locally(
+        &self,
+        _raw_tx: &[u8],
+        tx_hash: &B256,
+        evm_tx: &EvmTransaction,
+    ) -> RpcResult<String> {
+        let mut executor = self.state.executor.write().await;
+        let result = executor.execute_tx(evm_tx).map_err(|e| {
+            ErrorObject::owned(3, format!("execution error: {}", e), None::<()>)
+        })?;
+
+        let block_number = *self.state.block_number.read().await;
+
+        let tx_obj = TransactionObject {
+            block_hash: Some(format!("0x{}", "0".repeat(64))),
+            block_number: Some(format_u64(block_number)),
+            from: format_address(&evm_tx.from),
+            gas: format_u64(evm_tx.gas_limit),
+            gas_price: format_u64(evm_tx.gas_price),
+            hash: format_b256(tx_hash),
+            input: format_bytes(&evm_tx.data),
+            nonce: format_u64(evm_tx.nonce),
+            to: evm_tx.to.map(|a| format_address(&a)),
+            transaction_index: Some("0x0".to_string()),
+            value: format_u256(evm_tx.value),
+            v: "0x1b".to_string(),
+            r: format!("0x{}", "0".repeat(64)),
+            s: format!("0x{}", "0".repeat(64)),
+            tx_type: "0x0".to_string(),
+        };
+
+        let contract_address = if evm_tx.to.is_none() && result.success {
+            result.contract_address.or_else(|| {
+                Some(calculate_contract_address(&evm_tx.from, evm_tx.nonce))
+            })
+        } else {
+            None
+        };
+
+        debug!("Transaction executed: to={:?}, success={}, contract_address={:?}",
+               evm_tx.to, result.success, contract_address);
+
+        let receipt = TransactionReceipt {
+            transaction_hash: format_b256(tx_hash),
+            transaction_index: "0x0".to_string(),
+            block_hash: format!("0x{}", "0".repeat(64)),
+            block_number: format_u64(block_number),
+            from: format_address(&evm_tx.from),
+            to: evm_tx.to.map(|a| format_address(&a)),
+            cumulative_gas_used: format_u64(result.gas_used),
+            effective_gas_price: format_u64(evm_tx.gas_price),
+            gas_used: format_u64(result.gas_used),
+            contract_address: contract_address.map(|a| format_address(&a)),
+            logs: result.logs.iter().enumerate().map(|(i, log)| LogEntry {
+                address: format_address(&log.address),
+                topics: log.topics.iter().map(|t| format_bytes(t)).collect(),
+                data: format_bytes(&log.data),
+                block_number: format_u64(block_number),
+                transaction_hash: format_b256(tx_hash),
+                transaction_index: "0x0".to_string(),
+                block_hash: format!("0x{}", "0".repeat(64)),
+                log_index: format_u64(i as u64),
+                removed: false,
+            }).collect(),
+            logs_bloom: format!("0x{}", "0".repeat(512)),
+            tx_type: "0x0".to_string(),
+            status: if result.success { "0x1".to_string() } else { "0x0".to_string() },
+        };
+
+        self.state.receipts.write().await.insert(*tx_hash, receipt);
+        self.state.transactions.write().await.insert(*tx_hash, tx_obj);
+
+        executor.commit();
+
+        *self.state.block_number.write().await += 1;
+        *self.state.block_timestamp.write().await = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        info!("Transaction executed: {} (success: {})", format_b256(tx_hash), result.success);
+        Ok(format_b256(tx_hash))
+    }
+}
+
+/// Simple base64 encoder for CometBFT RPC
+fn base64_encode(input: &[u8]) -> String {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut result = String::with_capacity((input.len() + 2) / 3 * 4);
+
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+
+        let n = (b0 << 16) | (b1 << 8) | b2;
+
+        result.push(CHARS[(n >> 18 & 0x3F) as usize] as char);
+        result.push(CHARS[(n >> 12 & 0x3F) as usize] as char);
+
+        if chunk.len() > 1 {
+            result.push(CHARS[(n >> 6 & 0x3F) as usize] as char);
+        } else {
+            result.push('=');
+        }
+
+        if chunk.len() > 2 {
+            result.push(CHARS[(n & 0x3F) as usize] as char);
+        } else {
+            result.push('=');
+        }
+    }
+
+    result
+}
+
 /// Decode a raw RLP-encoded transaction
-fn decode_raw_transaction(raw: &[u8]) -> anyhow::Result<EvmTransaction> {
+///
+/// Supports legacy, EIP-2930, and EIP-1559 transaction types.
+/// Recovers the sender address from the embedded ECDSA signature.
+pub fn decode_raw_transaction(raw: &[u8]) -> anyhow::Result<EvmTransaction> {
     use alloy_rlp::Decodable;
 
     if raw.is_empty() {

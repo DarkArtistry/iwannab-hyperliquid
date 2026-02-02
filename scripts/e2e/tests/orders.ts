@@ -73,11 +73,14 @@ export async function runOrderTests(ctx: TestContext): Promise<void> {
       response?: { data?: { statuses?: Array<{ resting?: { oid?: string } }> } };
     };
 
-    if (result.status === 'ok' && result.response?.data?.statuses?.[0]?.resting?.oid) {
+    if (result.status !== 'ok') {
+      throw new Error(`Order placement failed: ${JSON.stringify(result)}`);
+    }
+    if (result.response?.data?.statuses?.[0]?.resting?.oid) {
       placedOrderId = result.response.data.statuses[0].resting.oid;
       logProgress(`Order placed successfully, ID: ${placedOrderId}`);
     } else {
-      logProgress('Order submitted');
+      logProgress('Order accepted (status: ok)');
     }
   });
 
@@ -100,7 +103,10 @@ export async function runOrderTests(ctx: TestContext): Promise<void> {
     };
 
     const { signature, nonce } = await signAction(action, TEST_ACCOUNTS.ALICE.privateKey);
-    await exchangeRequest(action, signature, nonce);
+    const result = await exchangeRequest(action, signature, nonce) as { status?: string };
+    if (result.status !== 'ok') {
+      throw new Error(`Sell order failed: ${JSON.stringify(result)}`);
+    }
     logProgress('Sell order placed');
   });
 
@@ -123,7 +129,10 @@ export async function runOrderTests(ctx: TestContext): Promise<void> {
     };
 
     const { signature, nonce } = await signAction(action, TEST_ACCOUNTS.ALICE.privateKey);
-    await exchangeRequest(action, signature, nonce);
+    const result = await exchangeRequest(action, signature, nonce) as { status?: string };
+    if (result.status !== 'ok') {
+      throw new Error(`Post-only order failed: ${JSON.stringify(result)}`);
+    }
     logProgress('Post-only order placed');
   });
 
@@ -146,8 +155,11 @@ export async function runOrderTests(ctx: TestContext): Promise<void> {
     };
 
     const { signature, nonce } = await signAction(action, TEST_ACCOUNTS.ALICE.privateKey);
-    await exchangeRequest(action, signature, nonce);
-    logProgress('IOC order submitted (likely cancelled)');
+    const result = await exchangeRequest(action, signature, nonce) as { status?: string };
+    if (result.status !== 'ok') {
+      throw new Error(`IOC order failed: ${JSON.stringify(result)}`);
+    }
+    logProgress('IOC order submitted and handled');
   });
 
   await runTest(ctx, 'Batch place orders', 'orders', 'Place multiple orders in a single request', async () => {
@@ -164,7 +176,10 @@ export async function runOrderTests(ctx: TestContext): Promise<void> {
     };
 
     const { signature, nonce } = await signAction(action, TEST_ACCOUNTS.ALICE.privateKey);
-    await exchangeRequest(action, signature, nonce);
+    const result = await exchangeRequest(action, signature, nonce) as { status?: string };
+    if (result.status !== 'ok') {
+      throw new Error(`Batch order failed: ${JSON.stringify(result)}`);
+    }
     logProgress('Batch orders placed');
   });
 
@@ -214,7 +229,10 @@ export async function runOrderTests(ctx: TestContext): Promise<void> {
 
     await sleep(500);
     const orders = (await infoRequest('openOrders', { user: TEST_ACCOUNTS.ALICE.address })) as unknown[];
-    logProgress(`Remaining orders: ${orders.length}`);
+    if (orders.length !== 0) {
+      throw new Error(`Expected 0 open orders after cancelAll, got ${orders.length}`);
+    }
+    logProgress('All orders cancelled, 0 remaining');
   });
 
   await runTest(ctx, 'Cancel order by client order ID', 'orders', 'Place an order with CLOID and cancel it by CLOID', async () => {
@@ -269,8 +287,7 @@ export async function runOrderTests(ctx: TestContext): Promise<void> {
     // Only try transfer if there's enough balance
     const transferAmount = Math.min(10, Math.floor(coreViewBalance / 2));
     if (transferAmount < 1) {
-      logProgress('Insufficient core_view balance for transfer test, skipping actual transfer');
-      return;
+      throw new Error(`Insufficient core_view balance for transfer test: ${coreViewBalance} USDC`);
     }
 
     const transferAction = {

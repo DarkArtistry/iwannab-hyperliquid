@@ -93,7 +93,7 @@ export async function runEVMTests(ctx: TestContext): Promise<void> {
   await runTest(ctx, 'eth_blockNumber', 'evm', 'Query current block height from EVM', async () => {
     logProgress('Fetching block number...');
     const blockNumber = await publicClient.getBlockNumber();
-    if (blockNumber < 0n) throw new Error('Invalid block number');
+    if (blockNumber < 1n) throw new Error(`Expected block number >= 1, got ${blockNumber}`);
     logProgress(`Current block: ${blockNumber}`);
   });
 
@@ -129,10 +129,9 @@ export async function runEVMTests(ctx: TestContext): Promise<void> {
     const code = await publicClient.getCode({ address: TEST_ACCOUNTS.ALICE.address });
     // EOA should have no code
     if (code && code !== '0x') {
-      logProgress(`Code found (unexpected for EOA): ${code.slice(0, 20)}...`);
-    } else {
-      logProgress('No code found (expected for EOA)');
+      throw new Error(`EOA has code (unexpected): ${code.slice(0, 40)}`);
     }
+    logProgress('No code found (expected for EOA)');
   });
 
   await runTest(ctx, 'eth_getStorageAt', 'evm', 'Query storage slot at an address', async () => {
@@ -230,6 +229,7 @@ export async function runEVMTests(ctx: TestContext): Promise<void> {
 
   await runTest(ctx, 'eth_call (simple)', 'evm', 'Execute read-only call to zero address', async () => {
     logProgress('Executing eth_call to zero address...');
+    // Call to zero address: either succeeds with empty result or reverts - both are valid EVM behavior
     try {
       const result = await publicClient.call({
         to: '0x0000000000000000000000000000000000000000',
@@ -237,21 +237,32 @@ export async function runEVMTests(ctx: TestContext): Promise<void> {
       });
       logProgress(`Call result: ${result.data || '0x'}`);
     } catch (e) {
-      // Call to zero address may fail, which is acceptable
-      logProgress('Call completed (may have reverted, which is expected)');
+      // Revert is valid for calling zero address - the important thing is the RPC handled it
+      const msg = (e as Error).message;
+      if (msg.includes('revert') || msg.includes('execution') || msg.includes('halt')) {
+        logProgress('Call reverted as expected for zero address');
+      } else {
+        throw e; // Unexpected error - propagate
+      }
     }
   });
 
   await runTest(ctx, 'eth_call (precompile)', 'evm', 'Attempt to call HyperCore precompile', async () => {
     logProgress('Calling position precompile at 0x0800...');
+    // Precompile may or may not be available - test that RPC handles the call without crashing
     try {
       const result = await publicClient.call({
         to: '0x0000000000000000000000000000000000000800',
-        data: '0x', // Empty call
+        data: '0x',
       });
       logProgress(`Precompile response: ${result.data || '0x'}`);
     } catch (e) {
-      logProgress('Precompile not available or reverted (expected in test environment)');
+      const msg = (e as Error).message;
+      if (msg.includes('revert') || msg.includes('execution') || msg.includes('halt') || msg.includes('precompile')) {
+        logProgress('Precompile call reverted (expected without proper input encoding)');
+      } else {
+        throw e; // Unexpected error
+      }
     }
   });
 

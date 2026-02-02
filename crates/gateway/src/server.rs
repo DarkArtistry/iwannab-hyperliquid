@@ -22,6 +22,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::handlers::{handle_exchange, handle_info};
 use crate::rate_limit::{RateLimiter, RateLimitConfig};
+use crate::tx_router::TxRouter;
 use crate::validation::{ValidationConfig, Validator};
 use crate::websocket::{ws_handler, WsManager};
 
@@ -91,6 +92,7 @@ impl GatewayConfig {
 ///
 /// Phase 2B: Now includes chain components for proper transaction flow.
 /// Phase 6: Added validator for input validation.
+/// Phase 8: Added TxRouter for CometBFT multi-node support.
 #[derive(Clone)]
 pub struct AppState {
     /// Engine state for perpetual markets (read access for info queries)
@@ -103,10 +105,12 @@ pub struct AppState {
     pub chain_id: u64,
     /// Mempool for submitting transactions
     pub mempool: SharedMempool,
-    /// HyperCore application (for direct execution in development mode)
+    /// HyperCore application (for direct execution and info queries)
     pub app: Arc<RwLock<HyperCoreApp>>,
     /// Input validator
     pub validator: Arc<Validator>,
+    /// Transaction router (Direct for single-node, CometBft for multi-node)
+    pub tx_router: TxRouter,
 }
 
 /// Gateway server
@@ -119,6 +123,7 @@ pub struct GatewayServer {
     app: Arc<RwLock<HyperCoreApp>>,
     rate_limiter: RateLimiter,
     validator: Arc<Validator>,
+    tx_router: TxRouter,
 }
 
 impl GatewayServer {
@@ -132,6 +137,7 @@ impl GatewayServer {
     ) -> Self {
         let rate_limiter = RateLimiter::new(config.rate_limit.clone());
         let validator = Arc::new(Validator::new(config.validation.clone()));
+        let tx_router = TxRouter::Direct(Arc::clone(&app));
         Self {
             config,
             engine,
@@ -141,6 +147,35 @@ impl GatewayServer {
             app,
             rate_limiter,
             validator,
+            tx_router,
+        }
+    }
+
+    /// Create new gateway server with CometBFT transaction routing
+    ///
+    /// In CometBFT mode, transactions are broadcast to the local CometBFT node
+    /// instead of being executed directly. The engine/spot_engine are shared with
+    /// the CometBFT ABCI app so info queries return up-to-date state.
+    pub fn with_cometbft(
+        config: GatewayConfig,
+        engine: Arc<RwLock<EngineState>>,
+        spot_engine: Arc<RwLock<SpotEngine>>,
+        mempool: SharedMempool,
+        app: Arc<RwLock<HyperCoreApp>>,
+        tx_router: TxRouter,
+    ) -> Self {
+        let rate_limiter = RateLimiter::new(config.rate_limit.clone());
+        let validator = Arc::new(Validator::new(config.validation.clone()));
+        Self {
+            config,
+            engine,
+            spot_engine,
+            ws_manager: Arc::new(WsManager::new()),
+            mempool,
+            app,
+            rate_limiter,
+            validator,
+            tx_router,
         }
     }
 
@@ -155,6 +190,7 @@ impl GatewayServer {
         let app = Arc::new(RwLock::new(HyperCoreApp::new()));
         let rate_limiter = RateLimiter::new(config.rate_limit.clone());
         let validator = Arc::new(Validator::new(config.validation.clone()));
+        let tx_router = TxRouter::Direct(Arc::clone(&app));
 
         Self {
             config,
@@ -165,6 +201,7 @@ impl GatewayServer {
             app,
             rate_limiter,
             validator,
+            tx_router,
         }
     }
 
@@ -217,6 +254,7 @@ impl GatewayServer {
             mempool: self.mempool.clone(),
             app: Arc::clone(&self.app),
             validator: Arc::clone(&self.validator),
+            tx_router: self.tx_router.clone(),
         };
 
         // CORS configuration

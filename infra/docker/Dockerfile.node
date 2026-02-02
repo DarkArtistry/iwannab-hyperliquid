@@ -16,8 +16,8 @@ RUN apt-get update && apt-get install -y \
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
-# Build release binary
-RUN cargo build --release -p hypercore-node
+# Build release binary with CometBFT support for multi-node consensus
+RUN cargo build --release -p hypercore-node --features cometbft
 
 # Runtime stage
 FROM debian:bookworm-slim

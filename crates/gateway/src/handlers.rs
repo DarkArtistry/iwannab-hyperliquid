@@ -59,7 +59,7 @@ pub async fn handle_exchange(
         );
     }
 
-    match process_exchange_request(&state.engine, &state.spot_engine, &state.app, request).await {
+    match process_exchange_request(&state.engine, &state.spot_engine, &state.app, &state.tx_router, request).await {
         Ok(response) => (StatusCode::OK, Json(response)),
         Err(e) => (
             StatusCode::BAD_REQUEST,
@@ -93,11 +93,19 @@ async fn process_info_request(
         _ => {}
     }
 
+    // Get the perp engine reference for order/fill queries.
+    // The perp engine has its own EngineState with live orderbooks, positions, and fills
+    // from the matching engine. The gateway's EngineState only has market metadata.
+    let perp_engine_ref = {
+        let app_guard = app.read().await;
+        app_guard.state.perp_engine().cloned()
+    };
+
     let engine = engine.read().await;
 
     match request {
         InfoRequest::Meta => {
-            // Return exchange metadata
+            // Return exchange metadata - use gateway engine (has mark prices from price feed)
             let markets: Vec<_> = engine.get_all_markets().iter().map(|m| {
                 json!({
                     "name": m.config.symbol,
@@ -112,7 +120,21 @@ async fn process_info_request(
         }
 
         InfoRequest::AllMids => {
-            // Return mid prices for all markets
+            // Return mid prices - try perp engine's orderbook (has live orders)
+            if let Some(ref pe) = perp_engine_ref {
+                let perp = pe.read().await;
+                let mids: std::collections::HashMap<String, String> = perp.state
+                    .get_all_markets()
+                    .iter()
+                    .filter_map(|m| {
+                        perp.state.get_orderbook(m.config.id)
+                            .and_then(|book| book.mid_price())
+                            .map(|mid| (m.config.symbol.clone(), mid.to_string_trimmed()))
+                    })
+                    .collect();
+                return Ok(json!(mids));
+            }
+
             let mids: std::collections::HashMap<String, String> = engine
                 .get_all_markets()
                 .iter()
@@ -127,7 +149,29 @@ async fn process_info_request(
         }
 
         InfoRequest::L2Book { coin, n_sig_figs: _ } => {
-            // Find market by name
+            // Use perp engine's orderbook (has live orders from matching)
+            if let Some(ref pe) = perp_engine_ref {
+                let perp = pe.read().await;
+                let markets = perp.state.get_all_markets();
+                let market = markets.iter()
+                    .find(|m| m.config.symbol == coin)
+                    .ok_or(HandlerError::MarketNotFound(coin.clone()))?;
+                let market_id = market.config.id;
+
+                let book = perp.state.get_orderbook(market_id)
+                    .ok_or(HandlerError::MarketNotFound(coin))?;
+
+                let (bids, asks) = book.get_l2(20);
+
+                return Ok(json!({
+                    "levels": [
+                        bids.iter().map(|l| [l.price.to_string_trimmed(), l.size.to_string_trimmed()]).collect::<Vec<_>>(),
+                        asks.iter().map(|l| [l.price.to_string_trimmed(), l.size.to_string_trimmed()]).collect::<Vec<_>>(),
+                    ]
+                }));
+            }
+
+            // Fallback to gateway engine
             let markets = engine.get_all_markets();
             let market = markets.iter()
                 .find(|m| m.config.symbol == coin)
@@ -149,6 +193,33 @@ async fn process_info_request(
 
         InfoRequest::ClearinghouseState { user } => {
             let address = parse_address(&user)?;
+
+            // Try perp engine (has positions from matching)
+            if let Some(ref pe) = perp_engine_ref {
+                let perp = pe.read().await;
+                if let Some(account) = perp.state.get_account(address) {
+                    return Ok(json!({
+                        "marginSummary": {
+                            "accountValue": account.balance.to_string(),
+                            "totalNtlPos": "0",
+                            "totalRawUsd": account.balance.to_string(),
+                            "totalMarginUsed": "0",
+                            "withdrawable": account.balance.to_string(),
+                        },
+                        "crossMarginSummary": {},
+                        "crossMaintenanceMarginUsed": "0",
+                        "assetPositions": perp.state.get_all_positions(address).iter().map(|(market_id, pos)| {
+                            json!({
+                                "position": {
+                                    "asset": market_id,
+                                    "szi": pos.size.to_string_trimmed(),
+                                    "entryPx": pos.entry_price().map(|p| p.to_string_trimmed()).unwrap_or_default(),
+                                }
+                            })
+                        }).collect::<Vec<_>>(),
+                    }));
+                }
+            }
 
             if let Some(account) = engine.get_account(address) {
                 Ok(json!({
@@ -181,6 +252,24 @@ async fn process_info_request(
 
         InfoRequest::OpenOrders { user } => {
             let address = parse_address(&user)?;
+
+            // Use perp engine (has resting orders from matching)
+            if let Some(ref pe) = perp_engine_ref {
+                let perp = pe.read().await;
+                let orders = perp.state.get_all_user_orders(address);
+                let order_json: Vec<Value> = orders.iter().map(|o| json!({
+                    "coin": coin_name_from_market_id(o.market_id),
+                    "oid": o.id,
+                    "side": if o.side == hypercore_primitives::OrderSide::Buy { "B" } else { "A" },
+                    "limitPx": o.price.to_string_trimmed(),
+                    "sz": o.remaining_size.to_string_trimmed(),
+                    "origSz": o.original_size.to_string_trimmed(),
+                    "timestamp": o.timestamp,
+                    "cloid": o.client_order_id.clone(),
+                })).collect();
+                return Ok(json!(order_json));
+            }
+
             let orders = engine.get_all_user_orders(address);
             let order_json: Vec<Value> = orders.iter().map(|o| json!({
                 "coin": coin_name_from_market_id(o.market_id),
@@ -197,6 +286,23 @@ async fn process_info_request(
 
         InfoRequest::UserFills { user, .. } => {
             let address = parse_address(&user)?;
+
+            // Use perp engine (has recorded fills from matching)
+            if let Some(ref pe) = perp_engine_ref {
+                let perp = pe.read().await;
+                let fills = perp.state.get_user_fills(address, Some(100));
+                let fills_json: Vec<Value> = fills.iter().map(|f| json!({
+                    "coin": coin_name_from_market_id(f.market_id),
+                    "px": Decimal::from_raw(f.price as i128, 8).to_string_trimmed(),
+                    "sz": Decimal::from_raw(f.size as i128, 6).to_string_trimmed(),
+                    "side": if f.is_taker_buy { "B" } else { "A" },
+                    "time": f.timestamp,
+                    "fee": Decimal::from_raw(f.taker_fee as i128, 6).to_string_trimmed(),
+                    "oid": f.taker_order_id,
+                })).collect();
+                return Ok(json!(fills_json));
+            }
+
             let fills = engine.get_user_fills(address, Some(100));
             let fills_json: Vec<Value> = fills.iter().map(|f| json!({
                 "coin": coin_name_from_market_id(f.market_id),
@@ -236,6 +342,22 @@ async fn process_info_request(
 
         InfoRequest::RecentTrades { coin, .. } => {
             let market_id = market_id_from_coin(&coin);
+
+            // Use perp engine (has recorded trades from matching)
+            if let Some(ref pe) = perp_engine_ref {
+                let perp = pe.read().await;
+                let trades = perp.state.get_recent_trades(market_id, Some(50));
+                let trades_json: Vec<Value> = trades.iter().map(|t| json!({
+                    "coin": coin,
+                    "side": if t.is_taker_buy { "B" } else { "A" },
+                    "px": Decimal::from_raw(t.price as i128, 8).to_string_trimmed(),
+                    "sz": Decimal::from_raw(t.size as i128, 6).to_string_trimmed(),
+                    "time": t.timestamp,
+                    "tid": t.taker_order_id,
+                })).collect();
+                return Ok(json!(trades_json));
+            }
+
             let trades = engine.get_recent_trades(market_id, Some(50));
             let trades_json: Vec<Value> = trades.iter().map(|t| json!({
                 "coin": coin,
@@ -450,8 +572,10 @@ async fn process_spot_info_request(
             let unified_state = engine.state.unified_state();
             let unified = unified_state.read().unwrap();
 
-            // Get all balances for this user and convert to response format
-            let balances: Vec<_> = unified.get_all_balances(address)
+            // Get all balances for this user, sorted by token index for deterministic ordering
+            let mut user_balances = unified.get_all_balances(address);
+            user_balances.sort_by_key(|(token_index, _)| *token_index);
+            let balances: Vec<_> = user_balances
                 .iter()
                 .filter_map(|(token_index, unified_balance)| {
                     let token = engine.state.get_token(*token_index)?;
@@ -573,10 +697,13 @@ async fn process_state_proof_request(
 ///
 /// Phase 2B: Perp transactions are now routed through the ABCI app layer
 /// for proper transaction processing with state commitment.
+/// Phase 8: In CometBFT mode, transactions are broadcast to CometBFT instead
+/// of being executed directly, enabling multi-node consensus.
 async fn process_exchange_request(
     _engine: &Arc<RwLock<EngineState>>,
     spot_engine: &Arc<RwLock<SpotEngine>>,
     app: &Arc<RwLock<HyperCoreApp>>,
+    tx_router: &crate::tx_router::TxRouter,
     request: ExchangeRequest,
 ) -> Result<Value, HandlerError> {
     // Verify signature and extract sender address
@@ -593,14 +720,21 @@ async fn process_exchange_request(
         _ => {}
     }
 
-    // Route perp transactions through ABCI app layer
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-
-    // Execute all perp transactions through ABCI app layer (no fallback)
-    execute_perp_action_via_app(app, sender, &request, timestamp).await
+    // Route perp transactions based on consensus mode
+    match tx_router {
+        crate::tx_router::TxRouter::Direct(_) => {
+            // Single-node mode: execute directly through app
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            execute_perp_action_via_app(app, sender, &request, timestamp).await
+        }
+        crate::tx_router::TxRouter::CometBft(rpc_client) => {
+            // Multi-node mode: broadcast to CometBFT for consensus ordering
+            broadcast_perp_action_via_cometbft(rpc_client, sender, &request).await
+        }
+    }
 }
 
 /// Execute perp action through the ABCI app layer
@@ -686,6 +820,9 @@ async fn execute_perp_action_via_app(
     let mut app_guard = app.write().await;
     match app_guard.execute_tx(&tx, timestamp) {
         Ok(result) => {
+            // Extract order statuses from events for Hyperliquid-compatible response
+            let statuses = extract_order_statuses(&result.events);
+
             // Convert result to JSON response
             Ok(json!({
                 "status": "ok",
@@ -693,6 +830,7 @@ async fn execute_perp_action_via_app(
                     "type": format_action_type(&request.action),
                     "data": {
                         "success": result.success,
+                        "statuses": statuses,
                         "events": result.events.iter().map(|e| json!({
                             "type": e.r#type.clone(),
                             "attributes": e.attributes.clone()
@@ -703,6 +841,119 @@ async fn execute_perp_action_via_app(
             }))
         }
         Err(e) => Err(HandlerError::Internal(format!("Transaction failed: {}", e)))
+    }
+}
+
+/// Broadcast a perp action to CometBFT for consensus ordering
+///
+/// In multi-node mode, transactions are serialized and broadcast to the local
+/// CometBFT node via JSON-RPC. CometBFT handles mempool validation, gossip to
+/// other validators, consensus ordering, and execution via FinalizeBlock.
+async fn broadcast_perp_action_via_cometbft(
+    rpc_client: &crate::tx_router::CometBftRpcClient,
+    sender: AccountAddress,
+    request: &ExchangeRequest,
+) -> Result<Value, HandlerError> {
+    use hypercore_chain::tx::{Transaction, TransactionType, OrderWire, CancelWire, CancelByCloidWire};
+    use alloy_primitives::B256;
+
+    // Convert ExchangeAction to TransactionType (same as direct mode)
+    let tx_type = match &request.action {
+        ExchangeAction::Order { orders, grouping } => {
+            let order_wires: Vec<OrderWire> = orders.iter().map(|o| OrderWire {
+                a: o.a,
+                b: o.b,
+                p: o.p.clone(),
+                s: o.s.clone(),
+                r: o.r,
+                t: convert_order_type_wire(&o.t),
+                c: o.c.clone(),
+            }).collect();
+            let order_grouping = match grouping.to_lowercase().as_str() {
+                "normalTpsl" | "normaltpsl" => hypercore_chain::tx::OrderGrouping::NormalTpsl,
+                "positionTpsl" | "positiontpsl" => hypercore_chain::tx::OrderGrouping::PositionTpsl,
+                _ => hypercore_chain::tx::OrderGrouping::Na,
+            };
+            TransactionType::Order { orders: order_wires, grouping: order_grouping }
+        }
+        ExchangeAction::Cancel { cancels } => {
+            let cancel_wires: Vec<CancelWire> = cancels.iter().map(|c| CancelWire {
+                a: c.a,
+                o: c.o,
+            }).collect();
+            TransactionType::Cancel { cancels: cancel_wires }
+        }
+        ExchangeAction::CancelByCloid { cancels } => {
+            let cancel_wires: Vec<CancelByCloidWire> = cancels.iter().map(|c| CancelByCloidWire {
+                asset: c.asset,
+                cloid: c.cloid.clone(),
+            }).collect();
+            TransactionType::CancelByCloid { cancels: cancel_wires }
+        }
+        ExchangeAction::CancelAll => TransactionType::CancelAll,
+        ExchangeAction::UsdTransfer { destination, amount } => {
+            let dest = parse_address(destination)?;
+            TransactionType::UsdTransfer { destination: dest, amount: amount.clone() }
+        }
+        ExchangeAction::Withdraw { destination, amount } => {
+            let dest = parse_address(destination)?;
+            TransactionType::Withdraw { destination: dest, amount: amount.clone() }
+        }
+        ExchangeAction::UpdateLeverage { asset, is_cross, leverage } => {
+            TransactionType::UpdateLeverage { asset: *asset, is_cross: *is_cross, leverage: *leverage }
+        }
+        _ => return Err(HandlerError::Internal("Unsupported action type".to_string())),
+    };
+
+    // Create transaction with signature
+    let sig_wire = &request.signature;
+    let r_bytes = hex::decode(sig_wire.r.strip_prefix("0x").unwrap_or(&sig_wire.r))
+        .map_err(|_| HandlerError::InvalidSignature)?;
+    let s_bytes = hex::decode(sig_wire.s.strip_prefix("0x").unwrap_or(&sig_wire.s))
+        .map_err(|_| HandlerError::InvalidSignature)?;
+
+    let signature = Signature::new(
+        B256::from_slice(&r_bytes.get(..32).unwrap_or(&[0u8; 32])),
+        B256::from_slice(&s_bytes.get(..32).unwrap_or(&[0u8; 32])),
+        sig_wire.v,
+    );
+
+    let tx = Transaction {
+        action: tx_type,
+        nonce: request.nonce,
+        signature,
+        hash: None,
+    };
+
+    // Serialize transaction to JSON bytes for CometBFT
+    let tx_bytes = serde_json::to_vec(&tx)
+        .map_err(|e| HandlerError::Internal(format!("Failed to serialize transaction: {}", e)))?;
+
+    // Broadcast to CometBFT
+    match rpc_client.broadcast_tx_sync(&tx_bytes).await {
+        Ok(result) => {
+            Ok(json!({
+                "status": "ok",
+                "response": {
+                    "type": format_action_type(&request.action),
+                    "data": {
+                        "submitted": true,
+                        "hash": result.hash,
+                        "log": result.log
+                    }
+                }
+            }))
+        }
+        Err(crate::tx_router::TxRouterError::TxRejected { code, log }) => {
+            Err(HandlerError::Internal(format!(
+                "Transaction rejected by consensus: code={}, log={}", code, log
+            )))
+        }
+        Err(e) => {
+            Err(HandlerError::Internal(format!(
+                "Failed to broadcast transaction: {}", e
+            )))
+        }
     }
 }
 
@@ -718,6 +969,49 @@ fn format_action_type(action: &ExchangeAction) -> &'static str {
         ExchangeAction::UpdateLeverage { .. } => "updateLeverage",
         _ => "unknown",
     }
+}
+
+/// Extract order statuses from ABCI events for Hyperliquid-compatible response.
+/// Parses `perp_order`, `perp_order_failed`, `spot_order`, `spot_order_failed` events
+/// and converts them to `{ resting: { oid } }`, `{ filled: { oid, totalSz } }`, or `{ error }`.
+fn extract_order_statuses(events: &[hypercore_chain::app::Event]) -> Vec<Value> {
+    let mut statuses = Vec::new();
+
+    for event in events {
+        let get_attr = |key: &str| -> Option<String> {
+            event.attributes.iter().find(|a| a.key == key).map(|a| a.value.clone())
+        };
+
+        match event.r#type.as_str() {
+            "perp_order" | "spot_order" => {
+                let oid = get_attr("order_id").and_then(|v| v.parse::<u64>().ok());
+                let fills_count = get_attr("fills").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+                let remaining = get_attr("remaining").unwrap_or_default();
+
+                if fills_count > 0 && (remaining == "0" || remaining.is_empty()) {
+                    // Fully filled
+                    statuses.push(json!({ "filled": { "oid": oid, "totalSz": get_attr("size").unwrap_or_default() } }));
+                } else if fills_count > 0 {
+                    // Partially filled, resting remainder
+                    statuses.push(json!({ "resting": { "oid": oid } }));
+                } else {
+                    // Resting (no fills)
+                    statuses.push(json!({ "resting": { "oid": oid } }));
+                }
+            }
+            "perp_order_failed" | "spot_order_failed" => {
+                let error = get_attr("error").unwrap_or_else(|| "Order failed".to_string());
+                statuses.push(json!({ "error": error }));
+            }
+            "perp_order_skipped" => {
+                let reason = get_attr("reason").unwrap_or_else(|| "skipped".to_string());
+                statuses.push(json!({ "error": format!("Order skipped: {}", reason) }));
+            }
+            _ => {} // Ignore fill events, cancel events, etc.
+        }
+    }
+
+    statuses
 }
 
 /// Convert API order type wire to chain order type wire

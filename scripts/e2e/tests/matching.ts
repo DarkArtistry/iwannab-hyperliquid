@@ -48,9 +48,15 @@ export async function runMatchingTests(ctx: TestContext): Promise<void> {
       grouping: 'na',
     };
     const { signature: sellSig, nonce: sellNonce } = await signAction(sellAction, TEST_ACCOUNTS.BOB.privateKey);
-    const result = await exchangeRequest(sellAction, sellSig, sellNonce);
+    await exchangeRequest(sellAction, sellSig, sellNonce);
 
-    logProgress('Orders matched (check fills for confirmation)');
+    // Verify fills occurred
+    await sleep(500);
+    const fills = (await infoRequest('userFills', { user: TEST_ACCOUNTS.ALICE.address })) as Array<{ px: string; sz: string }>;
+    if (fills.length === 0) {
+      throw new Error('No fills found after matching buy and sell at $65,000');
+    }
+    logProgress(`Matched: ${fills.length} fill(s), price=${fills[0].px}, size=${fills[0].sz}`);
   });
 
   await runTest(ctx, 'Match with price improvement', 'matching', 'Buy order at higher price should match sell at lower price', async () => {
@@ -76,7 +82,13 @@ export async function runMatchingTests(ctx: TestContext): Promise<void> {
     const { signature: sellSig, nonce: sellNonce } = await signAction(sellAction, TEST_ACCOUNTS.BOB.privateKey);
     await exchangeRequest(sellAction, sellSig, sellNonce);
 
-    logProgress('Price improvement matching complete');
+    // Verify fills occurred
+    await sleep(500);
+    const fills = (await infoRequest('userFills', { user: TEST_ACCOUNTS.ALICE.address })) as Array<{ px: string; sz: string }>;
+    if (fills.length < 2) {
+      throw new Error(`Expected at least 2 fills (basic + price improvement), got ${fills.length}`);
+    }
+    logProgress(`Price improvement fill at price=${fills[0].px}`);
   });
 
   await runTest(ctx, 'Partial fill test', 'matching', 'Large order should partially fill against smaller order', async () => {
@@ -102,7 +114,14 @@ export async function runMatchingTests(ctx: TestContext): Promise<void> {
     const { signature: buySig, nonce: buyNonce } = await signAction(buyAction, TEST_ACCOUNTS.BOB.privateKey);
     await exchangeRequest(buyAction, buySig, buyNonce);
 
-    logProgress('Partial fill executed, remainder resting');
+    // Verify partial fill: Bob's larger order should have a resting remainder
+    await sleep(500);
+    const bobOrders = (await infoRequest('openOrders', { user: TEST_ACCOUNTS.BOB.address })) as Array<{ sz: string; side: string }>;
+    const bobFills = (await infoRequest('userFills', { user: TEST_ACCOUNTS.BOB.address })) as Array<{ px: string; sz: string }>;
+    if (bobFills.length === 0) {
+      throw new Error('No fills found for Bob after partial fill test');
+    }
+    logProgress(`Partial fill: Bob has ${bobFills.length} fill(s) and ${bobOrders.length} resting order(s)`);
   });
 
   // Clean up orders after matching tests

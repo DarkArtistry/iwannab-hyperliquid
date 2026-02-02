@@ -1,5 +1,7 @@
 # HyperCore Makefile
-.PHONY: all build test clean devnet devnet-down seed fmt lint docs
+.PHONY: all build test clean devnet devnet-down seed fmt lint docs \
+	test-multinode test-multinode-keep test-multinode-full \
+	test-all all-tests docker-build-node
 
 # Default target
 all: build
@@ -17,25 +19,30 @@ build-engine:
 	cargo build -p hypercore-engine --release
 
 build-node:
-	cargo build -p hypercore-node --release
+	cargo build -p hypercore-node --release --features cometbft
 
 # Build contracts
 build-contracts:
 	cd contracts && forge build
 
+# Build the node Docker image (used by all compose files)
+docker-build-node:
+	@echo "Building hypercore-node Docker image..."
+	docker build -f infra/docker/Dockerfile.node -t hypercore-node .
+
 # ============ Test ============
 
 test:
-	cargo test --workspace
+	cargo test --workspace --features cometbft
 
 test-verbose:
-	cargo test --workspace -- --nocapture
+	cargo test --workspace --features cometbft -- --nocapture
 
 test-engine:
 	cargo test -p hypercore-engine
 
 test-chain:
-	cargo test -p hypercore-chain
+	cargo test -p hypercore-chain --features cometbft
 
 test-gateway:
 	cargo test -p hypercore-gateway
@@ -59,45 +66,63 @@ test-quick:
 	@echo "  Quick Tests (Rust + Solidity - No Docker)"
 	@echo "=========================================="
 	@echo ""
-	@echo ">>> [1/2] Rust Unit Tests (379 tests)"
+	@echo ">>> [1/2] Rust Unit Tests (550+ tests)"
 	@echo "------------------------------------------"
-	@cargo test --workspace 2>&1 | tail -30
+	@cargo test --workspace --features cometbft 2>&1 | tail -30
 	@echo ""
 	@echo ">>> [2/2] Solidity Contract Tests (49 tests)"
 	@echo "------------------------------------------"
 	@cd contracts && forge test --summary
 	@echo ""
 	@echo "=========================================="
-	@echo "  QUICK TESTS COMPLETE (428 tests)"
+	@echo "  QUICK TESTS COMPLETE (600+ tests)"
 	@echo "=========================================="
 
-# Run ALL tests (Rust + Solidity + E2E) verbosely
+# Run ALL tests (Rust + Solidity + E2E + Multi-Node)
+# Builds Docker image ONCE, then reuses it for all E2E/multinode tests.
 test-all:
 	@echo "=========================================="
-	@echo "  Running ALL Tests (Rust + Solidity + E2E)"
+	@echo "  Running ALL Tests"
 	@echo "=========================================="
 	@echo ""
 	@echo "Test Suite Breakdown:"
-	@echo "  - Rust Unit Tests:      379 tests"
-	@echo "  - Solidity Contracts:    49 tests"
-	@echo "  - E2E Integration:      135 tests"
-	@echo "  - Total:                563+ tests"
+	@echo "  - Rust Unit Tests:          550+ tests"
+	@echo "  - Solidity Contracts:        49 tests"
+	@echo "  - E2E Integration:          144 tests"
+	@echo "  - Multi-Node E2E (3-node):    6 tests"
+	@echo "  - Multi-Node Full (5-node):  29 tests"
+	@echo "  - Total:                    780+ tests"
 	@echo ""
-	@echo ">>> [1/3] Rust Unit Tests (cargo test)"
+	@echo ">>> [1/6] Rust Unit Tests (cargo test)"
 	@echo "------------------------------------------"
-	cargo test --workspace -- --nocapture
+	cargo test --workspace --features cometbft -- --nocapture
 	@echo ""
-	@echo ">>> [2/3] Solidity Contract Tests (forge test)"
+	@echo ">>> [2/6] Solidity Contract Tests (forge test)"
 	@echo "------------------------------------------"
 	cd contracts && forge test -vvv
 	@echo ""
-	@echo ">>> [3/3] E2E Integration Tests"
+	@echo ">>> [3/6] Building Docker Image (one-time build)"
+	@echo "------------------------------------------"
+	docker build -f infra/docker/Dockerfile.node -t hypercore-node .
+	@echo ""
+	@echo ">>> [4/6] E2E Integration Tests (single-node)"
 	@echo "------------------------------------------"
 	./scripts/e2e-test.sh --verbose
 	@echo ""
+	@echo ">>> [5/6] Multi-Validator E2E Tests (3-node cluster)"
+	@echo "------------------------------------------"
+	./scripts/e2e-multinode.sh --verbose --no-build
+	@echo ""
+	@echo ">>> [6/6] Comprehensive 5-Validator E2E Tests"
+	@echo "------------------------------------------"
+	./scripts/e2e-multinode-full.sh --verbose --no-build
+	@echo ""
 	@echo "=========================================="
-	@echo "  ALL TESTS COMPLETE (563+ tests)"
+	@echo "  ALL TESTS COMPLETE (780+ tests)"
 	@echo "=========================================="
+
+# Alias for test-all
+all-tests: test-all
 
 # Run E2E tests only (requires Docker)
 test-e2e:
@@ -106,6 +131,18 @@ test-e2e:
 # Run E2E tests with existing services (no Docker restart)
 test-e2e-quick:
 	./scripts/e2e-test.sh --no-docker --verbose
+
+# Run multi-validator E2E tests (requires Docker)
+test-multinode:
+	./scripts/e2e-multinode.sh --verbose
+
+# Run multi-validator tests and keep cluster running
+test-multinode-keep:
+	./scripts/e2e-multinode.sh --keep --verbose
+
+# Run comprehensive 5-validator multi-node E2E tests (requires Docker)
+test-multinode-full:
+	./scripts/e2e-multinode-full.sh --verbose
 
 # SDK Integration tests (requires services running)
 test-sdk:
@@ -230,27 +267,35 @@ help:
 	@echo "Build:"
 	@echo "  make build           - Build all crates (release)"
 	@echo "  make build-debug     - Build all crates (debug)"
+	@echo "  make build-node      - Build node with CometBFT support"
 	@echo "  make build-contracts - Build Solidity contracts"
 	@echo ""
-	@echo "Test (563+ total tests):"
-	@echo "  make test             - Run Rust unit tests (379 tests)"
-	@echo "  make test-quick       - Run Rust + Solidity (428 tests, no Docker)"
-	@echo "  make test-all         - Run ALL tests (Rust + Solidity + E2E)"
-	@echo "  make test-engine      - Run engine tests only"
-	@echo "  make test-chain       - Run chain/consensus tests only"
-	@echo "  make test-gateway     - Run gateway tests only (81 tests)"
-	@echo "  make test-primitives  - Run primitives tests only"
-	@echo "  make test-persistence - Run persistence tests (51 tests)"
-	@echo "  make test-contracts   - Run Solidity tests (49 tests)"
-	@echo "  make test-e2e         - Run E2E integration tests (135 tests)"
-	@echo "  make test-e2e-quick   - Run E2E with existing services"
-	@echo "  make test-sdk         - Run SDK integration tests"
+	@echo "Test (780+ total tests):"
+	@echo "  make test              - Run Rust unit tests (550+ tests, includes cometbft)"
+	@echo "  make test-quick        - Run Rust + Solidity (600+ tests, no Docker)"
+	@echo "  make test-all          - Run ALL tests (780+ tests, requires Docker)"
+	@echo "  make all-tests         - Alias for test-all"
+	@echo "  make test-engine       - Run engine tests only (105 tests)"
+	@echo "  make test-chain        - Run chain/consensus tests only (213+ tests)"
+	@echo "  make test-gateway      - Run gateway tests only (84 tests)"
+	@echo "  make test-primitives   - Run primitives tests only (59 tests)"
+	@echo "  make test-persistence  - Run persistence tests (51 tests)"
+	@echo "  make test-contracts    - Run Solidity tests (49 tests)"
+	@echo "  make test-e2e          - Run E2E integration tests (144 tests)"
+	@echo "  make test-e2e-quick    - Run E2E with existing services"
+	@echo "  make test-multinode    - Run 3-node multi-validator E2E (6 tests)"
+	@echo "  make test-multinode-full - Run 5-node comprehensive E2E (29 tests)"
+	@echo "  make test-sdk          - Run SDK integration tests"
 	@echo "  make test-export-import - Run export/import CLI tests"
 	@echo ""
 	@echo "Devnet:"
 	@echo "  make devnet          - Start local development network"
 	@echo "  make devnet-down     - Stop devnet"
 	@echo "  make devnet-logs     - View devnet logs"
+	@echo ""
+	@echo "Docker:"
+	@echo "  make docker-build-node - Build node Docker image"
+	@echo "  make docker-build      - Build all Docker images"
 	@echo ""
 	@echo "Other:"
 	@echo "  make fmt             - Format code"

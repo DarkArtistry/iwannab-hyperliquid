@@ -18,6 +18,36 @@ use tokio::sync::RwLock;
 use crate::state::{AppState, BlockMeta, SharedEngine, SharedEngineState, SharedSpotEngine};
 use crate::tx::{OrderWire, Transaction, TransactionType};
 
+/// Acquire a write lock on a tokio RwLock with retry.
+///
+/// In CometBFT mode, `FinalizeBlock` runs on a `spawn_blocking` thread.
+/// `try_write()` can fail if a gateway info handler concurrently holds a read lock.
+/// This helper spins briefly then sleeps 1ms per attempt for up to 100 attempts (~90ms max),
+/// which is sufficient for any gateway read to complete.
+///
+/// Safe in both async (BlockProducer - lock is uncontested) and sync (ABCI - retries
+/// until gateway read finishes) contexts.
+fn acquire_write_with_retry<'a, T>(lock: &'a RwLock<T>, label: &str) -> Result<tokio::sync::RwLockWriteGuard<'a, T>, AppError> {
+    // First try without sleeping (covers the uncontested case)
+    if let Ok(guard) = lock.try_write() {
+        return Ok(guard);
+    }
+
+    // Retry with short sleeps - gateway reads finish quickly
+    for attempt in 1..=100 {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        if let Ok(guard) = lock.try_write() {
+            if attempt > 5 {
+                tracing::debug!("{}: acquired write lock after {} retries", label, attempt);
+            }
+            return Ok(guard);
+        }
+    }
+
+    tracing::error!("{}: failed to acquire write lock after 100 retries", label);
+    Err(AppError::Internal(format!("{} lock contention (100 retries exhausted)", label)))
+}
+
 /// HyperCore application
 pub struct HyperCoreApp {
     /// Application state
@@ -72,7 +102,7 @@ impl HyperCoreApp {
 
         // 1. Initialize perpetual markets
         if !genesis.markets.is_empty() {
-            let mut engine = self.state.engine.blocking_write();
+            let mut engine = acquire_write_with_retry(&self.state.engine, "Engine (genesis init)")?;
             for market in &genesis.markets {
                 let m: hypercore_primitives::Market = market.clone().into();
                 engine.add_market(m);
@@ -86,7 +116,7 @@ impl HyperCoreApp {
         // For CometBFT mode, tokens are initialized here if spot_engine is available
         if !genesis.spot_tokens.is_empty() {
             if let Some(ref spot_engine) = self.state.spot_engine {
-                let mut engine = spot_engine.blocking_write();
+                let mut engine = acquire_write_with_retry(spot_engine, "Spot engine (genesis init)")?;
                 let deployer = AccountAddress::from([0u8; 20]); // System deployer
                 // Use genesis timestamp (0) for deterministic genesis state
                 // CRITICAL: Do not use SystemTime::now() - it breaks consensus determinism
@@ -289,7 +319,7 @@ impl HyperCoreApp {
                     .map_err(|e| AppError::TxError(e))?;
 
                 let result = if let Some(spot_engine) = &self.state.spot_engine {
-                    let mut engine = spot_engine.blocking_write();
+                    let mut engine = acquire_write_with_retry(spot_engine, "Spot engine (place_order)")?;
                     engine.place_order(sender, market_id, order_request, timestamp)
                 } else {
                     continue;
@@ -382,7 +412,7 @@ impl HyperCoreApp {
                     .map_err(|e| AppError::TxError(e))?;
 
                 let result = if let Some(perp_engine) = &self.state.perp_engine {
-                    let mut engine = perp_engine.blocking_write();
+                    let mut engine = acquire_write_with_retry(perp_engine, "Perp engine (place_order)")?;
                     Some(engine.place_order(sender, order_request, timestamp))
                 } else {
                     None
@@ -512,7 +542,7 @@ impl HyperCoreApp {
             if market_id >= 128 {
                 // Spot cancel - get result then process
                 let result = if let Some(spot_engine) = &self.state.spot_engine {
-                    let mut engine = spot_engine.blocking_write();
+                    let mut engine = acquire_write_with_retry(spot_engine, "Spot engine (cancel_order)")?;
                     engine.cancel_order(sender, market_id, order_id)
                 } else {
                     continue;
@@ -537,7 +567,7 @@ impl HyperCoreApp {
             } else {
                 // Perp cancel - get result then process
                 let result = if let Some(perp_engine) = &self.state.perp_engine {
-                    let mut engine = perp_engine.blocking_write();
+                    let mut engine = acquire_write_with_retry(perp_engine, "Perp engine (cancel_order)")?;
                     Some(engine.cancel_order(sender, market_id, order_id))
                 } else {
                     None
@@ -601,7 +631,7 @@ impl HyperCoreApp {
                 if market_id >= 128 {
                     // Spot cancel
                     let result = if let Some(spot_engine) = &self.state.spot_engine {
-                        let mut engine = spot_engine.blocking_write();
+                        let mut engine = acquire_write_with_retry(spot_engine, "Spot engine (cancel_by_cloid)")?;
                         engine.cancel_order(sender, market_id, order_id)
                     } else {
                         continue;
@@ -624,7 +654,7 @@ impl HyperCoreApp {
                 } else {
                     // Perp cancel
                     let result = if let Some(perp_engine) = &self.state.perp_engine {
-                        let mut engine = perp_engine.blocking_write();
+                        let mut engine = acquire_write_with_retry(perp_engine, "Perp engine (cancel_by_cloid)")?;
                         engine.cancel_order(sender, market_id, order_id)
                     } else {
                         continue;
@@ -672,8 +702,7 @@ impl HyperCoreApp {
 
         // Cancel all spot orders (iterate over spot markets: 128-255)
         if let Some(spot_engine) = &self.state.spot_engine {
-            let mut engine = spot_engine.try_write()
-                .map_err(|_| AppError::Internal("Spot engine lock contention".to_string()))?;
+            let mut engine = acquire_write_with_retry(spot_engine, "Spot engine (cancel_all)")?;
             let markets: Vec<_> = engine.state.get_all_markets().iter().map(|m| m.config.id).collect();
             for market_id in markets {
                 if let Ok(canceled) = engine.cancel_all_orders(sender, market_id) {
@@ -689,8 +718,7 @@ impl HyperCoreApp {
 
         // Cancel all perp orders
         if let Some(perp_engine) = &self.state.perp_engine {
-            let mut engine = perp_engine.try_write()
-                .map_err(|_| AppError::Internal("Perp engine lock contention".to_string()))?;
+            let mut engine = acquire_write_with_retry(perp_engine, "Perp engine (cancel_all)")?;
             // Get all perpetual markets (0-127)
             let markets: Vec<_> = engine.state.get_all_markets().iter().map(|m| m.id()).collect();
             for market_id in markets {
@@ -727,8 +755,7 @@ impl HyperCoreApp {
     ) -> Result<Vec<Event>, AppError> {
         // Use full Engine for validation and state update
         if let Some(perp_engine) = &self.state.perp_engine {
-            let mut engine = perp_engine.try_write()
-                .map_err(|_| AppError::Internal("Perp engine lock contention".to_string()))?;
+            let mut engine = acquire_write_with_retry(perp_engine, "Perp engine (update_leverage)")?;
             match engine.update_leverage(sender, asset, leverage) {
                 Ok(()) => {
                     Ok(vec![Event::new("update_leverage")
@@ -741,8 +768,7 @@ impl HyperCoreApp {
             }
         } else {
             // Fallback to EngineState for legacy compatibility
-            let mut engine = self.state.engine.try_write()
-                .map_err(|_| AppError::Internal("Engine lock contention".to_string()))?;
+            let mut engine = acquire_write_with_retry(&self.state.engine, "Engine (update_leverage fallback)")?;
             engine.set_leverage(sender, asset, leverage);
             Ok(vec![Event::new("update_leverage")
                 .add_attribute("asset", &asset.to_string())
@@ -931,17 +957,21 @@ impl HyperCoreApp {
 
         // Process funding rates
         if let Some(perp_engine) = &self.state.perp_engine {
-            let mut engine = perp_engine.blocking_write();
+            let mut engine = acquire_write_with_retry(perp_engine, "Perp engine (end_block funding)")
+                .expect("perp_engine write lock should be acquirable during end_block");
             let funding_rates = engine.process_funding(self.state.timestamp);
             drop(engine); // Release write lock before acquiring read lock on engine state
 
             for (market_id, rate) in &funding_rates {
                 // Get market state for mark/index prices from EngineState
-                let engine_state = self.state.engine.blocking_read();
-                let (mark_price, index_price) = engine_state.get_market_state(*market_id)
-                    .map(|s| (s.mark_price, s.index_price))
-                    .unwrap_or((Decimal::ZERO, Decimal::ZERO));
-                drop(engine_state);
+                let (mark_price, index_price) = if let Ok(engine_state) = self.state.engine.try_read() {
+                    let result = engine_state.get_market_state(*market_id)
+                        .map(|s| (s.mark_price, s.index_price))
+                        .unwrap_or((Decimal::ZERO, Decimal::ZERO));
+                    result
+                } else {
+                    (Decimal::ZERO, Decimal::ZERO)
+                };
 
                 let event = BlockEvent::FundingApplied(FundingAppliedEvent {
                     market_id: *market_id,
@@ -961,17 +991,20 @@ impl HyperCoreApp {
 
         // Process liquidations
         if let Some(perp_engine) = &self.state.perp_engine {
-            let mut engine = perp_engine.blocking_write();
+            let mut engine = acquire_write_with_retry(perp_engine, "Perp engine (end_block liquidations)")
+                .expect("perp_engine write lock should be acquirable during end_block");
             let liquidations = engine.process_liquidations(self.state.timestamp);
             drop(engine); // Release write lock
 
             for (account, market_id, size) in &liquidations {
                 // Get mark price for liquidation price from EngineState
-                let engine_state = self.state.engine.blocking_read();
-                let price = engine_state.get_market_state(*market_id)
-                    .map(|s| s.mark_price)
-                    .unwrap_or(Decimal::ZERO);
-                drop(engine_state);
+                let price = if let Ok(engine_state) = self.state.engine.try_read() {
+                    engine_state.get_market_state(*market_id)
+                        .map(|s| s.mark_price)
+                        .unwrap_or(Decimal::ZERO)
+                } else {
+                    Decimal::ZERO
+                };
 
                 let event = BlockEvent::Liquidation(LiquidationEvent {
                     account: *account,
@@ -1006,21 +1039,23 @@ impl HyperCoreApp {
         });
 
         // Also store block metadata to shared EngineState (for indexer access)
-        // Use try_write to avoid blocking in async contexts
         {
             use hypercore_engine::BlockMetadata;
-            if let Ok(mut engine) = self.state.engine.try_write() {
-                engine.store_block_metadata(
-                    self.state.height,
-                    BlockMetadata {
-                        hash: app_hash,
-                        timestamp: self.state.timestamp,
-                        tx_count,
-                        events,
-                    },
-                );
-            } else {
-                tracing::warn!("Could not acquire engine write lock for block metadata storage");
+            match acquire_write_with_retry(&self.state.engine, "Engine (block metadata)") {
+                Ok(mut engine) => {
+                    engine.store_block_metadata(
+                        self.state.height,
+                        BlockMetadata {
+                            hash: app_hash,
+                            timestamp: self.state.timestamp,
+                            tx_count,
+                            events,
+                        },
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("Could not acquire engine write lock for block metadata storage: {}", e);
+                }
             }
         }
 
@@ -1152,8 +1187,8 @@ impl HyperCoreApp {
         addr_bytes.copy_from_slice(data);
         let address = AccountAddress::from(addr_bytes);
 
-        // Use blocking read for sync context
-        let engine = self.state.engine.blocking_read();
+        let engine = self.state.engine.try_read()
+            .map_err(|_| AppError::QueryError("Engine lock contention".to_string()))?;
         if let Some(account) = engine.get_account(address) {
             serde_json::to_vec(account)
                 .map_err(|e| AppError::QueryError(e.to_string()))
@@ -1172,7 +1207,8 @@ impl HyperCoreApp {
         let address = AccountAddress::from(addr_bytes);
         let market_id = data[20];
 
-        let engine = self.state.engine.blocking_read();
+        let engine = self.state.engine.try_read()
+            .map_err(|_| AppError::QueryError("Engine lock contention".to_string()))?;
         if let Some(position) = engine.get_position(address, market_id) {
             serde_json::to_vec(position)
                 .map_err(|e| AppError::QueryError(e.to_string()))
@@ -1188,7 +1224,8 @@ impl HyperCoreApp {
         }
         let market_id = data[0];
 
-        let engine = self.state.engine.blocking_read();
+        let engine = self.state.engine.try_read()
+            .map_err(|_| AppError::QueryError("Engine lock contention".to_string()))?;
         if let Some(orderbook) = engine.get_orderbook(market_id) {
             let snapshot = orderbook.get_l2_snapshot(50);
             serde_json::to_vec(&snapshot)
@@ -1322,8 +1359,11 @@ pub struct GenesisSpotToken {
     #[serde(default = "default_sz_decimals")]
     pub sz_decimals: u8,
     /// Max supply as decimal string
+    #[serde(default = "default_max_supply")]
     pub max_supply: String,
 }
+
+fn default_max_supply() -> String { "1000000000".to_string() }
 
 fn default_wei_decimals() -> u8 { 18 }
 fn default_sz_decimals() -> u8 { 4 }
@@ -1334,6 +1374,7 @@ pub struct GenesisMarket {
     pub id: MarketId,
     pub symbol: String,
     pub max_leverage: u8,
+    #[serde(alias = "initial_price")]
     pub initial_mark_price: String,
 }
 

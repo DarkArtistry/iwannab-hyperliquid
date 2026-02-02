@@ -29,6 +29,9 @@ jsonrpsee = { workspace = true }
 sha3 = { workspace = true }
 k256 = { workspace = true }
 
+# HTTP client (for CometBFT RPC broadcast in multi-node mode)
+reqwest = { workspace = true }
+
 # Error handling
 thiserror = { workspace = true }
 anyhow = { workspace = true }
