@@ -715,7 +715,14 @@ async fn process_exchange_request(
         | ExchangeAction::SpotCancel { .. }
         | ExchangeAction::SpotCancelAll { .. }
         | ExchangeAction::ViewTransfer { .. } => {
-            return process_spot_exchange_request(spot_engine, sender, request).await;
+            match tx_router {
+                crate::tx_router::TxRouter::Direct(_) => {
+                    return process_spot_exchange_request(spot_engine, sender, request).await;
+                }
+                crate::tx_router::TxRouter::CometBft(rpc_client) => {
+                    return broadcast_spot_action_via_cometbft(rpc_client, sender, &request).await;
+                }
+            }
         }
         _ => {}
     }
@@ -936,6 +943,113 @@ async fn broadcast_perp_action_via_cometbft(
                 "status": "ok",
                 "response": {
                     "type": format_action_type(&request.action),
+                    "data": {
+                        "submitted": true,
+                        "hash": result.hash,
+                        "log": result.log
+                    }
+                }
+            }))
+        }
+        Err(crate::tx_router::TxRouterError::TxRejected { code, log }) => {
+            Err(HandlerError::Internal(format!(
+                "Transaction rejected by consensus: code={}, log={}", code, log
+            )))
+        }
+        Err(e) => {
+            Err(HandlerError::Internal(format!(
+                "Failed to broadcast transaction: {}", e
+            )))
+        }
+    }
+}
+
+/// Broadcast spot/view-transfer actions to CometBFT for consensus ordering.
+///
+/// Converts SpotOrder → Order (market_id >= 128), SpotCancel → Cancel,
+/// SpotCancelAll → SpotCancelAll, ViewTransfer → ViewTransfer TransactionTypes.
+async fn broadcast_spot_action_via_cometbft(
+    rpc_client: &crate::tx_router::CometBftRpcClient,
+    sender: AccountAddress,
+    request: &ExchangeRequest,
+) -> Result<Value, HandlerError> {
+    use hypercore_chain::tx::{Transaction, TransactionType, OrderWire, CancelWire};
+    use alloy_primitives::B256;
+
+    let tx_type = match &request.action {
+        ExchangeAction::SpotOrder { orders, grouping: _ } => {
+            // Use SpotOrder TransactionType for correct EIP-712 signature verification.
+            // SpotOrder uses a different type hash than Order (no reduce_only field,
+            // type string "spotOrder" instead of "order").
+            let order_wires: Vec<OrderWire> = orders.iter().map(|o| OrderWire {
+                a: o.a,
+                b: o.b,
+                p: o.p.clone(),
+                s: o.s.clone(),
+                r: o.r,
+                t: convert_order_type_wire(&o.t),
+                c: o.c.clone(),
+            }).collect();
+            TransactionType::SpotOrder {
+                orders: order_wires,
+                grouping: hypercore_chain::tx::OrderGrouping::Na,
+            }
+        }
+        ExchangeAction::SpotCancel { cancels } => {
+            let cancel_wires: Vec<CancelWire> = cancels.iter().map(|c| CancelWire {
+                a: c.a,
+                o: c.o,
+            }).collect();
+            TransactionType::Cancel { cancels: cancel_wires }
+        }
+        ExchangeAction::SpotCancelAll { market } => {
+            TransactionType::SpotCancelAll { market: *market }
+        }
+        ExchangeAction::ViewTransfer { token, amount, to_evm } => {
+            TransactionType::ViewTransfer {
+                token: *token,
+                amount: amount.clone(),
+                to_evm: *to_evm,
+            }
+        }
+        _ => return Err(HandlerError::Internal("Unsupported spot action type".to_string())),
+    };
+
+    let sig_wire = &request.signature;
+    let r_bytes = hex::decode(sig_wire.r.strip_prefix("0x").unwrap_or(&sig_wire.r))
+        .map_err(|_| HandlerError::InvalidSignature)?;
+    let s_bytes = hex::decode(sig_wire.s.strip_prefix("0x").unwrap_or(&sig_wire.s))
+        .map_err(|_| HandlerError::InvalidSignature)?;
+
+    let signature = Signature::new(
+        B256::from_slice(&r_bytes.get(..32).unwrap_or(&[0u8; 32])),
+        B256::from_slice(&s_bytes.get(..32).unwrap_or(&[0u8; 32])),
+        sig_wire.v,
+    );
+
+    let tx = Transaction {
+        action: tx_type,
+        nonce: request.nonce,
+        signature,
+        hash: None,
+    };
+
+    let tx_bytes = serde_json::to_vec(&tx)
+        .map_err(|e| HandlerError::Internal(format!("Failed to serialize transaction: {}", e)))?;
+
+    match rpc_client.broadcast_tx_sync(&tx_bytes).await {
+        Ok(result) => {
+            let action_name = match &request.action {
+                ExchangeAction::SpotOrder { .. } => "spotOrder",
+                ExchangeAction::SpotCancel { .. } => "spotCancel",
+                ExchangeAction::SpotCancelAll { .. } => "spotCancelAll",
+                ExchangeAction::ViewTransfer { .. } => "viewTransfer",
+                _ => "unknown",
+            };
+            Ok(json!({
+                "status": "ok",
+                "response": {
+                    "type": action_name,
                     "data": {
                         "submitted": true,
                         "hash": result.hash,

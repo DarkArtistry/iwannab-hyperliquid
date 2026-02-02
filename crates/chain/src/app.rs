@@ -283,6 +283,18 @@ impl HyperCoreApp {
             TransactionType::EvmAction { action_type, data } => {
                 self.execute_evm_action_sync(sender, *action_type, data)?
             }
+
+            TransactionType::SpotOrder { orders, grouping: _ } => {
+                self.execute_orders_sync(sender, orders, timestamp)?
+            }
+
+            TransactionType::SpotCancelAll { market } => {
+                self.execute_spot_cancel_all_sync(sender, *market)?
+            }
+
+            TransactionType::ViewTransfer { token, amount, to_evm } => {
+                self.execute_view_transfer_sync(sender, *token, amount, *to_evm)?
+            }
         };
 
         // Update nonces (supports both sequential and timestamp-based)
@@ -744,6 +756,68 @@ impl HyperCoreApp {
             .add_attribute("perp_cancelled", &perp_cancelled.to_string()));
 
         Ok(events)
+    }
+
+    /// Execute spot cancel all (sync version)
+    fn execute_spot_cancel_all_sync(
+        &mut self,
+        sender: AccountAddress,
+        market: Option<u8>,
+    ) -> Result<Vec<Event>, AppError> {
+        let mut events = Vec::new();
+        let mut cancelled = 0;
+
+        if let Some(spot_engine) = &self.state.spot_engine {
+            let mut engine = acquire_write_with_retry(spot_engine, "Spot engine (spot_cancel_all)")?;
+
+            if let Some(market_id) = market {
+                if let Ok(canceled) = engine.cancel_all_orders(sender, market_id) {
+                    cancelled += canceled.len();
+                }
+            } else {
+                let markets: Vec<_> = engine.state.get_all_markets().iter().map(|m| m.config.id).collect();
+                for market_id in markets {
+                    if let Ok(canceled) = engine.cancel_all_orders(sender, market_id) {
+                        cancelled += canceled.len();
+                    }
+                }
+            }
+        }
+
+        events.push(Event::new("spot_cancel_all")
+            .add_attribute("sender", &format!("{:?}", sender))
+            .add_attribute("cancelled", &cancelled.to_string()));
+
+        Ok(events)
+    }
+
+    /// Execute view transfer (sync version)
+    fn execute_view_transfer_sync(
+        &mut self,
+        sender: AccountAddress,
+        token: u8,
+        amount: &str,
+        to_evm: bool,
+    ) -> Result<Vec<Event>, AppError> {
+        if let Some(spot_engine) = &self.state.spot_engine {
+            let mut engine = acquire_write_with_retry(spot_engine, "Spot engine (view_transfer)")?;
+
+            let token_info = engine.state.get_token(token)
+                .ok_or(AppError::Internal(format!("Token {} not found", token)))?;
+            let decimal_amount = Decimal::from_str_exact(amount, token_info.wei_decimals)
+                .ok_or(AppError::Internal(format!("Invalid amount: {}", amount)))?;
+
+            engine.view_transfer(sender, token, decimal_amount, to_evm)
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+
+            Ok(vec![Event::new("view_transfer")
+                .add_attribute("sender", &format!("{:?}", sender))
+                .add_attribute("token", &token.to_string())
+                .add_attribute("amount", amount)
+                .add_attribute("to_evm", &to_evm.to_string())])
+        } else {
+            Err(AppError::Internal("Spot engine not available".to_string()))
+        }
     }
 
     /// Execute leverage update (sync version)

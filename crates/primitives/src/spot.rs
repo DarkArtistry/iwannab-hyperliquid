@@ -264,10 +264,17 @@ impl SpotMarketConfig {
     }
 
     /// Validate size against lot size
+    ///
+    /// Normalizes the input size to the lot_size's decimal scale before
+    /// checking divisibility, since order sizes may arrive in a different
+    /// decimal representation (e.g., PRICE_DECIMALS=8) than the market's
+    /// lot_size (which uses the token's wei_decimals, typically 18).
     pub fn validate_size(&self, size: Decimal) -> bool {
         let lot_raw = self.lot_size.raw();
         if lot_raw == 0 { return true; }
-        size.raw() % lot_raw == 0 && size >= self.min_order_size
+        // Normalize size to the lot_size's decimal scale for correct modulo check
+        let size_normalized = size.to_decimals(self.lot_size.decimals());
+        size_normalized.raw() % lot_raw == 0 && size_normalized.raw() >= self.min_order_size.raw()
     }
 
     /// Calculate maker fee (positive = pay, negative = rebate)

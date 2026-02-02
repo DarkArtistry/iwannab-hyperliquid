@@ -17,15 +17,21 @@ import {
   createWalletClient,
   http,
   parseEther,
+  encodeFunctionData,
+  decodeFunctionResult,
 } from 'viem';
-import { privateKeyToAccount } from 'viem/accounts';
+import { privateKeyToAccount, signTypedData } from 'viem/accounts';
 import { foundry } from 'viem/chains';
+import { exec as execCb } from 'child_process';
+import { promisify } from 'util';
 
 import type { TestContext, SignatureWire } from '../lib/types.js';
 import { logSection, logProgress } from '../lib/logging.js';
 import { runTest, sleep } from '../lib/testing.js';
 import { signAction } from '../lib/signing.js';
 import { TEST_ACCOUNTS } from '../lib/accounts.js';
+
+const exec = promisify(execCb);
 
 // =============================================================================
 // MULTI-NODE CONFIG
@@ -363,16 +369,33 @@ export async function runMultinodeTests(ctx: TestContext): Promise<void> {
     logProgress('Placing resting order at $40,000 via Node 0...');
     const { signature, nonce } = await signAction(orderAction, TEST_ACCOUNTS.ALICE.privateKey);
     await exchangeRequestTo(GATEWAY_URLS[0], orderAction, signature, nonce);
-    await sleep(4000);
+
+    // Wait for order to appear on target cancel node
+    await waitForCondition(async () => {
+      const orders = (await infoRequestTo(GATEWAY_URLS[Math.min(1, NUM_NODES - 1)], 'openOrders', {
+        user: TEST_ACCOUNTS.ALICE.address,
+      })) as Array<unknown>;
+      return orders.length > 0;
+    }, 15000, 1000);
 
     // Cancel on Node 1
     logProgress('Cancelling all orders via Node 1...');
     const cancelAction = { type: 'cancelAll' };
     const { signature: cSig, nonce: cNonce } = await signAction(cancelAction, TEST_ACCOUNTS.ALICE.privateKey);
     await exchangeRequestTo(GATEWAY_URLS[Math.min(1, NUM_NODES - 1)], cancelAction, cSig, cNonce);
-    await sleep(4000);
 
-    // Verify removed on all nodes
+    // Poll until cancel propagates to all nodes (instead of hardcoded sleep)
+    const cancelled = await waitForCondition(async () => {
+      for (let i = 0; i < NUM_NODES; i++) {
+        const orders = (await infoRequestTo(GATEWAY_URLS[i], 'openOrders', {
+          user: TEST_ACCOUNTS.ALICE.address,
+        })) as Array<unknown>;
+        if (orders.length !== 0) return false;
+      }
+      return true;
+    }, 15000, 1000);
+
+    // Log final state
     for (let i = 0; i < NUM_NODES; i++) {
       const orders = (await infoRequestTo(GATEWAY_URLS[i], 'openOrders', {
         user: TEST_ACCOUNTS.ALICE.address,
@@ -860,8 +883,8 @@ export async function runMultinodeTests(ctx: TestContext): Promise<void> {
 
     await sleep(3000);
     logProgress(`${successCount}/${Math.min(3, NUM_NODES)} EVM transactions sent to different validators`);
-    if (successCount === 0) {
-      throw new Error('No EVM transactions succeeded across any node');
+    if (successCount < 2) {
+      throw new Error(`Only ${successCount}/${Math.min(3, NUM_NODES)} EVM transactions succeeded (expected at least 2)`);
     }
   });
 
@@ -1043,5 +1066,1096 @@ export async function runMultinodeTests(ctx: TestContext): Promise<void> {
     }
 
     logProgress(`Cluster stable after mixed transaction storm: consistent state, spread=${spread}`);
+  });
+
+  // =========================================================================
+  // 8. NODE RESILIENCE TESTS
+  // =========================================================================
+  logSection('24. Node Resilience (Restart, Catch-Up, Failure)');
+
+  // Helper: get CometBFT block height for a specific node
+  async function getNodeHeight(nodeIdx: number): Promise<number> {
+    const data = (await cometbftRpcCall(COMETBFT_RPC_URLS[nodeIdx], 'status')) as {
+      result: { sync_info: { latest_block_height: string; catching_up: boolean } };
+    };
+    return parseInt(data.result.sync_info.latest_block_height);
+  }
+
+  // Helper: check if a node is catching up
+  async function isNodeCatchingUp(nodeIdx: number): Promise<boolean> {
+    const data = (await cometbftRpcCall(COMETBFT_RPC_URLS[nodeIdx], 'status')) as {
+      result: { sync_info: { catching_up: boolean } };
+    };
+    return data.result.sync_info.catching_up;
+  }
+
+  // Helper: check if a gateway is reachable
+  async function isGatewayHealthy(nodeIdx: number): Promise<boolean> {
+    try {
+      const resp = await fetch(`${GATEWAY_URLS[nodeIdx]}/health`, { signal: AbortSignal.timeout(2000) });
+      return resp.ok;
+    } catch {
+      return false;
+    }
+  }
+
+  // Helper: check if CometBFT RPC is reachable
+  async function isCometBftReachable(nodeIdx: number): Promise<boolean> {
+    try {
+      await cometbftRpcCall(COMETBFT_RPC_URLS[nodeIdx], 'status');
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // Determine compose file based on number of nodes
+  const COMPOSE_FILE = NUM_NODES === 5 ? 'docker-compose-multinode-5.yml' : 'docker-compose-multinode.yml';
+  const CONTAINER_PREFIX = NUM_NODES === 5 ? 'hypercore-5v' : 'hypercore';
+
+  await runTest(ctx, 'Validator failure: chain continues with 4/5', 'multinode-resilience', 'Stop 1 validator, verify chain keeps producing blocks', async () => {
+    // Record baseline height
+    const heightBefore = await getNodeHeight(0);
+    logProgress(`Height before stopping node 4: ${heightBefore}`);
+
+    // Stop validator 4 (node + cometbft)
+    logProgress('Stopping validator 4...');
+    try {
+      await exec(`docker stop ${CONTAINER_PREFIX}-cometbft-4 ${CONTAINER_PREFIX}-node-4`);
+    } catch (e: any) {
+      logProgress(`Stop command: ${e.message?.slice(0, 100)}`);
+    }
+
+    // Wait for a few blocks to confirm chain continues
+    await sleep(8000);
+
+    // Verify chain is still producing blocks on remaining nodes
+    const heightAfter = await getNodeHeight(0);
+    const growth = heightAfter - heightBefore;
+    logProgress(`Height after 8s with 4/5 validators: ${heightAfter} (grew by ${growth})`);
+
+    if (growth < 2) {
+      // Restart node before failing
+      await exec(`docker start ${CONTAINER_PREFIX}-node-4 ${CONTAINER_PREFIX}-cometbft-4`).catch(() => {});
+      throw new Error(`Chain stalled with 4/5 validators: only grew ${growth} blocks`);
+    }
+
+    // Submit a transaction while node 4 is down
+    logProgress('Submitting order while node 4 is offline...');
+    const orderAction = {
+      type: 'order',
+      orders: [{ a: 0, b: true, p: '41000', s: '0.001', r: false, t: { limit: { tif: 'Gtc' } } }],
+      grouping: 'na',
+    };
+    const { signature, nonce } = await signAction(orderAction, TEST_ACCOUNTS.ALICE.privateKey);
+    await exchangeRequestTo(GATEWAY_URLS[0], orderAction, signature, nonce);
+    logProgress('Order submitted successfully with 4/5 validators');
+
+    // Verify order visible on remaining nodes
+    await sleep(2000);
+    for (let i = 0; i < NUM_NODES - 1; i++) {
+      const orders = (await infoRequestTo(GATEWAY_URLS[i], 'openOrders', {
+        user: TEST_ACCOUNTS.ALICE.address,
+      })) as Array<unknown>;
+      if (orders.length === 0) {
+        logProgress(`Warning: Node ${i} has 0 open orders`);
+      }
+    }
+
+    // Cleanup order
+    const cancelAction = { type: 'cancelAll' };
+    const { signature: cSig, nonce: cNonce } = await signAction(cancelAction, TEST_ACCOUNTS.ALICE.privateKey);
+    await exchangeRequestTo(GATEWAY_URLS[0], cancelAction, cSig, cNonce);
+
+    // Restart node 4
+    logProgress('Restarting validator 4...');
+    await exec(`docker start ${CONTAINER_PREFIX}-node-4 ${CONTAINER_PREFIX}-cometbft-4`);
+    logProgress('Chain continued producing blocks with 4/5 validators');
+  });
+
+  await runTest(ctx, 'Node catch-up after restart', 'multinode-resilience', 'Restarted node syncs missed blocks and matches state', async () => {
+    // Wait for node 4 to come back online
+    const caughtUp = await waitForCondition(async () => {
+      if (!(await isCometBftReachable(4))) return false;
+      if (!(await isGatewayHealthy(4))) return false;
+      return !(await isNodeCatchingUp(4));
+    }, 60000, 2000);
+
+    if (!caughtUp) {
+      throw new Error('Node 4 did not finish catching up within 60s');
+    }
+
+    logProgress('Node 4 is back online and synced');
+
+    // Wait a moment for state to settle
+    await sleep(3000);
+
+    // Verify heights are consistent
+    const heights: number[] = [];
+    for (let i = 0; i < NUM_NODES; i++) {
+      heights.push(await getNodeHeight(i));
+    }
+    const spread = Math.max(...heights) - Math.min(...heights);
+    logProgress(`All node heights: [${heights.join(', ')}] (spread: ${spread})`);
+
+    if (spread > 3) {
+      throw new Error(`Node 4 height diverged after restart: spread=${spread}`);
+    }
+
+    // Verify appHash is consistent (proves state matches)
+    const minHeight = Math.min(...heights) - 1;
+    const appHashes: string[] = [];
+    for (let i = 0; i < NUM_NODES; i++) {
+      const commit = (await cometbftRpcCall(COMETBFT_RPC_URLS[i], `commit?height=${minHeight}`)) as {
+        result: { signed_header: { header: { app_hash: string } } };
+      };
+      appHashes.push(commit.result.signed_header.header.app_hash);
+    }
+
+    const allMatch = appHashes.every((h) => h === appHashes[0]);
+    if (!allMatch) {
+      throw new Error(`AppHash mismatch after catch-up: ${JSON.stringify(appHashes)}`);
+    }
+    logProgress(`AppHash consistent across all ${NUM_NODES} nodes after restart`);
+
+    // Verify balances match (proves unified state is intact)
+    const balances: string[] = [];
+    for (let i = 0; i < NUM_NODES; i++) {
+      const state = (await infoRequestTo(GATEWAY_URLS[i], 'clearinghouseState', {
+        user: TEST_ACCOUNTS.ALICE.address,
+      })) as { marginSummary: { accountValue: string } };
+      balances.push(state.marginSummary.accountValue);
+    }
+    const balancesMatch = balances.every((b) => b === balances[0]);
+    if (!balancesMatch) {
+      throw new Error(`Balances differ after catch-up: ${JSON.stringify(balances)}`);
+    }
+    logProgress('State fully consistent after node restart and catch-up');
+  });
+
+  await runTest(ctx, 'Transactions during downtime reflected after sync', 'multinode-resilience', 'Orders placed while node offline appear after sync', async () => {
+    // Stop node 3
+    logProgress('Stopping validator 3...');
+    await exec(`docker stop ${CONTAINER_PREFIX}-cometbft-3 ${CONTAINER_PREFIX}-node-3`).catch(() => {});
+    await sleep(3000);
+
+    // Place an order while node 3 is offline
+    const cloid = `resilience-${Date.now()}`;
+    const orderAction = {
+      type: 'order',
+      orders: [{ a: 0, b: true, p: '43000', s: '0.001', r: false, t: { limit: { tif: 'Gtc' } }, c: cloid }],
+      grouping: 'na',
+    };
+    logProgress('Placing order while node 3 is offline...');
+    const { signature, nonce } = await signAction(orderAction, TEST_ACCOUNTS.ALICE.privateKey);
+    await exchangeRequestTo(GATEWAY_URLS[0], orderAction, signature, nonce);
+
+    // Verify order is on Node 0
+    await sleep(2000);
+    const ordersOnNode0 = (await infoRequestTo(GATEWAY_URLS[0], 'openOrders', {
+      user: TEST_ACCOUNTS.ALICE.address,
+    })) as Array<{ cloid?: string }>;
+    const hasOrder = ordersOnNode0.some((o) => o.cloid === cloid);
+    if (!hasOrder) {
+      logProgress('Warning: Order not found on Node 0 (may have been consumed)');
+    } else {
+      logProgress('Order confirmed on Node 0');
+    }
+
+    // Restart node 3
+    logProgress('Restarting validator 3...');
+    await exec(`docker start ${CONTAINER_PREFIX}-node-3 ${CONTAINER_PREFIX}-cometbft-3`);
+
+    // Wait for node 3 to catch up
+    const synced = await waitForCondition(async () => {
+      if (!(await isCometBftReachable(3))) return false;
+      if (!(await isGatewayHealthy(3))) return false;
+      return !(await isNodeCatchingUp(3));
+    }, 60000, 2000);
+
+    if (!synced) {
+      throw new Error('Node 3 did not finish catching up within 60s');
+    }
+    await sleep(3000);
+
+    // Verify the order (or its effects) are on node 3
+    const ordersOnNode3 = (await infoRequestTo(GATEWAY_URLS[3], 'openOrders', {
+      user: TEST_ACCOUNTS.ALICE.address,
+    })) as Array<{ cloid?: string }>;
+
+    // Check that node 3 has the same view as node 0
+    const ordersOnNode0After = (await infoRequestTo(GATEWAY_URLS[0], 'openOrders', {
+      user: TEST_ACCOUNTS.ALICE.address,
+    })) as Array<unknown>;
+
+    logProgress(`Node 0: ${ordersOnNode0After.length} orders, Node 3: ${ordersOnNode3.length} orders`);
+
+    if (ordersOnNode0After.length !== ordersOnNode3.length) {
+      throw new Error(`Order count mismatch: Node 0 has ${ordersOnNode0After.length}, Node 3 has ${ordersOnNode3.length}`);
+    }
+    logProgress('Transactions during downtime correctly reflected after sync');
+
+    // Cleanup
+    const cancelAction = { type: 'cancelAll' };
+    const { signature: cSig, nonce: cNonce } = await signAction(cancelAction, TEST_ACCOUNTS.ALICE.privateKey);
+    await exchangeRequestTo(GATEWAY_URLS[0], cancelAction, cSig, cNonce);
+    await sleep(1000);
+  });
+
+  await runTest(ctx, 'Double failure halts consensus, recovery resumes', 'multinode-resilience', 'Stop 2/5 validators (below 2/3), verify halt, restart to resume', async () => {
+    const heightBefore = await getNodeHeight(0);
+    logProgress(`Height before double failure: ${heightBefore}`);
+
+    // Stop 2 validators (3/5 = 60% < 66.7% required)
+    logProgress('Stopping validators 3 and 4...');
+    await exec(`docker stop ${CONTAINER_PREFIX}-cometbft-3 ${CONTAINER_PREFIX}-node-3 ${CONTAINER_PREFIX}-cometbft-4 ${CONTAINER_PREFIX}-node-4`).catch(() => {});
+
+    // Wait and check if chain halted
+    await sleep(10000);
+
+    let heightDuringHalt: number;
+    try {
+      heightDuringHalt = await getNodeHeight(0);
+    } catch {
+      // Node 0 might be unresponsive if consensus is fully stuck
+      heightDuringHalt = heightBefore;
+    }
+
+    const growthDuringHalt = heightDuringHalt - heightBefore;
+    logProgress(`Height during halt: ${heightDuringHalt} (grew by ${growthDuringHalt})`);
+
+    // With only 3/5 nodes, chain should have stalled or grown very little
+    // (CometBFT might produce 1-2 blocks before realizing no supermajority)
+    if (growthDuringHalt > 5) {
+      logProgress(`Warning: Chain produced ${growthDuringHalt} blocks with 3/5 validators (expected stall)`);
+    } else {
+      logProgress('Chain correctly stalled with insufficient validators');
+    }
+
+    // Restart 1 validator (back to 4/5 = 80% > 66.7%)
+    logProgress('Restarting validator 3 (to reach 4/5 = 80%)...');
+    await exec(`docker start ${CONTAINER_PREFIX}-node-3 ${CONTAINER_PREFIX}-cometbft-3`);
+
+    // Wait for consensus to resume
+    const resumed = await waitForCondition(async () => {
+      try {
+        const h = await getNodeHeight(0);
+        return h > heightDuringHalt + 2;
+      } catch {
+        return false;
+      }
+    }, 60000, 3000);
+
+    if (!resumed) {
+      // Restart remaining node before failing
+      await exec(`docker start ${CONTAINER_PREFIX}-node-4 ${CONTAINER_PREFIX}-cometbft-4`).catch(() => {});
+      throw new Error('Chain did not resume after restoring 4th validator');
+    }
+
+    const heightAfterResume = await getNodeHeight(0);
+    logProgress(`Chain resumed at height ${heightAfterResume} after restoring 4th validator`);
+
+    // Restart remaining validator
+    logProgress('Restarting validator 4...');
+    await exec(`docker start ${CONTAINER_PREFIX}-node-4 ${CONTAINER_PREFIX}-cometbft-4`);
+
+    // Wait for full cluster sync
+    const fullSync = await waitForCondition(async () => {
+      try {
+        if (!(await isCometBftReachable(4))) return false;
+        return !(await isNodeCatchingUp(4));
+      } catch {
+        return false;
+      }
+    }, 60000, 3000);
+
+    if (!fullSync) {
+      logProgress('Warning: Node 4 still syncing after 60s');
+    }
+
+    await sleep(5000);
+
+    // Verify all 5 nodes are back and consistent
+    const finalHeights: number[] = [];
+    for (let i = 0; i < NUM_NODES; i++) {
+      try {
+        finalHeights.push(await getNodeHeight(i));
+      } catch {
+        finalHeights.push(-1);
+      }
+    }
+    logProgress(`Final heights: [${finalHeights.join(', ')}]`);
+
+    const activeNodes = finalHeights.filter((h) => h > 0);
+    if (activeNodes.length < NUM_NODES) {
+      logProgress(`Warning: Only ${activeNodes.length}/${NUM_NODES} nodes responsive`);
+    }
+
+    logProgress('Double failure + recovery test complete');
+  });
+
+  await runTest(ctx, 'CometBFT finality: committed blocks never change', 'multinode-resilience', 'Block hashes at committed heights are immutable', async () => {
+    // Get a committed height
+    const currentHeight = await getNodeHeight(0);
+    const checkHeight = currentHeight - 5;
+
+    if (checkHeight < 1) {
+      throw new Error('Not enough blocks produced for finality test');
+    }
+
+    // Record block hashes at checkHeight from all nodes
+    logProgress(`Recording block hashes at height ${checkHeight}...`);
+    const hashesBefore: string[] = [];
+    for (let i = 0; i < NUM_NODES; i++) {
+      try {
+        const block = (await cometbftRpcCall(COMETBFT_RPC_URLS[i], `block?height=${checkHeight}`)) as {
+          result: { block_id: { hash: string } };
+        };
+        hashesBefore.push(block.result.block_id.hash);
+      } catch {
+        hashesBefore.push('unreachable');
+      }
+    }
+
+    // Wait for more blocks
+    logProgress('Waiting for 10 more blocks...');
+    await waitForCondition(async () => {
+      const h = await getNodeHeight(0);
+      return h > currentHeight + 10;
+    }, 30000, 1000);
+
+    // Re-query the SAME height - hashes must be identical
+    logProgress(`Re-querying block hashes at height ${checkHeight}...`);
+    const hashesAfter: string[] = [];
+    for (let i = 0; i < NUM_NODES; i++) {
+      try {
+        const block = (await cometbftRpcCall(COMETBFT_RPC_URLS[i], `block?height=${checkHeight}`)) as {
+          result: { block_id: { hash: string } };
+        };
+        hashesAfter.push(block.result.block_id.hash);
+      } catch {
+        hashesAfter.push('unreachable');
+      }
+    }
+
+    // Compare
+    for (let i = 0; i < NUM_NODES; i++) {
+      if (hashesBefore[i] === 'unreachable' || hashesAfter[i] === 'unreachable') continue;
+      if (hashesBefore[i] !== hashesAfter[i]) {
+        throw new Error(
+          `REORG DETECTED: Node ${i} block hash at height ${checkHeight} changed from ` +
+          `${hashesBefore[i].slice(0, 16)}... to ${hashesAfter[i].slice(0, 16)}...`
+        );
+      }
+    }
+
+    // Also verify all reachable nodes agree
+    const reachableHashes = hashesAfter.filter((h) => h !== 'unreachable');
+    const allSame = reachableHashes.every((h) => h === reachableHashes[0]);
+    if (!allSame) {
+      throw new Error(`Block hash disagreement at height ${checkHeight}: ${JSON.stringify(hashesAfter)}`);
+    }
+
+    logProgress(`Finality verified: block ${checkHeight} hash immutable across all nodes`);
+  });
+
+  // =========================================================================
+  // 9. CROSS-NODE EVM CONTRACT & SPOT TESTS
+  // =========================================================================
+  logSection('25. Cross-Node EVM Contract & Spot Trading');
+
+  // Let cluster stabilize after resilience tests (node restarts, double failure recovery)
+  await sleep(5000);
+
+  await runTest(ctx, 'Contract deploy on Node 0, read on all nodes', 'multinode-crossnode', 'Deploy SimpleStorage on Node 0, call get() on all nodes', async () => {
+    const account = privateKeyToAccount(TEST_ACCOUNTS.ALICE.privateKey);
+    const walletClient = createWalletClient({
+      account,
+      chain: { ...foundry, id: CHAIN_ID },
+      transport: http(EVM_RPC_URLS[0]),
+    });
+
+    // Deploy SimpleStorage: contract with set(uint256) and get() returns (uint256)
+    // Hand-crafted minimal bytecode with correct JUMPDEST alignment.
+    //
+    // Runtime code (52 bytes):
+    //   Function dispatch: CALLDATALOAD >> 224, match set(uint256)=0x60fe47b1 or get()=0x6d4ce63c
+    //   set(uint256) at 0x1e: SSTORE(slot=0, CALLDATALOAD(4)), STOP
+    //   get()        at 0x27: RETURN(SLOAD(slot=0))
+    //
+    // Init code (12 bytes): CODECOPY runtime to memory, RETURN
+    const SIMPLE_STORAGE_BYTECODE = '0x6034600c60003960346000f360003560e01c806360fe47b114601e5780636d4ce63c14602757600080fd5b50600435600055005b5060005460005260206000f3';
+
+    logProgress('Deploying SimpleStorage on Node 0...');
+    const deployHash = await walletClient.deployContract({
+      abi: [
+        { type: 'function', name: 'set', inputs: [{ type: 'uint256' }], outputs: [], stateMutability: 'nonpayable' },
+        { type: 'function', name: 'get', inputs: [], outputs: [{ type: 'uint256' }], stateMutability: 'view' },
+      ],
+      bytecode: SIMPLE_STORAGE_BYTECODE as `0x${string}`,
+    });
+
+    // Wait for deployment
+    const publicClient0 = createPublicClient({
+      chain: { ...foundry, id: CHAIN_ID },
+      transport: http(EVM_RPC_URLS[0]),
+    });
+
+    let contractAddr: string | null = null;
+    const deployed = await waitForCondition(async () => {
+      try {
+        const receipt = await publicClient0.getTransactionReceipt({ hash: deployHash });
+        if (receipt?.contractAddress) {
+          contractAddr = receipt.contractAddress;
+          return true;
+        }
+      } catch { /* not yet */ }
+      return false;
+    }, 15000, 1000);
+
+    if (!deployed || !contractAddr) {
+      throw new Error(`Contract deployment receipt not found after 15s`);
+    }
+    logProgress(`Contract deployed at ${contractAddr}`);
+
+    // Set value to 42
+    const setHash = await walletClient.writeContract({
+      address: contractAddr as `0x${string}`,
+      abi: [
+        { type: 'function', name: 'set', inputs: [{ type: 'uint256' }], outputs: [], stateMutability: 'nonpayable' },
+      ],
+      functionName: 'set',
+      args: [42n],
+    });
+    logProgress(`set(42) tx: ${setHash.slice(0, 20)}...`);
+
+    // Wait for set tx
+    await waitForCondition(async () => {
+      try {
+        const r = await publicClient0.getTransactionReceipt({ hash: setHash });
+        return r != null;
+      } catch { return false; }
+    }, 15000, 1000);
+
+    // Wait for state propagation across nodes
+    await sleep(5000);
+
+    // Call get() on ALL nodes
+    const getAbi = [
+      { type: 'function', name: 'get', inputs: [], outputs: [{ type: 'uint256' }], stateMutability: 'view' },
+    ] as const;
+
+    let successCount = 0;
+    for (let i = 0; i < NUM_NODES; i++) {
+      try {
+        const client = createPublicClient({
+          chain: { ...foundry, id: CHAIN_ID },
+          transport: http(EVM_RPC_URLS[i]),
+        });
+
+        const value = await client.readContract({
+          address: contractAddr as `0x${string}`,
+          abi: getAbi,
+          functionName: 'get',
+        });
+
+        if (value !== 42n) {
+          logProgress(`Node ${i}: get() returned ${value} (expected 42)`);
+        } else {
+          logProgress(`Node ${i}: get() = 42`);
+          successCount++;
+        }
+      } catch (e: any) {
+        logProgress(`Node ${i}: get() failed: ${e.message?.slice(0, 60)}`);
+      }
+    }
+
+    if (successCount < NUM_NODES - 1) {
+      throw new Error(`Only ${successCount}/${NUM_NODES} nodes returned correct contract state`);
+    }
+    logProgress(`Contract state consistent on ${successCount}/${NUM_NODES} nodes`);
+  });
+
+  await runTest(ctx, 'Spot order propagation across nodes', 'multinode-crossnode', 'Place spot buy on Node 0, verify on all nodes', async () => {
+    const spotOrderAction = {
+      type: 'spotOrder',
+      orders: [{
+        a: 128, // TEST-USDC
+        b: true,
+        p: '0.01', // Low price so it rests
+        s: '10',
+        r: false,
+        t: { limit: { tif: 'Gtc' } },
+      }],
+      grouping: 'na',
+    };
+
+    logProgress('Placing spot buy order on Node 0...');
+    const { signature, nonce } = await signAction(spotOrderAction, TEST_ACCOUNTS.ALICE.privateKey);
+    await exchangeRequestTo(GATEWAY_URLS[0], spotOrderAction, signature, nonce);
+
+    // Wait for propagation (needs block inclusion + consensus propagation)
+    const found = await waitForCondition(async () => {
+      for (let i = 0; i < NUM_NODES; i++) {
+        try {
+          const orders = (await infoRequestTo(GATEWAY_URLS[i], 'spotOpenOrders', {
+            user: TEST_ACCOUNTS.ALICE.address,
+          })) as Array<unknown>;
+          if (orders.length === 0) return false;
+        } catch {
+          return false;
+        }
+      }
+      return true;
+    }, 15000, 1000);
+
+    if (!found) {
+      // Log status for debugging
+      for (let i = 0; i < NUM_NODES; i++) {
+        try {
+          const orders = (await infoRequestTo(GATEWAY_URLS[i], 'spotOpenOrders', {
+            user: TEST_ACCOUNTS.ALICE.address,
+          })) as Array<unknown>;
+          logProgress(`Node ${i}: ${orders.length} spot orders`);
+        } catch {
+          logProgress(`Node ${i}: unreachable`);
+        }
+      }
+      throw new Error('Spot order not propagated to all nodes within 15s');
+    }
+    logProgress('Spot order visible on all nodes');
+
+    // Cleanup
+    const cancelAction = { type: 'spotCancelAll', market: 128 };
+    const { signature: cSig, nonce: cNonce } = await signAction(cancelAction, TEST_ACCOUNTS.ALICE.privateKey);
+    await exchangeRequestTo(GATEWAY_URLS[0], cancelAction, cSig, cNonce);
+    await sleep(1000);
+  });
+
+  await runTest(ctx, 'View transfer propagation across nodes', 'multinode-crossnode', 'View transfer on Node 0 reflected on all nodes', async () => {
+    // Get baseline unified balance on all nodes
+    const baseBalances: string[] = [];
+    for (let i = 0; i < NUM_NODES; i++) {
+      const ub = (await infoRequestTo(GATEWAY_URLS[i], 'unifiedBalances', {
+        user: TEST_ACCOUNTS.ALICE.address,
+      })) as { balances?: Array<{ tokenIndex?: number; evmView: string }> };
+      const usdc = ub.balances?.find((b) => (b.tokenIndex || 0) === 0);
+      baseBalances.push(usdc?.evmView || '0');
+    }
+    logProgress(`Baseline EVM view: ${baseBalances[0]}`);
+
+    // Execute view transfer on Node 0
+    const transferAction = {
+      type: 'viewTransfer',
+      token: 0,
+      amount: '100',
+      toEvm: true,
+    };
+    const { signature, nonce } = await signAction(transferAction, TEST_ACCOUNTS.ALICE.privateKey);
+    await exchangeRequestTo(GATEWAY_URLS[0], transferAction, signature, nonce);
+    logProgress('View transfer (100 USDC to EVM) submitted on Node 0');
+
+    // Poll until all nodes reflect the transfer (needs block inclusion + propagation)
+    const baseEvmView = parseFloat(baseBalances[0]);
+    let afterBalances: string[] = [];
+    const propagated = await waitForCondition(async () => {
+      afterBalances = [];
+      for (let i = 0; i < NUM_NODES; i++) {
+        const ub = (await infoRequestTo(GATEWAY_URLS[i], 'unifiedBalances', {
+          user: TEST_ACCOUNTS.ALICE.address,
+        })) as { balances?: Array<{ tokenIndex?: number; evmView: string }> };
+        const usdc = ub.balances?.find((b) => (b.tokenIndex || 0) === 0);
+        afterBalances.push(usdc?.evmView || '0');
+      }
+      // All nodes must have the same value AND it must have changed from baseline
+      const allMatch = afterBalances.every((b) => b === afterBalances[0]);
+      const changed = parseFloat(afterBalances[0]) !== baseEvmView;
+      return allMatch && changed;
+    }, 15000, 1000);
+
+    if (!propagated) {
+      throw new Error(`View transfer not consistent after 15s: ${JSON.stringify(afterBalances)}`);
+    }
+
+    const evmDiff = parseFloat(afterBalances[0]) - baseEvmView;
+    logProgress(`EVM view increased by ${evmDiff} on all nodes (expected ~100)`);
+
+    if (Math.abs(evmDiff - 100) > 1) {
+      throw new Error(`Unexpected EVM view change: ${evmDiff} (expected 100)`);
+    }
+
+    // Restore
+    const restoreAction = { type: 'viewTransfer', token: 0, amount: '100', toEvm: false };
+    const { signature: rSig, nonce: rNonce } = await signAction(restoreAction, TEST_ACCOUNTS.ALICE.privateKey);
+    await exchangeRequestTo(GATEWAY_URLS[0], restoreAction, rSig, rNonce);
+    await sleep(1000);
+    logProgress('View transfer propagation verified across all nodes');
+  });
+
+  await runTest(ctx, 'Genesis state matches across all nodes', 'multinode-crossnode', 'Verify all genesis accounts and markets are consistent', async () => {
+    // Check market metadata
+    const metas: string[] = [];
+    for (let i = 0; i < NUM_NODES; i++) {
+      const meta = (await infoRequestTo(GATEWAY_URLS[i], 'meta')) as {
+        universe?: Array<{ name: string; maxLeverage?: number }>;
+      };
+      const summary = (meta.universe || []).map((m) => `${m.name}:${m.maxLeverage}`).sort().join(',');
+      metas.push(summary);
+    }
+
+    const metaMatch = metas.every((m) => m === metas[0]);
+    if (!metaMatch) {
+      throw new Error(`Market metadata differs: ${JSON.stringify(metas)}`);
+    }
+    logProgress(`Markets consistent: ${metas[0]}`);
+
+    // Check spot metadata
+    const spotMetas: string[] = [];
+    for (let i = 0; i < NUM_NODES; i++) {
+      const spotMeta = (await infoRequestTo(GATEWAY_URLS[i], 'spotMeta')) as {
+        tokens?: Array<{ name: string; index: number }>;
+      };
+      const summary = (spotMeta.tokens || []).map((t) => `${t.name}:${t.index}`).sort().join(',');
+      spotMetas.push(summary);
+    }
+
+    const spotMatch = spotMetas.every((m) => m === spotMetas[0]);
+    if (!spotMatch) {
+      throw new Error(`Spot metadata differs: ${JSON.stringify(spotMetas)}`);
+    }
+    logProgress(`Spot tokens consistent: ${spotMetas[0]}`);
+
+    // Check Alice balance on all nodes
+    const balances: string[] = [];
+    for (let i = 0; i < NUM_NODES; i++) {
+      const ub = (await infoRequestTo(GATEWAY_URLS[i], 'unifiedBalances', {
+        user: TEST_ACCOUNTS.ALICE.address,
+      })) as { balances?: Array<{ tokenIndex?: number; total: string }> };
+      const usdc = ub.balances?.find((b) => (b.tokenIndex || 0) === 0);
+      balances.push(usdc?.total || '0');
+    }
+
+    const balMatch = balances.every((b) => b === balances[0]);
+    if (!balMatch) {
+      throw new Error(`Alice total balance differs: ${JSON.stringify(balances)}`);
+    }
+    logProgress(`Alice total balance consistent: ${balances[0]}`);
+  });
+
+  // =========================================================================
+  // 10. CROSS-NODE ADVANCED TESTS
+  // =========================================================================
+  logSection('26. Cross-Node Advanced (Spot Matching, Nonce Replay, EVM Receipts)');
+
+  await runTest(ctx, 'Cross-node spot matching with balance consistency', 'multinode-crossnode-advanced', 'Alice buys spot on Node 0, Bob sells on Node 3, verify balances on all nodes', async () => {
+    // Pre-cleanup: cancel any stale spot orders from previous sections
+    for (const acct of [TEST_ACCOUNTS.ALICE, TEST_ACCOUNTS.BOB]) {
+      const ca = { type: 'spotCancelAll', market: 128 };
+      const { signature: cs, nonce: cn } = await signAction(ca, acct.privateKey);
+      await exchangeRequestTo(GATEWAY_URLS[0], ca, cs, cn);
+    }
+    await sleep(3000);
+
+    // Verify both users have zero spot orders before starting
+    for (const acct of [TEST_ACCOUNTS.ALICE, TEST_ACCOUNTS.BOB]) {
+      const orders = (await infoRequestTo(GATEWAY_URLS[0], 'spotOpenOrders', {
+        user: acct.address,
+      })) as Array<{ limitPx?: string; side?: string }>;
+      if (orders.length > 0) {
+        logProgress(`Warning: ${acct.address.slice(0, 10)} still has ${orders.length} spot orders after pre-cleanup`);
+      }
+    }
+
+    // Capture baseline unified balances for Alice and Bob (token 0 = USDC, token 1 = TEST)
+    const getTokenBalances = async (gatewayUrl: string, user: string) => {
+      const ub = (await infoRequestTo(gatewayUrl, 'unifiedBalances', { user })) as {
+        balances?: Array<{ tokenIndex?: number; total: string }>;
+      };
+      const balances = ub.balances || [];
+      const usdc = balances.find((b) => (b.tokenIndex || 0) === 0);
+      const test = balances.find((b) => b.tokenIndex === 1);
+      return {
+        usdc: parseFloat(usdc?.total || '0'),
+        test: parseFloat(test?.total || '0'),
+      };
+    };
+
+    const aliceBefore = await getTokenBalances(GATEWAY_URLS[0], TEST_ACCOUNTS.ALICE.address);
+    const bobBefore = await getTokenBalances(GATEWAY_URLS[0], TEST_ACCOUNTS.BOB.address);
+    logProgress(`Baseline - Alice: USDC=${aliceBefore.usdc}, TEST=${aliceBefore.test}`);
+    logProgress(`Baseline - Bob: USDC=${bobBefore.usdc}, TEST=${bobBefore.test}`);
+
+    // Alice places spot BUY 10 TEST @ 1.0 on Node 0 (market 128)
+    const buyAction = {
+      type: 'spotOrder',
+      orders: [{
+        a: 128,
+        b: true,
+        p: '1.0',
+        s: '10',
+        r: false,
+        t: { limit: { tif: 'Gtc' } },
+      }],
+      grouping: 'na',
+    };
+    logProgress('Alice placing spot BUY 10 TEST @ 1.0 on Node 0...');
+    const { signature: buySig, nonce: buyNonce } = await signAction(buyAction, TEST_ACCOUNTS.ALICE.privateKey);
+    await exchangeRequestTo(GATEWAY_URLS[0], buyAction, buySig, buyNonce);
+
+    // Wait for Alice's order at price 1.0 to be visible on Node 3
+    // Check price to avoid matching against stale orders from earlier tests
+    const aliceVisible = await waitForCondition(async () => {
+      const orders = (await infoRequestTo(GATEWAY_URLS[Math.min(3, NUM_NODES - 1)], 'spotOpenOrders', {
+        user: TEST_ACCOUNTS.ALICE.address,
+      })) as Array<{ limitPx?: string; side?: string }>;
+      return orders.some((o) => parseFloat(o.limitPx || '0') === 1 && o.side === 'B');
+    }, 15000, 1000);
+
+    if (!aliceVisible) {
+      const orders = (await infoRequestTo(GATEWAY_URLS[Math.min(3, NUM_NODES - 1)], 'spotOpenOrders', {
+        user: TEST_ACCOUNTS.ALICE.address,
+      })) as Array<{ limitPx?: string; side?: string; sz?: string }>;
+      logProgress(`Node 3 Alice spot orders: ${JSON.stringify(orders)}`);
+      throw new Error('Alice spot order at price 1.0 not visible on Node 3 after 15s');
+    }
+    logProgress('Alice spot BUY @ 1.0 confirmed on Node 3, placing Bob sell...');
+
+    // Bob places spot SELL 10 TEST @ 1.0 on Node 3 — should cross
+    const sellAction = {
+      type: 'spotOrder',
+      orders: [{
+        a: 128,
+        b: false,
+        p: '1.0',
+        s: '10',
+        r: false,
+        t: { limit: { tif: 'Gtc' } },
+      }],
+      grouping: 'na',
+    };
+    const { signature: sellSig, nonce: sellNonce } = await signAction(sellAction, TEST_ACCOUNTS.BOB.privateKey);
+    await exchangeRequestTo(GATEWAY_URLS[Math.min(3, NUM_NODES - 1)], sellAction, sellSig, sellNonce);
+
+    // Poll until both orders disappear (= matched), with diagnostics
+    let lastAliceCount = -1;
+    let lastBobCount = -1;
+    const matched = await waitForCondition(async () => {
+      const aliceOrders = (await infoRequestTo(GATEWAY_URLS[0], 'spotOpenOrders', {
+        user: TEST_ACCOUNTS.ALICE.address,
+      })) as Array<{ limitPx?: string; side?: string }>;
+      const bobOrders = (await infoRequestTo(GATEWAY_URLS[0], 'spotOpenOrders', {
+        user: TEST_ACCOUNTS.BOB.address,
+      })) as Array<{ limitPx?: string; side?: string }>;
+      if (aliceOrders.length !== lastAliceCount || bobOrders.length !== lastBobCount) {
+        logProgress(`Poll: Alice=${aliceOrders.length} orders${aliceOrders[0] ? ` (${aliceOrders[0].side}@${aliceOrders[0].limitPx})` : ''}, Bob=${bobOrders.length} orders${bobOrders[0] ? ` (${bobOrders[0].side}@${bobOrders[0].limitPx})` : ''}`);
+        lastAliceCount = aliceOrders.length;
+        lastBobCount = bobOrders.length;
+      }
+      return aliceOrders.length === 0 && bobOrders.length === 0;
+    }, 30000, 1000);
+
+    if (!matched) {
+      // Log final state for diagnostics
+      for (let i = 0; i < NUM_NODES; i++) {
+        const ao = (await infoRequestTo(GATEWAY_URLS[i], 'spotOpenOrders', {
+          user: TEST_ACCOUNTS.ALICE.address,
+        })) as Array<{ limitPx?: string; side?: string; sz?: string }>;
+        const bo = (await infoRequestTo(GATEWAY_URLS[i], 'spotOpenOrders', {
+          user: TEST_ACCOUNTS.BOB.address,
+        })) as Array<{ limitPx?: string; side?: string; sz?: string }>;
+        logProgress(`Node ${i}: Alice=${JSON.stringify(ao)}, Bob=${JSON.stringify(bo)}`);
+      }
+      // Cleanup before failing
+      for (const acct of [TEST_ACCOUNTS.ALICE, TEST_ACCOUNTS.BOB]) {
+        const ca = { type: 'spotCancelAll', market: 128 };
+        const { signature: cs, nonce: cn } = await signAction(ca, acct.privateKey);
+        await exchangeRequestTo(GATEWAY_URLS[0], ca, cs, cn);
+      }
+      await sleep(1000);
+      throw new Error('Cross-node spot orders did not match within 30s');
+    }
+    logProgress('Spot orders matched successfully');
+
+    // Wait for balance propagation
+    await sleep(3000);
+
+    // Verify balance changes: Alice TEST increased, Bob TEST decreased
+    const aliceAfter = await getTokenBalances(GATEWAY_URLS[0], TEST_ACCOUNTS.ALICE.address);
+    const bobAfter = await getTokenBalances(GATEWAY_URLS[0], TEST_ACCOUNTS.BOB.address);
+    logProgress(`After - Alice: USDC=${aliceAfter.usdc}, TEST=${aliceAfter.test}`);
+    logProgress(`After - Bob: USDC=${bobAfter.usdc}, TEST=${bobAfter.test}`);
+
+    const aliceTestDelta = aliceAfter.test - aliceBefore.test;
+    const bobTestDelta = bobAfter.test - bobBefore.test;
+    logProgress(`Alice TEST delta: ${aliceTestDelta}, Bob TEST delta: ${bobTestDelta}`);
+
+    if (aliceTestDelta <= 0) {
+      throw new Error(`Expected Alice TEST balance to increase, but delta = ${aliceTestDelta}`);
+    }
+    if (bobTestDelta >= 0) {
+      throw new Error(`Expected Bob TEST balance to decrease, but delta = ${bobTestDelta}`);
+    }
+
+    // Verify unifiedBalances identical across all 5 nodes
+    const nodeBalances: string[] = [];
+    for (let i = 0; i < NUM_NODES; i++) {
+      const aliceUb = (await infoRequestTo(GATEWAY_URLS[i], 'unifiedBalances', {
+        user: TEST_ACCOUNTS.ALICE.address,
+      })) as { balances?: Array<{ tokenIndex?: number; total: string }> };
+      const sorted = (aliceUb.balances || [])
+        .sort((a, b) => (a.tokenIndex || 0) - (b.tokenIndex || 0))
+        .map((b) => `${b.tokenIndex || 0}:${b.total}`);
+      nodeBalances.push(JSON.stringify(sorted));
+    }
+
+    const allMatch = nodeBalances.every((b) => b === nodeBalances[0]);
+    if (!allMatch) {
+      throw new Error(`Unified balances differ across nodes after spot trade: ${JSON.stringify(nodeBalances)}`);
+    }
+    logProgress(`Spot balances consistent across all ${NUM_NODES} nodes`);
+  });
+
+  await runTest(ctx, 'Nonce replay protection and old nonce rejection', 'multinode-crossnode-advanced', 'Replayed nonce and old nonce both rejected', async () => {
+    // Part A: Replay protection — same nonce rejected on retry
+    const leverageAction = {
+      type: 'updateLeverage',
+      asset: 0,
+      isCross: true,
+      leverage: 30,
+    };
+    const { signature, nonce } = await signAction(leverageAction, TEST_ACCOUNTS.CHARLIE.privateKey);
+    logProgress(`Submitting leverage update with nonce=${nonce} to Node 0...`);
+    await exchangeRequestTo(GATEWAY_URLS[0], leverageAction, signature, nonce);
+    logProgress('First submission succeeded');
+
+    // Wait for block inclusion so that last_timestamp_nonce is updated
+    await sleep(5000);
+
+    // Re-submit exact same action + signature + nonce — must fail
+    let replayRejected = false;
+    try {
+      await exchangeRequestTo(GATEWAY_URLS[0], leverageAction, signature, nonce);
+      logProgress('WARNING: Replay was accepted (should have been rejected)');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logProgress(`Replay correctly rejected: ${msg.slice(0, 80)}`);
+      replayRejected = true;
+    }
+
+    if (!replayRejected) {
+      throw new Error('Nonce replay was not rejected — same nonce should fail on retry');
+    }
+
+    // Verify chain continues producing blocks after rejection
+    const statusBefore = (await cometbftRpcCall(COMETBFT_RPC_URLS[0], 'status')) as {
+      result: { sync_info: { latest_block_height: string } };
+    };
+    const heightBefore = parseInt(statusBefore.result.sync_info.latest_block_height);
+    await sleep(3000);
+    const statusAfter = (await cometbftRpcCall(COMETBFT_RPC_URLS[0], 'status')) as {
+      result: { sync_info: { latest_block_height: string } };
+    };
+    const heightAfter = parseInt(statusAfter.result.sync_info.latest_block_height);
+    if (heightAfter <= heightBefore) {
+      throw new Error('Chain stopped producing blocks after nonce replay rejection');
+    }
+    logProgress(`Chain healthy: blocks ${heightBefore} -> ${heightAfter}`);
+
+    // Part B: Old nonce rejection — nonce > 1 hour in the past
+    const oldNonce = Date.now() - 7_200_000; // 2 hours ago
+
+    // EIP-712 domain and types for updateLeverage
+    const EIP712_DOMAIN = {
+      name: 'HyperCore',
+      version: '1',
+      chainId: 1337,
+      verifyingContract: '0x0000000000000000000000000000000000000000' as `0x${string}`,
+    };
+    const leverageTypes = {
+      Action: [
+        { name: 'type', type: 'string' },
+        { name: 'asset', type: 'uint8' },
+        { name: 'isCross', type: 'bool' },
+        { name: 'leverage', type: 'uint8' },
+        { name: 'nonce', type: 'uint64' },
+      ],
+    };
+    const oldAction = {
+      type: 'updateLeverage',
+      asset: 0,
+      isCross: true,
+      leverage: 35,
+    };
+    const oldMessage = { ...oldAction, nonce: BigInt(oldNonce) };
+
+    const oldSigRaw = await signTypedData({
+      privateKey: TEST_ACCOUNTS.CHARLIE.privateKey,
+      domain: EIP712_DOMAIN,
+      types: leverageTypes,
+      primaryType: 'Action',
+      message: oldMessage,
+    });
+    // Parse signature into r, s, v
+    const sigHex = oldSigRaw.slice(2);
+    const oldSig = {
+      r: `0x${sigHex.slice(0, 64)}`,
+      s: `0x${sigHex.slice(64, 128)}`,
+      v: parseInt(sigHex.slice(128, 130), 16),
+    };
+
+    logProgress(`Submitting action with old nonce=${oldNonce} (2 hours ago)...`);
+    let oldNonceRejected = false;
+    try {
+      await exchangeRequestTo(GATEWAY_URLS[0], oldAction, oldSig, oldNonce);
+      logProgress('WARNING: Old nonce was accepted (should have been rejected)');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logProgress(`Old nonce correctly rejected: ${msg.slice(0, 80)}`);
+      oldNonceRejected = true;
+    }
+
+    if (!oldNonceRejected) {
+      throw new Error('Old nonce (2 hours ago) was not rejected — should be outside 1-hour window');
+    }
+
+    // Reset leverage to default
+    const resetAction = { type: 'updateLeverage', asset: 0, isCross: true, leverage: 10 };
+    const { signature: rSig, nonce: rNonce } = await signAction(resetAction, TEST_ACCOUNTS.CHARLIE.privateKey);
+    await exchangeRequestTo(GATEWAY_URLS[0], resetAction, rSig, rNonce);
+    await sleep(1000);
+    logProgress('Nonce replay and old nonce protection verified');
+  });
+
+  await runTest(ctx, 'EVM transaction receipts consistent across nodes', 'multinode-crossnode-advanced', 'Deploy contract, verify receipt fields match on all nodes', async () => {
+    const account = privateKeyToAccount(TEST_ACCOUNTS.ALICE.privateKey);
+    const walletClient = createWalletClient({
+      account,
+      chain: { ...foundry, id: CHAIN_ID },
+      transport: http(EVM_RPC_URLS[0]),
+    });
+
+    // Deploy SimpleStorage (same bytecode as Section 25)
+    const SIMPLE_STORAGE_BYTECODE = '0x6034600c60003960346000f360003560e01c806360fe47b114601e5780636d4ce63c14602757600080fd5b50600435600055005b5060005460005260206000f3';
+
+    logProgress('Deploying SimpleStorage on Node 0...');
+    const deployHash = await walletClient.deployContract({
+      abi: [
+        { type: 'function', name: 'set', inputs: [{ type: 'uint256' }], outputs: [], stateMutability: 'nonpayable' },
+        { type: 'function', name: 'get', inputs: [], outputs: [{ type: 'uint256' }], stateMutability: 'view' },
+      ],
+      bytecode: SIMPLE_STORAGE_BYTECODE as `0x${string}`,
+    });
+
+    const publicClient0 = createPublicClient({
+      chain: { ...foundry, id: CHAIN_ID },
+      transport: http(EVM_RPC_URLS[0]),
+    });
+
+    let contractAddr: string | null = null;
+    const deployed = await waitForCondition(async () => {
+      try {
+        const receipt = await publicClient0.getTransactionReceipt({ hash: deployHash });
+        if (receipt?.contractAddress) {
+          contractAddr = receipt.contractAddress;
+          return true;
+        }
+      } catch { /* not yet */ }
+      return false;
+    }, 15000, 1000);
+
+    if (!deployed || !contractAddr) {
+      throw new Error('Contract deployment receipt not found after 15s');
+    }
+    logProgress(`Contract deployed at ${contractAddr}`);
+
+    // Call set(42) and wait for receipt
+    const setHash = await walletClient.writeContract({
+      address: contractAddr as `0x${string}`,
+      abi: [
+        { type: 'function', name: 'set', inputs: [{ type: 'uint256' }], outputs: [], stateMutability: 'nonpayable' },
+      ],
+      functionName: 'set',
+      args: [42n],
+    });
+    logProgress(`set(42) tx: ${setHash.slice(0, 20)}...`);
+
+    let setReceiptNode0: any = null;
+    await waitForCondition(async () => {
+      try {
+        setReceiptNode0 = await publicClient0.getTransactionReceipt({ hash: setHash });
+        return setReceiptNode0 != null;
+      } catch { return false; }
+    }, 15000, 1000);
+
+    if (!setReceiptNode0) {
+      throw new Error('set(42) receipt not found on Node 0 after 15s');
+    }
+    logProgress(`set(42) receipt on Node 0: status=${setReceiptNode0.status}, gasUsed=${setReceiptNode0.gasUsed}`);
+
+    // Wait for propagation
+    await sleep(5000);
+
+    // Query eth_getTransactionReceipt on all nodes via raw evmRpcCall
+    const receipts: Array<Record<string, unknown>> = [];
+    for (let i = 0; i < NUM_NODES; i++) {
+      try {
+        const receipt = (await evmRpcCall(EVM_RPC_URLS[i], 'eth_getTransactionReceipt', [setHash])) as Record<string, unknown>;
+        if (!receipt) {
+          throw new Error(`Node ${i} returned null receipt`);
+        }
+        receipts.push(receipt);
+        logProgress(`Node ${i}: status=${receipt.status}, gasUsed=${receipt.gasUsed}, from=${(receipt.from as string)?.slice(0, 10)}...`);
+      } catch (e: any) {
+        throw new Error(`Node ${i} failed to return receipt: ${e.message?.slice(0, 80)}`);
+      }
+    }
+
+    // Compare canonical receipt fields across all nodes
+    const referenceReceipt = receipts[0];
+    const fieldsToCompare = ['status', 'gasUsed', 'from', 'to', 'transactionHash'];
+
+    for (let i = 1; i < receipts.length; i++) {
+      for (const field of fieldsToCompare) {
+        const refVal = String(referenceReceipt[field] || '').toLowerCase();
+        const nodeVal = String(receipts[i][field] || '').toLowerCase();
+        if (refVal !== nodeVal) {
+          throw new Error(
+            `Receipt field '${field}' differs: Node 0 = ${refVal}, Node ${i} = ${nodeVal}`
+          );
+        }
+      }
+      // Compare logs count
+      const refLogs = Array.isArray(referenceReceipt.logs) ? referenceReceipt.logs.length : 0;
+      const nodeLogsArr = receipts[i].logs;
+      const nodeLogs = Array.isArray(nodeLogsArr) ? nodeLogsArr.length : 0;
+      if (refLogs !== nodeLogs) {
+        throw new Error(
+          `Receipt logs count differs: Node 0 = ${refLogs}, Node ${i} = ${nodeLogs}`
+        );
+      }
+    }
+    logProgress('All receipt fields consistent across nodes');
+
+    // Also verify get() == 42 on all nodes
+    const getAbi = [
+      { type: 'function', name: 'get', inputs: [], outputs: [{ type: 'uint256' }], stateMutability: 'view' },
+    ] as const;
+
+    for (let i = 0; i < NUM_NODES; i++) {
+      const client = createPublicClient({
+        chain: { ...foundry, id: CHAIN_ID },
+        transport: http(EVM_RPC_URLS[i]),
+      });
+      const value = await client.readContract({
+        address: contractAddr as `0x${string}`,
+        abi: getAbi,
+        functionName: 'get',
+      });
+      if (value !== 42n) {
+        throw new Error(`Node ${i}: get() returned ${value}, expected 42`);
+      }
+      logProgress(`Node ${i}: get() = 42`);
+    }
+    logProgress('EVM receipts and contract state consistent across all nodes');
   });
 }

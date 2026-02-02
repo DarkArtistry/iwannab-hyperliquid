@@ -413,6 +413,12 @@ impl Application for CometBftApp {
                                 let tx_hash_hex = format!("0x{}", hex::encode(tx_hash.as_slice()));
 
                                 if let Some(ref receipts_store) = inner.evm_receipts {
+                                    // Calculate contract address for deployments (to == None)
+                                    let contract_address = if evm_tx.to.is_none() && result.success {
+                                        Some(calculate_contract_address_hex(evm_tx.from.as_slice(), evm_tx.nonce))
+                                    } else {
+                                        None
+                                    };
                                     let receipt = TransactionReceipt {
                                         transaction_hash: tx_hash_hex.clone(),
                                         transaction_index: "0x0".to_string(),
@@ -423,7 +429,7 @@ impl Application for CometBftApp {
                                         cumulative_gas_used: format!("0x{:x}", result.gas_used),
                                         effective_gas_price: format!("0x{:x}", evm_tx.gas_price),
                                         gas_used: format!("0x{:x}", result.gas_used),
-                                        contract_address: None,
+                                        contract_address,
                                         logs: vec![],
                                         logs_bloom: format!("0x{}", "0".repeat(512)),
                                         tx_type: "0x2".to_string(),
@@ -622,6 +628,45 @@ impl Application for CometBftApp {
             status: 1, // ACCEPT
         }
     }
+}
+
+/// Calculate contract address from sender and nonce (CREATE opcode).
+/// Returns the 20-byte contract address as a hex string "0x..."
+fn calculate_contract_address_hex(sender_bytes: &[u8], nonce: u64) -> String {
+    let mut buf = Vec::new();
+
+    // RLP: [sender (20 bytes), nonce]
+    let sender_len = 21; // 0x94 + 20 bytes
+    let nonce_len = if nonce == 0 { 1 } else if nonce < 0x80 { 1 } else if nonce < 0x100 { 2 } else { 9 };
+    let total_len = sender_len + nonce_len;
+
+    if total_len < 56 {
+        buf.push(0xc0 + total_len as u8);
+    } else {
+        buf.push(0xf7 + 1);
+        buf.push(total_len as u8);
+    }
+
+    buf.push(0x94);
+    buf.extend_from_slice(sender_bytes);
+
+    if nonce == 0 {
+        buf.push(0x80);
+    } else if nonce < 0x80 {
+        buf.push(nonce as u8);
+    } else if nonce < 0x100 {
+        buf.push(0x81);
+        buf.push(nonce as u8);
+    } else {
+        let nonce_bytes = nonce.to_be_bytes();
+        let leading_zeros = nonce_bytes.iter().take_while(|&&b| b == 0).count();
+        let nonce_bytes = &nonce_bytes[leading_zeros..];
+        buf.push(0x80 + nonce_bytes.len() as u8);
+        buf.extend_from_slice(nonce_bytes);
+    }
+
+    let hash = Keccak256::digest(&buf);
+    format!("0x{}", hex::encode(&hash[12..]))
 }
 
 #[cfg(test)]

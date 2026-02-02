@@ -610,6 +610,9 @@ impl SpotEngine {
         // Process matching
         let mut fills = Vec::new();
         let mut remaining_order = order.clone();
+        // Track maker orders that need state updates after matching
+        let mut filled_maker_ids: Vec<OrderId> = Vec::new();
+        let mut partially_filled_makers: Vec<(OrderId, Decimal)> = Vec::new();
 
         {
             let orderbook = self.state.get_orderbook_mut(market_id)
@@ -686,6 +689,7 @@ impl SpotEngine {
                 // Remove maker order from book if filled
                 if maker_order.remaining_size <= fill_size {
                     orderbook.remove(maker_order.id);
+                    filled_maker_ids.push(maker_order.id);
                 } else {
                     // Update maker order size in book
                     // Note: In a real implementation, we'd update the order in place
@@ -694,9 +698,25 @@ impl SpotEngine {
                     updated_maker.remaining_size = updated_maker.remaining_size - fill_size;
                     orderbook.remove(maker_order.id);
                     if !updated_maker.is_filled() {
-                        orderbook.insert(updated_maker);
+                        orderbook.insert(updated_maker.clone());
+                        partially_filled_makers.push((maker_order.id, updated_maker.remaining_size));
+                    } else {
+                        filled_maker_ids.push(maker_order.id);
                     }
                 }
+            }
+        }
+
+        // Sync the orders/account_orders maps with orderbook changes
+        for maker_id in &filled_maker_ids {
+            self.state.remove_order(market_id, *maker_id);
+        }
+        for (maker_id, new_remaining) in &partially_filled_makers {
+            if let Some(order_entry) = self.state.orders.get_mut(&market_id)
+                .and_then(|m| m.get_mut(maker_id))
+            {
+                order_entry.remaining_size = *new_remaining;
+                order_entry.status = OrderStatus::PartiallyFilled;
             }
         }
 
@@ -899,14 +919,20 @@ impl SpotEngine {
             });
         }
 
-        if request.size < config.min_order_size {
+        // Normalize size to the market's decimal scale for correct comparison.
+        // Order sizes arrive in PRICE_DECIMALS (8) but market config uses
+        // the token's wei_decimals (typically 18). The derived Ord on Decimal
+        // compares raw values without normalizing, so we must align scales.
+        let size_normalized = request.size.to_decimals(config.lot_size.decimals());
+
+        if size_normalized.raw() < config.min_order_size.raw() {
             return Err(Error::SizeTooSmall {
                 size: request.size.to_string_trimmed(),
                 min_size: config.min_order_size.to_string_trimmed(),
             });
         }
 
-        if request.size > config.max_order_size {
+        if size_normalized.raw() > config.max_order_size.raw() {
             return Err(Error::SizeTooLarge {
                 size: request.size.to_string_trimmed(),
                 max_size: config.max_order_size.to_string_trimmed(),

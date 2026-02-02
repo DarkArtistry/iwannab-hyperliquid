@@ -115,6 +115,21 @@ pub enum TransactionType {
         action_type: u8,
         data: Vec<u8>,
     },
+    /// Place spot orders (uses SpotOrder EIP-712 type, without reduce_only field)
+    SpotOrder {
+        orders: Vec<OrderWire>,
+        grouping: OrderGrouping,
+    },
+    /// Cancel all orders in a specific spot market (or all spot markets if None)
+    SpotCancelAll {
+        market: Option<u8>,
+    },
+    /// View transfer between Core and EVM views
+    ViewTransfer {
+        token: u8,
+        amount: String,
+        to_evm: bool,
+    },
 }
 
 // ============================================================================
@@ -253,6 +268,52 @@ impl TransactionType {
                 hasher.update(encode_uint64(nonce));
                 Ok(hasher.finalize().into())
             }
+            TransactionType::SpotOrder { orders, grouping } => {
+                // SpotOrder EIP-712 uses different type than perp Order:
+                // - Type string: "spotOrder" (not "order")
+                // - SpotOrder struct: no 'r' (reduce_only) field
+                let mut order_hashes = Vec::with_capacity(orders.len());
+                for order in orders {
+                    order_hashes.push(order.compute_hash_eip712_spot());
+                }
+
+                let orders_hash = encode_array(&order_hashes);
+
+                let type_hash = Keccak256::digest(
+                    b"Action(string type,SpotOrder[] orders,string grouping,uint64 nonce)SpotOrder(uint8 a,bool b,string p,string s,string t)"
+                );
+
+                let mut hasher = Keccak256::new();
+                hasher.update(type_hash);
+                hasher.update(encode_string("spotOrder"));
+                hasher.update(orders_hash);
+                hasher.update(encode_string(grouping.as_str()));
+                hasher.update(encode_uint64(nonce));
+                Ok(hasher.finalize().into())
+            }
+            TransactionType::SpotCancelAll { market } => {
+                let type_hash = Keccak256::digest(
+                    b"Action(string type,uint64 nonce)"
+                );
+                let mut hasher = Keccak256::new();
+                hasher.update(type_hash);
+                hasher.update(encode_string("spotCancelAll"));
+                hasher.update(encode_uint64(nonce));
+                Ok(hasher.finalize().into())
+            }
+            TransactionType::ViewTransfer { token, amount, to_evm } => {
+                let type_hash = Keccak256::digest(
+                    b"Action(string type,uint8 token,string amount,bool toEvm,uint64 nonce)"
+                );
+                let mut hasher = Keccak256::new();
+                hasher.update(type_hash);
+                hasher.update(encode_string("viewTransfer"));
+                hasher.update(encode_uint8(*token));
+                hasher.update(encode_string(amount));
+                hasher.update(encode_bool(*to_evm));
+                hasher.update(encode_uint64(nonce));
+                Ok(hasher.finalize().into())
+            }
         }
     }
 }
@@ -291,6 +352,25 @@ impl OrderWire {
         hasher.update(encode_string(&self.p));
         hasher.update(encode_string(&self.s));
         hasher.update(encode_bool(self.r));
+        hasher.update(encode_string(&self.t.to_tif_string()));
+        hasher.finalize().into()
+    }
+
+    /// Compute EIP-712 struct hash for SpotOrder (no reduce_only field)
+    ///
+    /// SpotOrder uses a different type definition than perp Order:
+    /// `SpotOrder(uint8 a,bool b,string p,string s,string t)` — no `bool r`
+    pub fn compute_hash_eip712_spot(&self) -> [u8; 32] {
+        use sha3::{Digest, Keccak256};
+        let type_hash = Keccak256::digest(
+            b"SpotOrder(uint8 a,bool b,string p,string s,string t)"
+        );
+        let mut hasher = Keccak256::new();
+        hasher.update(type_hash);
+        hasher.update(encode_uint8(self.a));
+        hasher.update(encode_bool(self.b));
+        hasher.update(encode_string(&self.p));
+        hasher.update(encode_string(&self.s));
         hasher.update(encode_string(&self.t.to_tif_string()));
         hasher.finalize().into()
     }
