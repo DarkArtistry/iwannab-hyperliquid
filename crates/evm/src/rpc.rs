@@ -105,6 +105,23 @@ pub struct TransactionRequest {
     pub nonce: Option<String>,
 }
 
+/// Address filter that supports both single string and array (viem sends single string)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AddressFilter {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
+impl AddressFilter {
+    fn to_vec(&self) -> Vec<String> {
+        match self {
+            AddressFilter::Single(s) => vec![s.clone()],
+            AddressFilter::Multiple(v) => v.clone(),
+        }
+    }
+}
+
 /// Log filter for eth_getLogs
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -115,9 +132,9 @@ pub struct LogFilter {
     /// To block
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to_block: Option<BlockTag>,
-    /// Contract addresses
+    /// Contract addresses (supports single string or array)
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub address: Option<Vec<String>>,
+    pub address: Option<AddressFilter>,
     /// Event topics
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topics: Option<Vec<Option<String>>>,
@@ -666,10 +683,68 @@ impl EthApiServer for EvmRpcServer {
         Ok(transactions.get(&hash).cloned())
     }
 
-    async fn get_logs(&self, _filter: LogFilter) -> RpcResult<Vec<LogEntry>> {
-        // For now, return empty logs
-        // In production, this should filter through stored logs
-        Ok(vec![])
+    async fn get_logs(&self, filter: LogFilter) -> RpcResult<Vec<LogEntry>> {
+        let receipts = self.state.receipts.read().await;
+        let current_block = *self.state.block_number.read().await;
+
+        let from_block = match &filter.from_block {
+            Some(tag) => tag.to_block_number(current_block)?,
+            None => 0,
+        };
+        let to_block = match &filter.to_block {
+            Some(tag) => tag.to_block_number(current_block)?,
+            None => current_block,
+        };
+
+        let filter_addrs: Option<Vec<String>> = filter.address
+            .map(|a| a.to_vec().iter().map(|s| s.to_lowercase()).collect());
+
+        let mut all_logs = Vec::new();
+
+        for receipt in receipts.values() {
+            let block_str = receipt.block_number.strip_prefix("0x").unwrap_or(&receipt.block_number);
+            let receipt_block = u64::from_str_radix(block_str, 16).unwrap_or(0);
+
+            // Block hash filter overrides from/to
+            if let Some(ref bh) = filter.block_hash {
+                if receipt.block_hash.to_lowercase() != bh.to_lowercase() { continue; }
+            } else if receipt_block < from_block || receipt_block > to_block {
+                continue;
+            }
+
+            for log in &receipt.logs {
+                // Address filter
+                if let Some(ref addrs) = filter_addrs {
+                    if !addrs.contains(&log.address.to_lowercase()) { continue; }
+                }
+                // Topic filter (positional per Ethereum spec)
+                if let Some(ref topics) = filter.topics {
+                    let mut ok = true;
+                    for (i, expected) in topics.iter().enumerate() {
+                        if let Some(ref exp) = expected {
+                            if i >= log.topics.len() || log.topics[i].to_lowercase() != exp.to_lowercase() {
+                                ok = false; break;
+                            }
+                        }
+                    }
+                    if !ok { continue; }
+                }
+                all_logs.push(log.clone());
+            }
+        }
+
+        // Sort by block number, then log index
+        all_logs.sort_by(|a, b| {
+            let ab = u64::from_str_radix(a.block_number.strip_prefix("0x").unwrap_or(&a.block_number), 16).unwrap_or(0);
+            let bb = u64::from_str_radix(b.block_number.strip_prefix("0x").unwrap_or(&b.block_number), 16).unwrap_or(0);
+            ab.cmp(&bb).then_with(|| {
+                let ai = u64::from_str_radix(a.log_index.strip_prefix("0x").unwrap_or(&a.log_index), 16).unwrap_or(0);
+                let bi = u64::from_str_radix(b.log_index.strip_prefix("0x").unwrap_or(&b.log_index), 16).unwrap_or(0);
+                ai.cmp(&bi)
+            })
+        });
+
+        Ok(all_logs)
     }
 
     async fn get_block_by_number(&self, block: BlockTag, _full_transactions: bool) -> RpcResult<Option<BlockObject>> {

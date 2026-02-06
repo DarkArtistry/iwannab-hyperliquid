@@ -254,6 +254,8 @@ export async function runRiskTests(ctx: TestContext): Promise<void> {
     const aliceCount = await getOpenOrdersCount(TEST_ACCOUNTS.ALICE.address);
     const bobCount = await getOpenOrdersCount(TEST_ACCOUNTS.BOB.address);
 
+    if (aliceCount !== 0) throw new Error(`Alice still has ${aliceCount} orders after cleanup`);
+    if (bobCount !== 0) throw new Error(`Bob still has ${bobCount} orders after cleanup`);
     logProgress(`After cleanup - Alice: ${aliceCount} orders, Bob: ${bobCount} orders`);
   });
 
@@ -687,6 +689,13 @@ export async function runRiskTests(ctx: TestContext): Promise<void> {
     logProgress(`Final coreView balance: $${finalBalance.toFixed(2)}`);
 
     const change = finalBalance - initialBalance;
+    if (change === 0) {
+      throw new Error('Balance should have changed after trade (margin lock + fees), but it did not');
+    }
+    // Buyer's balance should decrease (margin lock + taker fee)
+    if (change > 0) {
+      throw new Error(`Expected balance to decrease after buy trade (margin lock + fees), but it increased by $${change.toFixed(4)}`);
+    }
     logProgress(`Balance change: $${change.toFixed(4)} (includes margin lock and fees)`);
   });
 
@@ -698,7 +707,7 @@ export async function runRiskTests(ctx: TestContext): Promise<void> {
     logProgress('Testing reduce-only order behavior...');
 
     // Place a reduce-only buy order when we have no position
-    // This should either be rejected or have no effect
+    // This should be rejected — reduce-only cannot open a new position
     const reduceOnlyCloid = `reduce-only-${Date.now()}`;
     const action = {
       type: 'order',
@@ -714,29 +723,27 @@ export async function runRiskTests(ctx: TestContext): Promise<void> {
       grouping: 'na',
     };
 
-    const startTime = Date.now();
     const { signature, nonce } = await signAction(action, TEST_ACCOUNTS.ALICE.privateKey);
     const result = (await exchangeRequest(action, signature, nonce)) as ApiResponse;
-    const durationMs = Date.now() - startTime;
 
-    logProgress(`Reduce-only order response in ${durationMs}ms`);
-    logProgress(`Status: ${result.status}`);
-
-    // Check if order was rejected or didn't rest (expected behavior for reduce-only with no position)
+    // Check that the order was rejected or did not rest in the book
     const orderStatus = result.response?.data?.statuses?.[0];
-    if (orderStatus?.error) {
-      logProgress(`Order rejected as expected: ${orderStatus.error}`);
-    } else if (orderStatus?.resting) {
-      logProgress(`Order unexpectedly rested, ID: ${orderStatus.resting.oid}`);
-      // Clean it up
+    if (orderStatus?.resting) {
+      // Order should NOT rest when reduce-only with no position — clean up and fail
       const cancelAction = {
         type: 'cancel',
         cancels: [{ a: 0, o: orderStatus.resting.oid }],
       };
       const { signature: cancelSig, nonce: cancelNonce } = await signAction(cancelAction, TEST_ACCOUNTS.ALICE.privateKey);
       await exchangeRequest(cancelAction, cancelSig, cancelNonce);
+      throw new Error(`Reduce-only order should not rest when no position exists (got oid=${orderStatus.resting.oid})`);
+    }
+
+    // Verify the order was either explicitly rejected or simply not placed
+    if (orderStatus?.error) {
+      logProgress(`Reduce-only correctly rejected: ${orderStatus.error}`);
     } else {
-      logProgress('Order did not rest (expected for reduce-only with no position)');
+      logProgress('Reduce-only order did not rest (correct — no position to reduce)');
     }
   });
 
@@ -766,6 +773,8 @@ export async function runRiskTests(ctx: TestContext): Promise<void> {
     const aliceRemaining = await getOpenOrdersCount(TEST_ACCOUNTS.ALICE.address);
     const bobRemaining = await getOpenOrdersCount(TEST_ACCOUNTS.BOB.address);
 
+    if (aliceRemaining !== 0) throw new Error(`Alice still has ${aliceRemaining} orders after final cleanup`);
+    if (bobRemaining !== 0) throw new Error(`Bob still has ${bobRemaining} orders after final cleanup`);
     logProgress(`After cleanup - Alice: ${aliceRemaining} orders, Bob: ${bobRemaining} orders`);
   });
 }

@@ -20,32 +20,15 @@ use crate::app::HyperCoreApp;
 use crate::tx::Transaction;
 use super::validators::ValidatorSet;
 
-use hypercore_evm::{EvmExecutor, decode_raw_transaction, B256, TransactionReceipt, TransactionObject};
+use hypercore_evm::{EvmExecutor, decode_raw_transaction, B256, TransactionReceipt, TransactionObject, LogEntry};
 use tokio::sync::RwLock as TokioRwLock;
 use std::collections::HashMap;
 use sha3::{Digest, Keccak256};
 
-/// Acquire a write lock on a tokio RwLock with retry (for sync/blocking contexts).
-///
-/// In FinalizeBlock (which runs on a spawn_blocking thread), blocking_write() can
-/// deadlock if an EVM RPC handler concurrently holds a read lock. This helper uses
-/// try_write() with short sleeps, matching the pattern in app.rs for perp/spot engines.
-fn acquire_tokio_write_with_retry<'a, T>(lock: &'a TokioRwLock<T>, label: &str) -> Option<tokio::sync::RwLockWriteGuard<'a, T>> {
-    if let Ok(guard) = lock.try_write() {
-        return Some(guard);
-    }
-    for attempt in 1..=100 {
-        std::thread::sleep(std::time::Duration::from_millis(1));
-        if let Ok(guard) = lock.try_write() {
-            if attempt > 5 {
-                tracing::debug!("{}: acquired write lock after {} retries", label, attempt);
-            }
-            return Some(guard);
-        }
-    }
-    tracing::error!("{}: failed to acquire write lock after 100 retries", label);
-    None
-}
+#[cfg(feature = "persistence")]
+use hypercore_persistence::{RocksDbBackend, StatePersister};
+#[cfg(feature = "persistence")]
+use crate::persistence_integration::extract_state;
 
 /// CometBFT Application wrapper
 ///
@@ -73,6 +56,13 @@ struct CometBftAppInner {
     evm_transactions: Option<Arc<TokioRwLock<HashMap<B256, TransactionObject>>>>,
     /// Shared EVM block number counter
     evm_block_number: Option<Arc<TokioRwLock<u64>>>,
+    /// State persistence backend (populated when persistence feature enabled)
+    #[cfg(feature = "persistence")]
+    persistence: Option<Arc<RocksDbBackend>>,
+    /// Pending state to persist on Commit (stored by FinalizeBlock, persisted by Commit)
+    /// This ensures persistence happens AFTER CometBFT commits, not before.
+    #[cfg(feature = "persistence")]
+    pending_persistence: Option<hypercore_persistence::PersistedState>,
 }
 
 impl CometBftApp {
@@ -87,6 +77,10 @@ impl CometBftApp {
                 evm_receipts: None,
                 evm_transactions: None,
                 evm_block_number: None,
+                #[cfg(feature = "persistence")]
+                persistence: None,
+                #[cfg(feature = "persistence")]
+                pending_persistence: None,
             })),
         }
     }
@@ -96,7 +90,12 @@ impl CometBftApp {
     /// When set, the ABCI app can process raw EVM transactions that are
     /// broadcast directly (not wrapped in a HyperCore Transaction envelope).
     pub fn with_evm_executor(self, executor: Arc<TokioRwLock<EvmExecutor>>) -> Self {
-        self.inner.write().evm_executor = Some(executor);
+        let mut inner = self.inner.write();
+        // Set on CometBftAppInner for EVM tx execution in FinalizeBlock
+        inner.evm_executor = Some(Arc::clone(&executor));
+        // Also set on AppState so compute_app_hash() includes EVM state
+        inner.app.state.set_evm_executor(executor);
+        drop(inner);
         self
     }
 
@@ -116,6 +115,13 @@ impl CometBftApp {
         self
     }
 
+    /// Set the persistence backend for state persistence after each block
+    #[cfg(feature = "persistence")]
+    pub fn with_persistence(self, db: Arc<RocksDbBackend>) -> Self {
+        self.inner.write().persistence = Some(db);
+        self
+    }
+
     /// Get the current block height
     pub fn current_height(&self) -> u64 {
         self.inner.read().app.current_height()
@@ -124,6 +130,14 @@ impl CometBftApp {
     /// Get the chain ID
     pub fn chain_id(&self) -> String {
         self.inner.read().chain_id.clone()
+    }
+
+    /// Compute the current AppHash from state and compare against an expected value.
+    /// Returns (matches, computed_hash).
+    pub fn verify_app_hash(&self, expected: &[u8; 32]) -> (bool, [u8; 32]) {
+        let inner = self.inner.read();
+        let computed = inner.app.state.compute_app_hash();
+        (computed == *expected, computed)
     }
 }
 
@@ -136,14 +150,46 @@ impl Application for CometBftApp {
     }
 
     /// Info request - returns application information
+    ///
+    /// CRITICAL: This is called by CometBFT on startup to determine the app's last committed state.
+    /// The returned height and app_hash must match what CometBFT has in its state.db.
     fn info(&self, _request: RequestInfo) -> ResponseInfo {
         let inner = self.inner.read();
+        let height = inner.app.current_height();
+        let app_hash = inner.app.state.app_hash;
+
+        // Recompute app_hash to verify it matches the stored value.
+        // This helps diagnose state divergence issues on restart.
+        let recomputed = inner.app.state.compute_app_hash();
+        let matches = app_hash == recomputed;
+
+        // Log full app_hash (not truncated) for debugging consensus divergence
+        tracing::info!(
+            "ABCI Info: height={}, app_hash={}, recomputed={}, matches={}, version={}",
+            height,
+            hex::encode(&app_hash),
+            hex::encode(&recomputed),
+            matches,
+            env!("CARGO_PKG_VERSION"),
+        );
+
+        if !matches {
+            tracing::error!(
+                "CRITICAL: Stored app_hash does not match recomputed! \
+                 stored={} recomputed={} height={}. \
+                 This indicates state corruption or persistence issue.",
+                hex::encode(&app_hash),
+                hex::encode(&recomputed),
+                height,
+            );
+        }
+
         ResponseInfo {
             data: "HyperCore".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             app_version: 1,
-            last_block_height: inner.app.current_height() as i64,
-            last_block_app_hash: inner.app.state.app_hash.to_vec().into(),
+            last_block_height: height as i64,
+            last_block_app_hash: app_hash.to_vec().into(),
         }
     }
 
@@ -246,6 +292,12 @@ impl Application for CometBftApp {
 
     /// InitChain - initialize chain with genesis state
     fn init_chain(&self, request: RequestInitChain) -> ResponseInitChain {
+        tracing::info!(
+            "ABCI InitChain: chain_id={}, validators={}, app_state_bytes={}",
+            request.chain_id,
+            request.validators.len(),
+            request.app_state_bytes.len(),
+        );
         let mut inner = self.inner.write();
 
         // Store chain ID
@@ -323,7 +375,43 @@ impl Application for CometBftApp {
     /// 1. JSON-encoded HyperCore Transaction (orders, cancels, transfers, etc.)
     /// 2. Raw RLP-encoded EVM transactions (from eth_sendRawTransaction)
     fn finalize_block(&self, request: RequestFinalizeBlock) -> ResponseFinalizeBlock {
+        tracing::info!(
+            "ABCI FinalizeBlock: height={}, txs={}",
+            request.height,
+            request.txs.len(),
+        );
         let mut inner = self.inner.write();
+
+        // Guard against duplicate FinalizeBlock at the same height.
+        // This can happen if CometBFT replays the last block after a hash mismatch on restart.
+        // Without this guard, re-executing on already-committed state corrupts the app_hash.
+        if inner.app.current_height() == request.height as u64 {
+            tracing::warn!(
+                "FinalizeBlock: skipping duplicate height {} (already committed)",
+                request.height
+            );
+            return ResponseFinalizeBlock {
+                events: Vec::new(),
+                tx_results: Vec::new(),
+                validator_updates: Vec::new(),
+                consensus_param_updates: None,
+                app_hash: inner.app.state.app_hash.to_vec().into(),
+            };
+        }
+
+        // Log CLOID state and next_order_id at start of block for debugging state divergence
+        let cloid_count_start = inner.app.state.cloid_count();
+        let next_order_id_start = inner.app.state.perp_engine
+            .as_ref()
+            .and_then(|pe| pe.try_read().ok())
+            .map(|eng| eng.state.peek_next_order_id())
+            .unwrap_or(0);
+        tracing::debug!(
+            "FinalizeBlock START: height={}, cloid_count={}, next_order_id={}",
+            request.height,
+            cloid_count_start,
+            next_order_id_start
+        );
 
         // Extract timestamp from the request (handle Option<Timestamp>)
         let timestamp = request.time.map(|t| t.seconds as u64 * 1000 + t.nanos as u64 / 1_000_000)
@@ -335,6 +423,37 @@ impl Application for CometBftApp {
         // Execute transactions
         let mut tx_results = Vec::with_capacity(request.txs.len());
         let mut events = Vec::new();
+
+        // Process misbehavior evidence from CometBFT
+        if !request.misbehavior.is_empty() {
+            inner.app.state.last_evidence_count = request.misbehavior.len();
+            inner.app.state.total_evidence_count += request.misbehavior.len();
+            for evidence in &request.misbehavior {
+                tracing::error!(
+                    "MISBEHAVIOR EVIDENCE: type={:?}, height={}, total_voting_power={}",
+                    evidence.r#type,
+                    evidence.height,
+                    evidence.total_voting_power,
+                );
+                events.push(tendermint_proto::abci::Event {
+                    r#type: "misbehavior_evidence".to_string(),
+                    attributes: vec![
+                        tendermint_proto::abci::EventAttribute {
+                            key: "evidence_type".to_string(),
+                            value: format!("{:?}", evidence.r#type),
+                            index: true,
+                        },
+                        tendermint_proto::abci::EventAttribute {
+                            key: "evidence_height".to_string(),
+                            value: evidence.height.to_string(),
+                            index: true,
+                        },
+                    ],
+                });
+            }
+        } else {
+            inner.app.state.last_evidence_count = 0;
+        }
 
         for tx_bytes in request.txs {
             // Try JSON-encoded HyperCore Transaction first
@@ -385,20 +504,12 @@ impl Application for CometBftApp {
             match decode_raw_transaction(&tx_bytes) {
                 Ok(evm_tx) => {
                     if let Some(ref executor) = inner.evm_executor {
-                        // Acquire write lock with retry to avoid deadlock with EVM RPC readers
-                        let Some(mut exec) = acquire_tokio_write_with_retry(executor, "EVM executor (FinalizeBlock)") else {
-                            tx_results.push(tendermint_proto::abci::ExecTxResult {
-                                code: 1,
-                                data: Vec::new().into(),
-                                log: "EVM executor lock contention (100 retries exhausted)".to_string(),
-                                info: String::new(),
-                                gas_wanted: evm_tx.gas_limit as i64,
-                                gas_used: 0,
-                                events: Vec::new(),
-                                codespace: "evm".to_string(),
-                            });
-                            continue;
-                        };
+                        // Use blocking_write() for deterministic consensus execution.
+                        // This runs on a spawn_blocking thread, so blocking is safe.
+                        // Critical: we MUST acquire this lock reliably. If we skip EVM
+                        // transactions due to lock contention, the app_hash will diverge
+                        // from other validators, breaking consensus.
+                        let mut exec = executor.blocking_write();
                         match exec.execute_tx(&evm_tx) {
                             Ok(result) => {
                                 exec.commit();
@@ -430,14 +541,23 @@ impl Application for CometBftApp {
                                         effective_gas_price: format!("0x{:x}", evm_tx.gas_price),
                                         gas_used: format!("0x{:x}", result.gas_used),
                                         contract_address,
-                                        logs: vec![],
+                                        logs: result.logs.iter().enumerate().map(|(i, log)| LogEntry {
+                                            address: format!("0x{}", hex::encode(log.address.as_slice())),
+                                            topics: log.topics.iter().map(|t| format!("0x{}", hex::encode(t))).collect(),
+                                            data: format!("0x{}", hex::encode(&log.data)),
+                                            block_number: block_hex.clone(),
+                                            transaction_hash: tx_hash_hex.clone(),
+                                            transaction_index: "0x0".to_string(),
+                                            block_hash: block_hash.clone(),
+                                            log_index: format!("0x{:x}", i),
+                                            removed: false,
+                                        }).collect(),
                                         logs_bloom: format!("0x{}", "0".repeat(512)),
                                         tx_type: "0x2".to_string(),
                                         status: if result.success { "0x1".to_string() } else { "0x0".to_string() },
                                     };
-                                    if let Some(mut store) = acquire_tokio_write_with_retry(receipts_store, "EVM receipts store") {
-                                        store.insert(tx_hash, receipt);
-                                    }
+                                    let mut store = receipts_store.blocking_write();
+                                    store.insert(tx_hash, receipt);
                                 }
                                 if let Some(ref txs_store) = inner.evm_transactions {
                                     let tx_obj = TransactionObject {
@@ -457,9 +577,8 @@ impl Application for CometBftApp {
                                         s: format!("0x{}", "0".repeat(64)),
                                         tx_type: "0x2".to_string(),
                                     };
-                                    if let Some(mut store) = acquire_tokio_write_with_retry(txs_store, "EVM transactions store") {
-                                        store.insert(tx_hash, tx_obj);
-                                    }
+                                    let mut store = txs_store.blocking_write();
+                                    store.insert(tx_hash, tx_obj);
                                 }
 
                                 let evm_event = tendermint_proto::abci::Event {
@@ -552,13 +671,121 @@ impl Application for CometBftApp {
 
         // Update shared EVM block number to match CometBFT height
         if let Some(ref block_num) = inner.evm_block_number {
-            if let Some(mut bn) = acquire_tokio_write_with_retry(block_num, "EVM block number") {
-                *bn = request.height as u64;
-            }
+            let mut bn = block_num.blocking_write();
+            *bn = request.height as u64;
         }
+
+        // Log CLOID state before commit for debugging state divergence
+        let cloid_count_end = inner.app.state.cloid_count();
+        tracing::debug!(
+            "FinalizeBlock END: height={}, cloid_count={} (delta={})",
+            request.height,
+            cloid_count_end,
+            cloid_count_end as i64 - cloid_count_start as i64
+        );
 
         // Commit and get app hash
         let app_hash = inner.app.commit();
+
+        // Persist state to RocksDB after commit
+        // extract_state() now handles perp_engine extraction directly when provided,
+        // storing all trading state in perp.* fields with scalars mirrored to core.*.
+        #[cfg(feature = "persistence")]
+        if let Some(ref db) = inner.persistence {
+            let mut persisted_state = extract_state(
+                request.height as u64,
+                timestamp,
+                app_hash,
+                &inner.app.state.unified_state,
+                &inner.app.state.engine,
+                inner.app.state.perp_engine.as_ref().map(|p| p as &_),
+                inner.app.state.spot_engine.as_ref().map(|s| s as &_),
+                inner.app.get_nonces(),
+                inner.app.get_cloid_index(),
+                inner.app.get_block_metadata(),
+            );
+
+            tracing::info!(
+                "Persisting state at height {} with {} balances, {} perp orders, {} perp positions, next_order_id={}",
+                request.height,
+                persisted_state.core.balances.len(),
+                persisted_state.perp.orders.len(),
+                persisted_state.perp.positions.len(),
+                persisted_state.perp.next_order_id,
+            );
+
+            // Extract EVM state for persistence
+            // CRITICAL: Without this, restarted nodes have empty EVM state, causing
+            // different evm_root in compute_app_hash() and consensus failure.
+            if let Some(ref executor) = inner.evm_executor {
+                use hypercore_persistence::{EvmAccountEntry, EvmStorageEntry, EvmCodeEntry, EvmBlockHashEntry};
+
+                let evm = executor.blocking_read();
+                let evm_state = evm.state();
+
+                // Extract EVM accounts (address, nonce, code_hash)
+                for (addr, account) in evm_state.get_all_accounts_data() {
+                    persisted_state.evm.accounts.push(EvmAccountEntry {
+                        address: addr.0 .0,
+                        nonce: account.nonce,
+                        code_hash: account.code_hash.map(|h| h.0),
+                    });
+                }
+
+                // Extract EVM storage (address, slot, value)
+                for (addr, slots) in evm_state.get_all_storage_entries() {
+                    for (slot, value) in slots.iter() {
+                        persisted_state.evm.storage.push(EvmStorageEntry {
+                            address: addr.0 .0,
+                            slot: slot.to_be_bytes(),
+                            value: value.to_be_bytes(),
+                        });
+                    }
+                }
+
+                // Extract EVM code (code_hash, bytecode)
+                for (code_hash, bytecode) in evm_state.get_all_code_entries() {
+                    persisted_state.evm.code.push(EvmCodeEntry {
+                        code_hash: code_hash.0,
+                        bytecode: bytecode.clone(),
+                    });
+                }
+
+                // Extract EVM block hashes
+                for (height, hash) in evm_state.get_all_block_hashes() {
+                    persisted_state.evm.block_hashes.push(EvmBlockHashEntry {
+                        height: *height,
+                        hash: hash.0,
+                    });
+                }
+
+                tracing::debug!(
+                    "EVM state extracted: {} accounts, {} storage slots, {} code entries",
+                    persisted_state.evm.accounts.len(),
+                    persisted_state.evm.storage.len(),
+                    persisted_state.evm.code.len(),
+                );
+            }
+
+            // Store state for persistence in Commit (not here!)
+            // CRITICAL: Persisting in FinalizeBlock causes CometBFT restart panics.
+            // CometBFT stores app_hash in state.db AFTER calling Commit.
+            // If we persist in FinalizeBlock and the node crashes before Commit,
+            // on restart the app has new state but CometBFT has old app_hash.
+            tracing::debug!(
+                "FinalizeBlock: prepared state for height {} ({} balances, app_hash={}), will persist in Commit",
+                request.height,
+                persisted_state.core.balances.len(),
+                hex::encode(&app_hash[..8]),
+            );
+            inner.pending_persistence = Some(persisted_state);
+        }
+        #[cfg(feature = "persistence")]
+        if inner.persistence.is_none() {
+            if request.height == 1 {
+                tracing::warn!("Persistence backend not set - state will not be persisted");
+            }
+        }
 
         ResponseFinalizeBlock {
             events,
@@ -575,7 +802,32 @@ impl Application for CometBftApp {
     }
 
     /// Commit - persist state (called after FinalizeBlock in ABCI 2.0)
+    /// CRITICAL: State persistence MUST happen here, not in FinalizeBlock.
+    /// CometBFT stores app_hash in state.db AFTER Commit returns.
+    /// If we persist in FinalizeBlock, a crash before Commit causes mismatch on restart.
     fn commit(&self) -> ResponseCommit {
+        #[cfg(feature = "persistence")]
+        {
+            let mut inner = self.inner.write();
+            if let Some(persisted_state) = inner.pending_persistence.take() {
+                if let Some(ref db) = inner.persistence {
+                    let persister = StatePersister::new(db.as_ref());
+                    match persister.persist_state(&persisted_state) {
+                        Ok(()) => {
+                            tracing::info!(
+                                "Commit: persisted state at height {} ({} balances, {} perp orders)",
+                                persisted_state.height,
+                                persisted_state.core.balances.len(),
+                                persisted_state.perp.orders.len(),
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!("Commit: failed to persist state at height {}: {}", persisted_state.height, e);
+                        }
+                    }
+                }
+            }
+        }
         ResponseCommit {
             retain_height: 0,
         }

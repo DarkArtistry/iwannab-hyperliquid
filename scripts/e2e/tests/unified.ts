@@ -24,6 +24,7 @@ import {
   exchangeRequest,
   signAction,
   runTest,
+  assertErrorContains,
   logSection,
   log,
   logProgress,
@@ -224,15 +225,18 @@ export async function runUnifiedStateTests(ctx: TestContext): Promise<void> {
         throw new Error('Transfer should have been rejected but succeeded!');
       }
 
-      logProgress(`Transfer correctly rejected: ${result.error || 'Insufficient balance'}`);
+      assertErrorContains(
+        result.error || '',
+        ['Insufficient balance', 'Insufficient'],
+        'Insufficient Core view rejection'
+      );
+      logProgress(`Transfer correctly rejected: ${result.error}`);
     } catch (error: unknown) {
       // HTTP error is also acceptable for insufficient balance
       const message = error instanceof Error ? error.message : String(error);
-      if (message.includes('Insufficient') || message.includes('error')) {
-        logProgress(`Transfer correctly rejected: ${message}`);
-      } else {
-        throw error;
-      }
+      if (message.includes('should have been rejected')) throw error;
+      assertErrorContains(message, ['Insufficient balance', 'Insufficient'], 'Insufficient Core view rejection');
+      logProgress(`Transfer correctly rejected: ${message}`);
     }
   });
 
@@ -260,14 +264,17 @@ export async function runUnifiedStateTests(ctx: TestContext): Promise<void> {
         throw new Error('Transfer should have been rejected but succeeded!');
       }
 
-      logProgress(`Transfer correctly rejected: ${result.error || 'Insufficient balance'}`);
+      assertErrorContains(
+        result.error || '',
+        ['Insufficient balance', 'Insufficient'],
+        'Insufficient EVM view rejection'
+      );
+      logProgress(`Transfer correctly rejected: ${result.error}`);
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
-      if (message.includes('Insufficient') || message.includes('error')) {
-        logProgress(`Transfer correctly rejected: ${message}`);
-      } else {
-        throw error;
-      }
+      if (message.includes('should have been rejected')) throw error;
+      assertErrorContains(message, ['Insufficient balance', 'Insufficient'], 'Insufficient EVM view rejection');
+      logProgress(`Transfer correctly rejected: ${message}`);
     }
   });
 
@@ -344,12 +351,26 @@ export async function runUnifiedStateTests(ctx: TestContext): Promise<void> {
     if (result.status !== 'ok') {
       throw new Error(`TEST view transfer failed: ${JSON.stringify(result)}`);
     }
-    if (result.response?.data) {
-      logProgress(`TEST transfer successful:`);
-      logProgress(`  New Core View: ${result.response.data.newCoreView}`);
-      logProgress(`  New EVM View: ${result.response.data.newEvmView}`);
-      logProgress(`  Total: ${result.response.data.total} (should be unchanged)`);
+
+    // Verify the transfer actually changed the values
+    const balancesAfter = (await infoRequest('unifiedBalances', { user: TEST_ACCOUNTS.ALICE.address })) as {
+      balances: { tokenIndex: number; total: string; coreView: string; evmView: string }[];
+    };
+    const testAfter = balancesAfter.balances.find((b) => b.tokenIndex === 1);
+    if (!testAfter) throw new Error('TEST token balance not found after transfer');
+
+    const coreBefore = parseFloat(testBefore.coreView);
+    const coreAfter = parseFloat(testAfter.coreView);
+    const evmBefore = parseFloat(testBefore.evmView);
+    const evmAfter = parseFloat(testAfter.evmView);
+
+    if (coreAfter >= coreBefore - 0.01) throw new Error(`Core view should have decreased: ${coreBefore} -> ${coreAfter}`);
+    if (evmAfter <= evmBefore + 0.01) throw new Error(`EVM view should have increased: ${evmBefore} -> ${evmAfter}`);
+    // Verify total unchanged
+    if (Math.abs(parseFloat(testAfter.total) - parseFloat(testBefore.total)) > 0.01) {
+      throw new Error(`Total changed: ${testBefore.total} -> ${testAfter.total}`);
     }
+    logProgress(`TEST transfer verified: core ${coreBefore} -> ${coreAfter}, evm ${evmBefore} -> ${evmAfter}`);
   });
 
   // =========================================================================
@@ -557,8 +578,14 @@ export async function runUnifiedStateTests(ctx: TestContext): Promise<void> {
     logProgress('Balance restored to Core view');
   });
 
-  await runTest(ctx, 'Zero amount transfer rejection', 'unified', 'Verify zero amount transfers are handled correctly', async () => {
+  await runTest(ctx, 'Zero amount transfer handling', 'unified', 'Verify zero amount transfers do not alter balance', async () => {
     logProgress('Testing zero amount transfer handling...');
+
+    // Record balance before
+    const before = (await infoRequest('unifiedBalances', { user: TEST_ACCOUNTS.ALICE.address })) as {
+      balances: { tokenIndex: number; coreView: string; evmView: string }[];
+    };
+    const usdcBefore = before.balances.find((b) => b.tokenIndex === 0);
 
     const action = {
       type: 'viewTransfer',
@@ -575,14 +602,25 @@ export async function runUnifiedStateTests(ctx: TestContext): Promise<void> {
         error?: string;
       };
 
-      // Zero transfers might succeed (no-op) or be rejected - both are valid
       if (result.status === 'ok') {
-        logProgress('Zero transfer treated as no-op (acceptable)');
+        // If accepted as no-op, verify balance unchanged
+        const after = (await infoRequest('unifiedBalances', { user: TEST_ACCOUNTS.ALICE.address })) as {
+          balances: { tokenIndex: number; coreView: string; evmView: string }[];
+        };
+        const usdcAfter = after.balances.find((b) => b.tokenIndex === 0);
+
+        if (usdcBefore?.coreView !== usdcAfter?.coreView || usdcBefore?.evmView !== usdcAfter?.evmView) {
+          throw new Error(
+            `Zero transfer altered balance: core ${usdcBefore?.coreView} -> ${usdcAfter?.coreView}, ` +
+            `evm ${usdcBefore?.evmView} -> ${usdcAfter?.evmView}`
+          );
+        }
+        logProgress('Zero transfer accepted as no-op, balance unchanged');
       } else {
-        logProgress(`Zero transfer rejected: ${result.error} (acceptable)`);
+        logProgress(`Zero transfer rejected: ${result.error}`);
       }
     } catch (e) {
-      logProgress('Zero transfer rejected with error (acceptable)');
+      logProgress('Zero transfer rejected with error (expected)');
     }
   });
 
@@ -806,9 +844,11 @@ export async function runUnifiedStateTests(ctx: TestContext): Promise<void> {
       if ((e as Error).message.includes('CRITICAL BUG')) {
         throw e; // Re-throw our bug detection
       }
-      // Network error or other rejection = transfer was blocked
+      // Validate the error message is related to insufficient/available balance
+      const errMsg = (e as Error).message;
+      assertErrorContains(errMsg, ['Insufficient', 'balance', 'available'], 'Reserved balance over-transfer rejection');
       transferBlocked = true;
-      logProgress('Transfer correctly rejected due to reserved balance');
+      logProgress(`Transfer correctly rejected: ${errMsg}`);
     }
 
     if (!transferBlocked) {

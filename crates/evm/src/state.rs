@@ -453,6 +453,61 @@ impl EvmState {
     pub fn u256_from_u64(value: u64) -> U256 {
         U256::from(value)
     }
+
+    // ========================================================================
+    // State Extraction (for persistence)
+    // ========================================================================
+
+    /// Get all accounts with their data (for persistence)
+    pub fn get_all_accounts_data(&self) -> impl Iterator<Item = (&Address, &EvmAccount)> {
+        self.accounts.iter()
+    }
+
+    /// Get all storage entries (for persistence)
+    pub fn get_all_storage_entries(&self) -> impl Iterator<Item = (&Address, &HashMap<U256, U256>)> {
+        self.storage.iter().map(|(addr, s)| (addr, &s.slots))
+    }
+
+    /// Get all code entries (for persistence)
+    pub fn get_all_code_entries(&self) -> impl Iterator<Item = (&B256, &Vec<u8>)> {
+        self.code.iter()
+    }
+
+    /// Get all block hashes (for persistence)
+    pub fn get_all_block_hashes(&self) -> impl Iterator<Item = (&u64, &B256)> {
+        self.block_hashes.iter()
+    }
+
+    // ========================================================================
+    // State Restoration (from persistence)
+    // ========================================================================
+
+    /// Restore an account from persistence
+    pub fn restore_account(&mut self, address: Address, nonce: u64, code_hash: Option<B256>) {
+        let account = EvmAccount {
+            nonce,
+            code_hash,
+        };
+        self.accounts.insert(address, account);
+    }
+
+    /// Restore contract storage from persistence
+    pub fn restore_storage(&mut self, address: Address, key: U256, value: U256) {
+        let storage = self.storage.entry(address).or_insert_with(|| ContractStorage {
+            slots: HashMap::new(),
+        });
+        storage.slots.insert(key, value);
+    }
+
+    /// Restore contract code from persistence
+    pub fn restore_code(&mut self, code_hash: B256, code: Vec<u8>) {
+        self.code.insert(code_hash, code);
+    }
+
+    /// Restore block hash from persistence
+    pub fn restore_block_hash(&mut self, number: u64, hash: B256) {
+        self.block_hashes.insert(number, hash);
+    }
 }
 
 /// EVM state snapshot for rollback

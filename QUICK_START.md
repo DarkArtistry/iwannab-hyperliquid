@@ -10,14 +10,15 @@ iwannab-hyperliquid/
 ├── Makefile                   # Build and run commands
 ├── docker-compose.yml         # Full stack deployment
 │
-├── crates/                    # Rust crates
-│   ├── primitives/            # Core types (Decimal, Order, Position, etc.)
+├── crates/                    # Rust crates (8 crates)
+│   ├── primitives/            # Core types (Decimal, Order, Position, UnifiedState)
 │   ├── engine/                # Matching engine, risk, funding, liquidation
-│   ├── chain/                 # ABCI app for CometBFT consensus
-│   ├── evm/                   # HyperEVM with precompiles
-│   ├── gateway/               # HTTP/WebSocket API server
-│   ├── indexer/               # PostgreSQL data indexing
-│   └── node/                  # Main binary entry point
+│   ├── chain/                 # CometBFT ABCI app, Merkle proofs, attestation
+│   ├── evm/                   # HyperEVM with precompiles and JSON-RPC
+│   ├── gateway/               # HTTP/WebSocket API server with rate limiting
+│   ├── indexer/               # PostgreSQL data indexing and candle aggregation
+│   ├── persistence/           # RocksDB state persistence (24 column families)
+│   └── node/                  # Main binary (single-node & CometBFT modes)
 │
 ├── contracts/                 # Solidity contracts
 │   ├── src/
@@ -39,15 +40,19 @@ iwannab-hyperliquid/
 │   └── docker/                # Dockerfiles
 │
 ├── scripts/                   # Utility scripts
+│   ├── e2e/                   # E2E test suite (151 single-node + 52 multi-node tests)
+│   ├── e2e-test.sh            # Single-node E2E orchestration
+│   ├── e2e-multinode-full.sh  # 5-validator E2E orchestration
 │   ├── seed-accounts.sh       # Create test accounts
-│   └── place-orders.sh        # Sample order placement
+│   └── generate-multi-validator-genesis.sh  # N-validator genesis generator
 │
 └── docs/                      # Documentation
     ├── ARCHITECTURE.md        # System architecture
     ├── PROTOCOL.md            # Protocol specification
     ├── API.md                 # API reference
+    ├── CONSENSUS.md           # Consensus verification and BFT properties
     ├── SECURITY.md            # Security considerations
-    └── CODE_AUDIT.md          # Implementation status
+    └── IMPLEMENTATION_STATUS.md  # Detailed implementation analysis
 ```
 
 ## Prerequisites
@@ -77,7 +82,7 @@ cd iwannab-hyperliquid
 cargo build
 
 # Run tests
-cargo test
+cargo test --workspace --features cometbft
 ```
 
 ### 2. Start with Docker Compose (Recommended)
@@ -97,7 +102,7 @@ docker-compose logs -f indexer  # Indexer logs
 docker-compose down
 ```
 
-**Services and Ports (Phase 2A Architecture):**
+**Services and Ports:**
 
 | Service | Ports | Description |
 |---------|-------|-------------|
@@ -106,10 +111,10 @@ docker-compose down
 | `indexer` | - | Blockchain indexer |
 | `cometbft` | 26656 (P2P), 26657 (RPC) | Consensus |
 
-**Key Architecture Note (Phase 2A):**
-- Gateway API (port 3000) and EVM RPC (port 8545) now run in the **same process**
+**Key Architecture Note:**
+- Gateway API (port 3000) and EVM RPC (port 8545) run in the **same process**
 - This ensures they share the same `UnifiedState` for consistent balance views
-- The standalone gateway container is now in the `standalone-gateway` profile (not started by default)
+- The standalone gateway container is in the `standalone-gateway` profile (not started by default)
 
 ### 3. Or run services directly
 
@@ -262,7 +267,7 @@ forge test
 forge script script/Deploy.s.sol --rpc-url http://localhost:8545 --broadcast
 ```
 
-## Architecture Overview (Phase 2A)
+## Architecture Overview
 
 ```
                     ┌─────────────────────────────────────────────────────────┐
@@ -302,12 +307,12 @@ forge script script/Deploy.s.sol --rpc-url http://localhost:8545 --broadcast
         │
 ┌───────▼───────┐
 │   CometBFT    │
-│  (Consensus)  │
-│  [Phase 2B ✅] │
+│ (BFT Consensus)│
+│               │
 └───────────────┘
 ```
 
-### Key Concepts (Phase 2A)
+### Key Concepts
 
 1. **Unified State Model**: Single master balance sheet with views (`core_view`, `evm_view`). Both Gateway and EVM RPC see the same state because they run in the same process.
 
@@ -444,34 +449,16 @@ cargo run -p hypercore-gateway -- --http-addr 0.0.0.0:3001
 
 See `docs/IMPLEMENTATION_STATUS.md` for detailed implementation status. Key limitations:
 
-**Resolved in Phase 2A:**
-- ✅ ~~Separate state systems~~ - Now uses unified state model
-- ✅ ~~Gateway and EVM have different views~~ - Now share same process/state
-
-**Resolved in Phase 2B:**
-- ✅ ~~ABCI server is a stub~~ - CometBFT integration now complete with dual consensus modes
-
-**Resolved in Phase 3A (Genesis State):**
-- ✅ ~~Runtime creditBalance() calls~~ - Initial balances now set via genesis configuration
-- ✅ ~~Empty genesis state~~ - Genesis includes markets, tokens, and account balances
-
-**Resolved in Phase 3B (Gas Fees):**
-- ✅ ~~No gas fee infrastructure~~ - Gas fee system implemented (disabled by default for dev)
-
-**Resolved in Phase 4 (Persistence):**
-- ✅ ~~No state persistence~~ - RocksDB-based persistence with auto-save on block commit (Phase 4A/4B)
-
-**Still Pending:**
-1. **EIP-712 production mode** - Dev workarounds in place, production needs exact hash matching (Phase 3D)
-2. **State commitment hardening** - Simple hash, needs Merkle proofs for light clients (Phase 3C)
+All core features are implemented. The only remaining item is:
+1. **External Security Audit** - Third-party audit before mainnet deployment
 
 ## Running Tests
 
 ### Rust Tests
 
 ```bash
-# Run all Rust unit tests (160 tests)
-cargo test
+# Run all Rust unit tests (556 tests)
+cargo test --workspace --features cometbft
 
 # Run tests for specific crate
 cargo test -p hypercore-engine
@@ -503,7 +490,7 @@ cd sdk/typescript
 # Install dependencies
 pnpm install
 
-# Run all integration tests (86 tests)
+# Run all integration tests
 pnpm test:integration
 
 # Run specific test file
@@ -524,8 +511,6 @@ pnpm test:watch
 | 06-positions.test.ts | 14 | Positions, leverage, PnL |
 | 07-advanced.test.ts | 11 | Market making, stress tests |
 
-See `sdk/typescript/tests/integration/README.md` for detailed test documentation.
-
 ### Full E2E Integration Tests
 
 A comprehensive E2E test script that manages the entire test lifecycle:
@@ -544,7 +529,7 @@ A comprehensive E2E test script that manages the entire test lifecycle:
 ./scripts/e2e-test.sh --verbose
 ```
 
-**E2E Test Coverage (122 tests):**
+**E2E Test Coverage (151 tests):**
 | Category | Tests | Description |
 |----------|-------|-------------|
 | Connection | 4 | Gateway health, endpoints, EVM RPC |
@@ -553,33 +538,33 @@ A comprehensive E2E test script that manages the entire test lifecycle:
 | Orders | 10 | Place, cancel, batch, USD transfer, leverage |
 | Matching | 4 | Cross orders, price improvement |
 | Positions | 3 | Tracking, leverage, margin |
-| EVM | 24 | All eth_* methods, blocks, transactions |
+| EVM | 25 | All eth_* methods, blocks, transactions |
 | EVM Advanced | 9 | Contract deployment, storage, nonces |
-| Token Standards | 8 | ERC20, ERC721, ERC1155 |
+| Token Standards | 11 | ERC20, ERC721, ERC1155 |
 | Spot Trading | 12 | Spot orders, balances, cancellation |
 | Unified State | 18 | View transfers, balance invariants |
 | Stress | 3 | Rapid orders, concurrent requests |
-| Advanced | 15 | Withdraw, reduce-only, error handling, position lifecycle |
+| Risk & Margin | 13 | Margin requirements, leverage limits, liquidation |
+| State Proofs | 9 | State commitment, Merkle proofs, verification |
+| Advanced | 18 | Withdraw, reduce-only, error handling, position lifecycle |
 
 See `scripts/e2e/README.md` for detailed E2E test documentation.
 
 ## Next Steps
 
-**Completed:**
-- ✅ EVM Integration with revm (Phase 1)
-- ✅ HIP-1 Spot Token Trading (Phase 1c)
-- ✅ Unified state model (Phase 2A)
-- ✅ CometBFT consensus integration (Phase 2B)
-- ✅ Genesis state initialization (Phase 3A)
-- ✅ Gas fee infrastructure (Phase 3B)
-- ✅ Persistence infrastructure with RocksDB (Phase 4A)
-- ✅ State save/restore on block commit (Phase 4B)
+All core phases are complete:
+- ✅ EVM Integration with revm, HIP-1 Spot Trading (Phase 1)
+- ✅ Unified state model, CometBFT consensus (Phase 2A/2B)
+- ✅ Genesis state, gas fees, Merkle proofs, EIP-712 (Phase 3)
+- ✅ RocksDB persistence with state save/restore (Phase 4)
+- ✅ Indexer with candle aggregation (Phase 5)
+- ✅ Rate limiting, input validation (Phase 6)
+- ✅ State attestation, P2P gossip, re-org handling (Phase 7)
+- ✅ Multi-node BFT consensus (5-validator, 52 E2E tests)
 
 **Remaining Work:**
-1. Review `docs/IMPLEMENTATION_STATUS.md` for detailed status
-2. Production EIP-712 signature verification (Phase 3D)
-3. State commitment with Merkle proofs (Phase 3C)
-4. Production indexer integration (Phase 5)
+1. External security audit (required before mainnet)
+2. Review `docs/IMPLEMENTATION_STATUS.md` for detailed status
 
 ## Genesis State Configuration
 

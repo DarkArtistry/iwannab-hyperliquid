@@ -85,6 +85,10 @@ pub enum InfoRequest {
     /// Get unified balances (showing Core and EVM views)
     UnifiedBalances { user: String },
 
+    // === Byzantine Evidence Queries ===
+    /// Get evidence status (misbehavior evidence counters)
+    EvidenceStatus,
+
     // === Phase 3C: State Proof Queries ===
     /// Get current state info (block height, app hash, state roots)
     StateInfo,

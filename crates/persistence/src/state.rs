@@ -10,7 +10,13 @@ use serde::{Deserialize, Serialize};
 
 /// Schema version for the persistence format
 /// Increment when making breaking changes to the schema
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// Version history:
+/// - v1: Initial schema with core/perp/spot/evm/chain fields
+/// - v2: Unified persistence - perp.* is now the canonical source for all trading
+///        state (positions, orders, leverage, markets, scalars). core.* only holds
+///        balances and metadata. compute_app_hash() reads from perp_engine directly.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Complete persisted state that can be serialized/deserialized
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +44,15 @@ pub struct PersistedState {
 
     /// Chain metadata
     pub chain: ChainState,
+
+    /// Perpetual engine state (canonical source of truth for all trading state)
+    ///
+    /// Since schema v2, this is the canonical source for positions, orders, leverage,
+    /// markets, and scalars. compute_app_hash() reads directly from the perp_engine.
+    /// On restore, this data is loaded into the perp_engine via restore_perp_engine_state().
+    /// Falls back to core.* fields for backward compatibility with v1 snapshots.
+    #[serde(default)]
+    pub perp: PerpState,
 }
 
 impl PersistedState {
@@ -52,6 +67,7 @@ impl PersistedState {
             spot: SpotState::default(),
             evm: EvmStateData::default(),
             chain: ChainState::default(),
+            perp: PerpState::default(),
         }
     }
 
@@ -167,6 +183,34 @@ pub struct ChainState {
     pub cloid_index: Vec<CloidEntry>,
 }
 
+/// Perpetual engine internal state
+///
+/// Stored separately from CoreState because the shared EngineState (which CoreState
+/// represents) has different contents than the perp_engine's internal EngineState
+/// during normal CometBFT operation. The shared EngineState has empty positions/orders/
+/// leverage, while the perp_engine tracks them internally.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PerpState {
+    /// Positions tracked by the perp_engine
+    pub positions: Vec<PositionEntry>,
+
+    /// Leverage settings tracked by the perp_engine
+    pub leverage: Vec<LeverageEntry>,
+
+    /// Market state from the perp_engine (mark_price, funding, OI)
+    pub markets: Vec<MarketEntry>,
+
+    /// Open orders in the perp_engine's orderbooks
+    pub orders: Vec<OrderEntry>,
+
+    /// Next order ID from the perp_engine
+    pub next_order_id: OrderId,
+
+    /// Insurance fund balance from the perp_engine
+    #[serde(default)]
+    pub insurance_fund: String,
+}
+
 // ==================== ENTRY TYPES ====================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -181,17 +225,23 @@ pub struct UnifiedBalanceData {
     pub total: String,      // Decimal as string
     pub core_view: String,  // Decimal as string
     pub evm_view: String,   // Decimal as string
+    /// The decimal precision used for this balance (6 for USDC, 18 for other tokens)
+    #[serde(default = "default_decimals")]
+    pub decimals: u8,
+}
+
+fn default_decimals() -> u8 {
+    6 // Default to USDC decimals for backwards compatibility
 }
 
 impl UnifiedBalanceData {
     /// Check if the balance invariant holds
     pub fn is_valid(&self) -> bool {
-        // Parse decimals and check invariant
-        // Use 6 decimals (USDC standard) for validation
-        const DECIMALS: u8 = 6;
-        let total = Decimal::from_str_exact(&self.total, DECIMALS);
-        let core = Decimal::from_str_exact(&self.core_view, DECIMALS);
-        let evm = Decimal::from_str_exact(&self.evm_view, DECIMALS);
+        // Parse decimals and check invariant using the stored decimal precision
+        let decimals = self.decimals;
+        let total = Decimal::from_str_exact(&self.total, decimals);
+        let core = Decimal::from_str_exact(&self.core_view, decimals);
+        let evm = Decimal::from_str_exact(&self.evm_view, decimals);
 
         match (total, core, evm) {
             (Some(t), Some(c), Some(e)) => t == c + e,
@@ -229,6 +279,30 @@ pub struct MarketEntry {
     pub max_leverage: u8,
     pub tick_size: String,
     pub lot_size: String,
+    /// Maker fee rate (string for JSON compatibility)
+    /// CRITICAL: Must be persisted for consensus - different fee rates cause AppHash mismatch
+    #[serde(default)]
+    pub maker_fee_rate: String,
+    /// Taker fee rate (string for JSON compatibility)
+    /// CRITICAL: Must be persisted for consensus - different fee rates cause AppHash mismatch
+    #[serde(default)]
+    pub taker_fee_rate: String,
+    /// Market runtime state (mark price, funding, open interest)
+    /// These use #[serde(default)] for backwards compatibility with older snapshots
+    #[serde(default)]
+    pub mark_price: String,
+    #[serde(default)]
+    pub index_price: String,
+    #[serde(default)]
+    pub funding_rate: String,
+    #[serde(default)]
+    pub funding_accumulator: String,
+    #[serde(default)]
+    pub open_interest_long: String,
+    #[serde(default)]
+    pub open_interest_short: String,
+    #[serde(default)]
+    pub next_funding_time: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -257,6 +331,14 @@ pub struct SpotMarketEntry {
     pub quote_token: TokenIndex,
     pub tick_size: String,
     pub lot_size: String,
+    /// Maker fee rate (string for JSON compatibility)
+    /// CRITICAL: Must be persisted for consensus - different fee rates cause AppHash mismatch
+    #[serde(default)]
+    pub maker_fee_rate: String,
+    /// Taker fee rate (string for JSON compatibility)
+    /// CRITICAL: Must be persisted for consensus - different fee rates cause AppHash mismatch
+    #[serde(default)]
+    pub taker_fee_rate: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -361,6 +443,7 @@ mod tests {
             total: "100".to_string(),
             core_view: "60".to_string(),
             evm_view: "40".to_string(),
+            decimals: 6,
         };
         assert!(valid.is_valid());
 
@@ -368,6 +451,7 @@ mod tests {
             total: "100".to_string(),
             core_view: "60".to_string(),
             evm_view: "50".to_string(), // 60 + 50 != 100
+            decimals: 6,
         };
         assert!(!invalid.is_valid());
     }

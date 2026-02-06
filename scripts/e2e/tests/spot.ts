@@ -70,15 +70,14 @@ export async function runSpotTests(ctx: TestContext): Promise<void> {
   await runTest(ctx, 'Get spot mid prices', 'spot', 'Retrieve current mid prices for all spot markets', async () => {
     logProgress('Fetching spot mid prices...');
     const mids = (await infoRequest('spotAllMids')) as Record<string, string>;
-
-    // Mid prices may be empty if no orders are on the book
-    const markets = Object.keys(mids);
-    logProgress(`${markets.length} markets have mid prices`);
-
-    // Log any available mid prices
+    if (typeof mids !== 'object' || mids === null) throw new Error(`Expected object for spotAllMids, got ${typeof mids}`);
+    // Validate any returned prices are valid positive numbers
     for (const [market, price] of Object.entries(mids)) {
+      const parsed = parseFloat(price);
+      if (isNaN(parsed) || parsed <= 0) throw new Error(`Invalid spot mid price for ${market}: "${price}"`);
       logProgress(`  ${market}: ${price}`);
     }
+    logProgress(`${Object.keys(mids).length} markets with valid mid prices`);
   });
 
   await runTest(ctx, 'Get spot orderbook', 'spot', 'Retrieve L2 orderbook for TEST-USDC market', async () => {
@@ -138,12 +137,16 @@ export async function runSpotTests(ctx: TestContext): Promise<void> {
       limitPx: string;
       sz: string;
     }[];
-
-    // Orders may be empty for a new account
-    logProgress(`Found ${orders?.length || 0} open orders`);
-    for (const order of orders || []) {
+    if (!Array.isArray(orders)) throw new Error(`Expected array for spotOpenOrders, got ${typeof orders}`);
+    // Validate structure of any returned orders
+    for (const order of orders) {
+      if (order.oid === undefined) throw new Error(`Spot order missing oid: ${JSON.stringify(order)}`);
+      if (!order.side || (order.side !== 'B' && order.side !== 'A')) throw new Error(`Invalid spot order side: "${order.side}"`);
+      if (isNaN(parseFloat(order.limitPx))) throw new Error(`Invalid spot order price: "${order.limitPx}"`);
+      if (isNaN(parseFloat(order.sz)) || parseFloat(order.sz) <= 0) throw new Error(`Invalid spot order size: "${order.sz}"`);
       logProgress(`  ${order.market}: ${order.side} ${order.sz} @ ${order.limitPx} (oid: ${order.oid})`);
     }
+    logProgress(`Found ${orders.length} open orders (all valid)`);
   });
 
   await runTest(ctx, 'Get spot token info by index', 'spot', 'Retrieve detailed info for TEST token', async () => {
@@ -162,6 +165,10 @@ export async function runSpotTests(ctx: TestContext): Promise<void> {
 
     if (!info.symbol) throw new Error('Missing symbol in token info');
     if (info.symbol !== 'TEST') throw new Error(`Expected symbol=TEST, got ${info.symbol}`);
+    if (!info.name) throw new Error('Missing name in token info');
+    if (typeof info.weiDecimals !== 'number' || info.weiDecimals <= 0) throw new Error(`Invalid weiDecimals: ${info.weiDecimals}`);
+    if (typeof info.szDecimals !== 'number' || info.szDecimals < 0) throw new Error(`Invalid szDecimals: ${info.szDecimals}`);
+    if (!info.systemAddress) throw new Error('Missing systemAddress in token info');
 
     logProgress(`Token: ${info.name} (${info.symbol})`);
     logProgress(`  Decimals: wei=${info.weiDecimals}, sz=${info.szDecimals}`);
@@ -174,9 +181,15 @@ export async function runSpotTests(ctx: TestContext): Promise<void> {
     const orders = (await infoRequest('spotOpenOrders', {
       user: TEST_ACCOUNTS.ALICE.address,
       market: 'TEST-USDC',
-    })) as unknown[];
-
-    logProgress(`Found ${orders?.length || 0} orders in TEST-USDC market`);
+    })) as Array<{ market?: string; oid?: number }>;
+    if (!Array.isArray(orders)) throw new Error(`Expected array for filtered spotOpenOrders, got ${typeof orders}`);
+    // If orders exist, verify they all belong to the requested market
+    for (const order of orders) {
+      if (order.market && order.market !== 'TEST-USDC') {
+        throw new Error(`Market filter returned wrong market: expected TEST-USDC, got ${order.market}`);
+      }
+    }
+    logProgress(`Found ${orders.length} orders in TEST-USDC market`);
   });
 
   await runTest(ctx, 'Place spot limit order', 'spot', 'Place a limit buy order on TEST-USDC', async () => {
@@ -270,6 +283,7 @@ export async function runSpotTests(ctx: TestContext): Promise<void> {
     if (result.status !== 'ok') throw new Error(`Cancel failed: ${JSON.stringify(result)}`);
 
     const canceledCount = result.response?.data?.canceledCount || 0;
+    if (canceledCount === 0) throw new Error('Expected at least 1 order to be cancelled (we just placed one)');
     logProgress(`Cancelled ${canceledCount} orders`);
   });
 

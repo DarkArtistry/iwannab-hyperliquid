@@ -19,15 +19,21 @@ use hypercore_primitives::{
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use crate::state::{AppState, BlockMeta, SharedEngineState, SharedSpotEngine};
+use crate::state::{AppState, BlockMeta, SharedEngine, SharedEngineState, SharedSpotEngine};
 
 /// Extract complete state from runtime components into PersistedState
+///
+/// When `perp_engine` is provided, trading state (positions, orders, leverage,
+/// markets, scalars) is extracted from it into `perp.*` fields. The shared
+/// `engine` parameter is kept for backward compatibility but its trading state
+/// fields are no longer used when perp_engine is available.
 pub fn extract_state(
     height: u64,
     timestamp: u64,
     app_hash: [u8; 32],
     unified_state: &SharedUnifiedState,
     engine: &SharedEngineState,
+    perp_engine: Option<&SharedEngine>,
     spot_engine: Option<&SharedSpotEngine>,
     nonces: &HashMap<AccountAddress, u64>,
     cloid_index: &HashMap<(AccountAddress, String), (MarketId, OrderId)>,
@@ -50,16 +56,87 @@ pub fn extract_state(
                     total: balance.total.to_string_trimmed(),
                     core_view: balance.core_view.to_string_trimmed(),
                     evm_view: balance.evm_view.to_string_trimmed(),
+                    decimals: balance.total.decimals(),
                 },
             });
         }
     }
 
     // Extract perpetual engine state
-    {
+    // When perp_engine is available (CometBFT mode), extract all trading state from it.
+    // The perp_engine has the actual positions, orders, leverage, and updated scalars.
+    // Store in perp.* fields as the canonical source. Also mirror scalars to core.*
+    // for backward compatibility.
+    if let Some(perp) = perp_engine {
+        let perp_eng = perp.blocking_read();
+
+        // Extract positions from perp_engine
+        for (account, positions) in perp_eng.state.get_all_positions_global() {
+            for (market_id, position) in positions {
+                state.perp.positions.push(PositionEntry {
+                    account: *account,
+                    market: *market_id,
+                    position: position.clone(),
+                });
+            }
+        }
+
+        // Extract leverage from perp_engine
+        for (account, leverages) in perp_eng.state.get_all_leverage_global() {
+            for (market_id, leverage) in leverages {
+                state.perp.leverage.push(LeverageEntry {
+                    account: *account,
+                    market: *market_id,
+                    leverage: *leverage,
+                });
+            }
+        }
+
+        // Extract markets from perp_engine (has current mark_price, funding state)
+        // CRITICAL: Fee rates MUST be persisted for consensus safety
+        for market in perp_eng.state.get_all_markets() {
+            state.perp.markets.push(MarketEntry {
+                id: market.id(),
+                symbol: market.config.symbol.clone(),
+                max_leverage: market.config.max_leverage,
+                tick_size: market.config.tick_size.to_string_trimmed(),
+                lot_size: market.config.lot_size.to_string_trimmed(),
+                maker_fee_rate: market.config.maker_fee_rate.to_string_trimmed(),
+                taker_fee_rate: market.config.taker_fee_rate.to_string_trimmed(),
+                mark_price: market.state.mark_price.to_string_trimmed(),
+                index_price: market.state.index_price.to_string_trimmed(),
+                funding_rate: market.state.funding_rate.to_string_trimmed(),
+                funding_accumulator: market.state.funding_accumulator.to_string_trimmed(),
+                open_interest_long: market.state.open_interest_long.to_string_trimmed(),
+                open_interest_short: market.state.open_interest_short.to_string_trimmed(),
+                next_funding_time: market.state.next_funding_time,
+            });
+        }
+
+        // Extract orders from perp_engine orderbooks
+        for market in perp_eng.state.get_all_markets() {
+            if let Some(orderbook) = perp_eng.state.get_orderbook(market.id()) {
+                for order in orderbook.get_all_orders() {
+                    state.perp.orders.push(OrderEntry {
+                        market: market.id(),
+                        order_id: order.id,
+                        order: order.clone(),
+                    });
+                }
+            }
+        }
+
+        // Scalars: store in perp (canonical) and core (backward compat)
+        let next_order_id = perp_eng.state.peek_next_order_id();
+        let insurance_fund = perp_eng.state.get_insurance_fund().to_string_trimmed();
+        state.perp.next_order_id = next_order_id;
+        state.perp.insurance_fund = insurance_fund.clone();
+        state.core.next_order_id = next_order_id;
+        state.core.insurance_fund = insurance_fund;
+    } else {
+        // Fallback: extract from shared engine (for tests without perp_engine)
         let eng = engine.blocking_read();
 
-        // Extract positions
         for (account, positions) in eng.get_all_positions_global() {
             for (market_id, position) in positions {
                 state.core.positions.push(PositionEntry {
@@ -70,7 +147,6 @@ pub fn extract_state(
             }
         }
 
-        // Extract leverage settings
         for (account, leverages) in eng.get_all_leverage_global() {
             for (market_id, leverage) in leverages {
                 state.core.leverage.push(LeverageEntry {
@@ -81,7 +157,6 @@ pub fn extract_state(
             }
         }
 
-        // Extract markets
         for market in eng.get_all_markets() {
             state.core.markets.push(MarketEntry {
                 id: market.id(),
@@ -89,10 +164,18 @@ pub fn extract_state(
                 max_leverage: market.config.max_leverage,
                 tick_size: market.config.tick_size.to_string_trimmed(),
                 lot_size: market.config.lot_size.to_string_trimmed(),
+                maker_fee_rate: market.config.maker_fee_rate.to_string_trimmed(),
+                taker_fee_rate: market.config.taker_fee_rate.to_string_trimmed(),
+                mark_price: market.state.mark_price.to_string_trimmed(),
+                index_price: market.state.index_price.to_string_trimmed(),
+                funding_rate: market.state.funding_rate.to_string_trimmed(),
+                funding_accumulator: market.state.funding_accumulator.to_string_trimmed(),
+                open_interest_long: market.state.open_interest_long.to_string_trimmed(),
+                open_interest_short: market.state.open_interest_short.to_string_trimmed(),
+                next_funding_time: market.state.next_funding_time,
             });
         }
 
-        // Extract orders from orderbooks
         for market in eng.get_all_markets() {
             if let Some(orderbook) = eng.get_orderbook(market.id()) {
                 for order in orderbook.get_all_orders() {
@@ -127,6 +210,8 @@ pub fn extract_state(
         }
 
         // Extract spot markets
+        // CRITICAL: Fee rates MUST be persisted for consensus safety
+        // Different fee rates after restore cause AppHash mismatch and consensus failure
         for market in spot_eng.state.get_all_markets() {
             state.spot.markets.push(SpotMarketEntry {
                 id: market.config.id as u32,
@@ -135,6 +220,8 @@ pub fn extract_state(
                 quote_token: market.config.quote_token,
                 tick_size: market.config.tick_size.to_string_trimmed(),
                 lot_size: market.config.lot_size.to_string_trimmed(),
+                maker_fee_rate: market.config.maker_fee_rate.to_string_trimmed(),
+                taker_fee_rate: market.config.taker_fee_rate.to_string_trimmed(),
             });
         }
 
@@ -200,14 +287,28 @@ pub fn extract_state(
 /// Restore PersistedState into runtime components
 ///
 /// This function restores state from a PersistedState into the runtime components.
+/// Restores: unified balances, shared engine (markets only when perp_engine
+/// will be used later), and spot engine state.
 /// Returns the height, timestamp, and app_hash that were restored.
+///
+/// For perp_engine restoration, call `restore_perp_engine_state()` separately
+/// after the perp_engine has been created.
 pub fn restore_state(
     state: &PersistedState,
     unified_state: &SharedUnifiedState,
     engine: &SharedEngineState,
     spot_engine: Option<&SharedSpotEngine>,
 ) -> Result<(u64, u64, [u8; 32]), RestoreError> {
-    info!("Restoring state from height {}", state.height);
+    let perp_engine: Option<&SharedEngine> = None; // Perp engine restored separately
+    info!(
+        "Restoring state: height={}, timestamp={}, app_hash={}, balances={}, positions={}, orders={}",
+        state.height,
+        state.timestamp,
+        hex::encode(&state.app_hash),
+        state.core.balances.len(),
+        state.perp.positions.len(),
+        state.perp.orders.len(),
+    );
 
     // Validate schema version
     if state.schema_version != SCHEMA_VERSION {
@@ -225,8 +326,15 @@ pub fn restore_state(
         let mut unified = unified_state.write().unwrap();
 
         for balance in &state.core.balances {
-            // Determine decimals based on token
-            let decimals = if balance.token == 0 { 6 } else { 18 };
+            // Use the stored decimals field, falling back to token-based defaults
+            // for backwards compatibility with older snapshots
+            let decimals = if balance.balance.decimals > 0 {
+                balance.balance.decimals
+            } else if balance.token == 0 {
+                6  // USDC
+            } else {
+                18 // Other tokens
+            };
 
             let total = Decimal::from_str_exact(&balance.balance.total, decimals)
                 .unwrap_or_else(|| Decimal::from_raw(0, decimals));
@@ -247,67 +355,75 @@ pub fn restore_state(
     }
 
     // Restore perpetual engine state
+    //
+    // When perp_engine is available, restore trading state directly into it from
+    // perp.* fields (with fallback to core.* for older snapshots).
+    // When perp_engine is not available (tests), restore into the shared engine from core.*.
+    //
+    // NOTE: Use try_write() instead of blocking_write() because this function
+    // is called from within a tokio async runtime (#[tokio::main]).
+    // At startup there is no lock contention, so try_write() always succeeds.
+    if let Some(perp) = perp_engine {
+        let mut perp_eng = perp.try_write()
+            .expect("PerpEngine lock should be uncontested during startup state restore");
+
+        // Use perp.* fields (canonical), fall back to core.* for older snapshots
+        let markets = if !state.perp.markets.is_empty() { &state.perp.markets } else { &state.core.markets };
+        let positions = if !state.perp.positions.is_empty() { &state.perp.positions } else { &state.core.positions };
+        let leverage = if !state.perp.leverage.is_empty() { &state.perp.leverage } else { &state.core.leverage };
+        let orders = if !state.perp.orders.is_empty() { &state.perp.orders } else { &state.core.orders };
+        let next_order_id = if state.perp.next_order_id > 0 { state.perp.next_order_id } else { state.core.next_order_id };
+        let insurance_fund = if !state.perp.insurance_fund.is_empty() { &state.perp.insurance_fund } else { &state.core.insurance_fund };
+
+        restore_engine_state(&mut perp_eng.state, markets, positions, leverage, orders, next_order_id, insurance_fund);
+
+        info!(
+            "Restored perp_engine: {} positions, {} orders, {} markets (source={})",
+            positions.len(), orders.len(), markets.len(),
+            if !state.perp.positions.is_empty() { "perp" } else { "core-fallback" },
+        );
+    }
+    // Always restore shared engine markets (needed for AppHash market_root in non-perp-engine path)
     {
-        let mut eng = engine.blocking_write();
+        let mut eng = engine.try_write()
+            .expect("Engine lock should be uncontested during startup state restore");
 
-        // Restore markets
-        for market_entry in &state.core.markets {
-            let tick_size = Decimal::price(&market_entry.tick_size);
-            let lot_size = Decimal::size(&market_entry.lot_size);
-
-            // Use new() which sets sensible defaults
-            let mut config = hypercore_primitives::MarketConfig::new(
-                market_entry.id,
-                market_entry.symbol.clone(),
-                market_entry.max_leverage,
-            );
-            config.tick_size = tick_size;
-            config.lot_size = lot_size;
-
-            let market = hypercore_primitives::Market::new(
-                config,
-                Decimal::price("0"), // Mark price will be updated by price feed
-                0,
-            );
+        let markets = &state.core.markets;
+        // Only restore markets into shared engine (positions/orders stay empty)
+        for market_entry in markets {
+            let market = build_market_from_entry(market_entry);
             eng.add_market(market);
         }
 
-        // Restore positions
-        for pos_entry in &state.core.positions {
-            eng.set_position(pos_entry.account, pos_entry.market, pos_entry.position.clone());
-        }
-
-        // Restore leverage
-        for lev_entry in &state.core.leverage {
-            eng.set_leverage(lev_entry.account, lev_entry.market, lev_entry.leverage);
-        }
-
-        // Restore orders
-        for order_entry in &state.core.orders {
-            if let Some(orderbook) = eng.get_orderbook_mut(order_entry.market) {
-                orderbook.restore_order(order_entry.order.clone());
+        // Only restore positions/orders/leverage into shared engine if no perp_engine
+        if perp_engine.is_none() {
+            restore_engine_state(
+                &mut eng,
+                &state.core.markets,
+                &state.core.positions,
+                &state.core.leverage,
+                &state.core.orders,
+                state.core.next_order_id,
+                &state.core.insurance_fund,
+            );
+            info!(
+                "Restored shared engine: {} positions, {} orders, {} markets",
+                state.core.positions.len(), state.core.orders.len(), state.core.markets.len()
+            );
+        } else {
+            // With perp_engine, shared engine only needs scalars for backward compat
+            eng.set_next_order_id(state.core.next_order_id);
+            if let Some(fund) = Decimal::from_str_exact(&state.core.insurance_fund, 6) {
+                eng.set_insurance_fund(fund);
             }
+            info!("Restored shared engine: {} markets (positions/orders in perp_engine)", state.core.markets.len());
         }
-
-        // Restore next_order_id
-        eng.set_next_order_id(state.core.next_order_id);
-
-        // Restore insurance fund
-        if let Some(fund) = Decimal::from_str_exact(&state.core.insurance_fund, 6) {
-            eng.set_insurance_fund(fund);
-        }
-
-        info!(
-            "Restored {} positions, {} orders, {} markets",
-            state.core.positions.len(),
-            state.core.orders.len(),
-            state.core.markets.len()
-        );
     }
 
     // Restore spot engine state
     if let Some(spot) = spot_engine {
-        let mut spot_eng = spot.blocking_write();
+        let mut spot_eng = spot.try_write()
+            .expect("SpotEngine lock should be uncontested during startup state restore");
 
         // Restore tokens
         for token_entry in &state.spot.tokens {
@@ -328,9 +444,40 @@ pub fn restore_state(
         }
 
         // Restore spot markets
+        // CRITICAL: Fee rates MUST be restored from persisted values for consensus safety
+        // Using hardcoded values causes AppHash mismatch after node restart
         for market_entry in &state.spot.markets {
             let tick_size = Decimal::price(&market_entry.tick_size);
             let lot_size = Decimal::size(&market_entry.lot_size);
+
+            // Restore fee rates from persisted values, with fallback for backwards compatibility
+            let maker_fee_rate = if market_entry.maker_fee_rate.is_empty() {
+                // Default for older snapshots without fee rates
+                warn!(
+                    "Spot market {} has no persisted maker_fee_rate, using default -0.0002",
+                    market_entry.symbol
+                );
+                Decimal::rate("-0.0002") // -2 bps rebate (matches SpotMarketConfig::new_usdc_pair)
+            } else {
+                Decimal::rate(&market_entry.maker_fee_rate)
+            };
+            let taker_fee_rate = if market_entry.taker_fee_rate.is_empty() {
+                // Default for older snapshots without fee rates
+                warn!(
+                    "Spot market {} has no persisted taker_fee_rate, using default 0.0005",
+                    market_entry.symbol
+                );
+                Decimal::rate("0.0005") // 5 bps (matches SpotMarketConfig::new_usdc_pair)
+            } else {
+                Decimal::rate(&market_entry.taker_fee_rate)
+            };
+
+            debug!(
+                "Restoring spot market {}: maker_fee={}, taker_fee={}",
+                market_entry.symbol,
+                maker_fee_rate.to_string_trimmed(),
+                taker_fee_rate.to_string_trimmed()
+            );
 
             spot_eng.state.restore_market(hypercore_primitives::SpotMarketConfig {
                 id: market_entry.id as u8,
@@ -341,8 +488,8 @@ pub fn restore_state(
                 lot_size,
                 min_order_size: lot_size,
                 max_order_size: Decimal::from_raw(1_000_000_000, 6),
-                maker_fee_rate: Decimal::from_raw(10, 6), // 0.001%
-                taker_fee_rate: Decimal::from_raw(20, 6), // 0.002%
+                maker_fee_rate,
+                taker_fee_rate,
                 is_active: true,
             });
         }
@@ -415,6 +562,89 @@ pub fn restore_chain_state(
     );
 }
 
+/// Restore perp_engine state from persisted data.
+///
+/// Called AFTER the perp_engine has been created and default markets added.
+/// Restores positions, orders, leverage, detailed market state, and scalars
+/// from `perp.*` fields (with fallback to `core.*` for older snapshots).
+pub fn restore_perp_engine_state(
+    state: &PersistedState,
+    perp_engine: &SharedEngine,
+) {
+    let mut perp_eng = perp_engine.try_write()
+        .expect("PerpEngine lock should be uncontested during startup state restore");
+
+    // Use perp.* fields (canonical), fall back to core.* for older snapshots
+    let markets = if !state.perp.markets.is_empty() { &state.perp.markets } else { &state.core.markets };
+    let positions = if !state.perp.positions.is_empty() { &state.perp.positions } else { &state.core.positions };
+    let leverage = if !state.perp.leverage.is_empty() { &state.perp.leverage } else { &state.core.leverage };
+    let orders = if !state.perp.orders.is_empty() { &state.perp.orders } else { &state.core.orders };
+    let next_order_id = if state.perp.next_order_id > 0 { state.perp.next_order_id } else { state.core.next_order_id };
+    let insurance_fund = if !state.perp.insurance_fund.is_empty() { &state.perp.insurance_fund } else { &state.core.insurance_fund };
+
+    // Restore detailed market state (mark_price, funding, OI, fee rates)
+    for market_entry in markets {
+        if let Some(market) = perp_eng.state.get_market_mut(market_entry.id) {
+            if !market_entry.mark_price.is_empty() {
+                market.state.mark_price = Decimal::price(&market_entry.mark_price);
+            }
+            if !market_entry.index_price.is_empty() {
+                market.state.index_price = Decimal::price(&market_entry.index_price);
+            }
+            if !market_entry.funding_rate.is_empty() {
+                market.state.funding_rate = Decimal::price(&market_entry.funding_rate);
+            }
+            if !market_entry.funding_accumulator.is_empty() {
+                market.state.funding_accumulator = Decimal::price(&market_entry.funding_accumulator);
+            }
+            if !market_entry.open_interest_long.is_empty() {
+                market.state.open_interest_long = Decimal::size(&market_entry.open_interest_long);
+            }
+            if !market_entry.open_interest_short.is_empty() {
+                market.state.open_interest_short = Decimal::size(&market_entry.open_interest_short);
+            }
+            if market_entry.next_funding_time > 0 {
+                market.state.next_funding_time = market_entry.next_funding_time;
+            }
+            // Restore fee rates if persisted
+            if !market_entry.maker_fee_rate.is_empty() {
+                market.config.maker_fee_rate = Decimal::rate(&market_entry.maker_fee_rate);
+            }
+            if !market_entry.taker_fee_rate.is_empty() {
+                market.config.taker_fee_rate = Decimal::rate(&market_entry.taker_fee_rate);
+            }
+        }
+    }
+
+    // Restore positions
+    for pos_entry in positions {
+        perp_eng.state.set_position(pos_entry.account, pos_entry.market, pos_entry.position.clone());
+    }
+
+    // Restore leverage
+    for lev_entry in leverage {
+        perp_eng.state.set_leverage(lev_entry.account, lev_entry.market, lev_entry.leverage);
+    }
+
+    // Restore orders into ALL perp_engine data structures
+    // (orders HashMap + orderbook BTreeMap + account_orders index)
+    for order_entry in orders {
+        perp_eng.state.restore_order(order_entry.order.clone());
+    }
+
+    // Restore scalars
+    perp_eng.state.set_next_order_id(next_order_id);
+    if let Some(fund) = Decimal::from_str_exact(insurance_fund, 6) {
+        perp_eng.state.set_insurance_fund(fund);
+    }
+
+    info!(
+        "Restored perp_engine: {} positions, {} orders, {} leverage, next_order_id={} (source={})",
+        positions.len(), orders.len(), leverage.len(), next_order_id,
+        if !state.perp.positions.is_empty() { "perp" } else { "core-fallback" },
+    );
+}
+
 /// Error type for state restoration
 #[derive(Debug, thiserror::Error)]
 pub enum RestoreError {
@@ -429,6 +659,104 @@ pub enum RestoreError {
 
     #[error("Invalid data format: {0}")]
     InvalidFormat(String),
+}
+
+/// Build a Market from a persisted MarketEntry
+fn build_market_from_entry(market_entry: &MarketEntry) -> hypercore_primitives::Market {
+    let tick_size = Decimal::price(&market_entry.tick_size);
+    let lot_size = Decimal::size(&market_entry.lot_size);
+
+    let maker_fee_rate = if market_entry.maker_fee_rate.is_empty() {
+        Decimal::rate("0.0002")
+    } else {
+        Decimal::rate(&market_entry.maker_fee_rate)
+    };
+    let taker_fee_rate = if market_entry.taker_fee_rate.is_empty() {
+        Decimal::rate("0.0005")
+    } else {
+        Decimal::rate(&market_entry.taker_fee_rate)
+    };
+
+    let mut config = hypercore_primitives::MarketConfig::new(
+        market_entry.id,
+        market_entry.symbol.clone(),
+        market_entry.max_leverage,
+    );
+    config.tick_size = tick_size;
+    config.lot_size = lot_size;
+    config.maker_fee_rate = maker_fee_rate;
+    config.taker_fee_rate = taker_fee_rate;
+
+    let mark_price = if market_entry.mark_price.is_empty() {
+        Decimal::price("0")
+    } else {
+        Decimal::price(&market_entry.mark_price)
+    };
+
+    let mut market = hypercore_primitives::Market::new(
+        config,
+        mark_price,
+        market_entry.next_funding_time,
+    );
+
+    if !market_entry.index_price.is_empty() {
+        market.state.index_price = Decimal::price(&market_entry.index_price);
+    }
+    if !market_entry.funding_rate.is_empty() {
+        market.state.funding_rate = Decimal::price(&market_entry.funding_rate);
+    }
+    if !market_entry.funding_accumulator.is_empty() {
+        market.state.funding_accumulator = Decimal::price(&market_entry.funding_accumulator);
+    }
+    if !market_entry.open_interest_long.is_empty() {
+        market.state.open_interest_long = Decimal::size(&market_entry.open_interest_long);
+    }
+    if !market_entry.open_interest_short.is_empty() {
+        market.state.open_interest_short = Decimal::size(&market_entry.open_interest_short);
+    }
+
+    market
+}
+
+/// Restore trading state (markets, positions, leverage, orders, scalars) into an EngineState
+fn restore_engine_state(
+    eng: &mut hypercore_engine::EngineState,
+    markets: &[MarketEntry],
+    positions: &[PositionEntry],
+    leverage: &[LeverageEntry],
+    orders: &[OrderEntry],
+    next_order_id: OrderId,
+    insurance_fund: &str,
+) {
+    for market_entry in markets {
+        let market = build_market_from_entry(market_entry);
+        debug!(
+            "Restored market {}: mark_price={}, funding_rate={}",
+            market_entry.symbol,
+            market.state.mark_price.to_string_trimmed(),
+            market.state.funding_rate.to_string_trimmed(),
+        );
+        eng.add_market(market);
+    }
+
+    for pos_entry in positions {
+        eng.set_position(pos_entry.account, pos_entry.market, pos_entry.position.clone());
+    }
+
+    for lev_entry in leverage {
+        eng.set_leverage(lev_entry.account, lev_entry.market, lev_entry.leverage);
+    }
+
+    // Restore orders into ALL data structures
+    // (orders HashMap + orderbook BTreeMap + account_orders index)
+    for order_entry in orders {
+        eng.restore_order(order_entry.order.clone());
+    }
+
+    eng.set_next_order_id(next_order_id);
+    if let Some(fund) = Decimal::from_str_exact(insurance_fund, 6) {
+        eng.set_insurance_fund(fund);
+    }
 }
 
 #[cfg(test)]
@@ -451,7 +779,8 @@ mod tests {
             [0u8; 32],
             &unified_state,
             &engine,
-            None,
+            None, // perp_engine
+            None, // spot_engine
             &nonces,
             &cloid_index,
             &block_metadata,
@@ -484,7 +813,8 @@ mod tests {
             [0u8; 32],
             &unified_state,
             &engine,
-            None,
+            None, // perp_engine
+            None, // spot_engine
             &nonces,
             &cloid_index,
             &block_metadata,

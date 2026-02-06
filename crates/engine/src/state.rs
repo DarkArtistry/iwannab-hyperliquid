@@ -288,6 +288,16 @@ impl EngineState {
             .collect()
     }
 
+    /// Update an order's remaining size after partial fill
+    ///
+    /// Called after matching to sync the orders HashMap with the orderbook BTreeMap.
+    pub fn update_order_remaining(&mut self, market_id: MarketId, order_id: OrderId, new_remaining: Decimal) {
+        if let Some(order) = self.orders.get_mut(&market_id).and_then(|m| m.get_mut(&order_id)) {
+            order.remaining_size = new_remaining;
+            order.status = hypercore_primitives::OrderStatus::PartiallyFilled;
+        }
+    }
+
     /// Get order count for account in market
     pub fn get_order_count(&self, address: AccountAddress, market_id: MarketId) -> usize {
         self.account_orders
@@ -537,6 +547,40 @@ impl EngineState {
     pub fn set_insurance_fund(&mut self, amount: Decimal) {
         self.insurance_fund = amount.raw();
     }
+
+    /// Restore an order into ALL data structures (for state restore)
+    ///
+    /// Unlike `add_order()` which assumes the market's orders HashMap entry exists
+    /// (created by `add_market()`), this method uses `or_default()` to be safe
+    /// during restore when market setup order may vary.
+    ///
+    /// Populates:
+    /// - `orders` HashMap (used by `get_all_orders_global()` → AppHash)
+    /// - `orderbooks` BTreeMap (used for matching)
+    /// - `account_orders` index (used for account queries)
+    pub fn restore_order(&mut self, order: Order) {
+        let market_id = order.market_id;
+        let order_id = order.id;
+        let owner = order.owner;
+
+        // Add to orders HashMap (used by get_all_orders_global() → AppHash)
+        self.orders.entry(market_id)
+            .or_default()
+            .insert(order_id, order.clone());
+
+        // Add to orderbook BTreeMap (used for matching)
+        if let Some(book) = self.orderbooks.get_mut(&market_id) {
+            book.restore_order(order);
+        }
+
+        // Add to account_orders index (used for queries)
+        self.account_orders
+            .entry(owner)
+            .or_default()
+            .entry(market_id)
+            .or_default()
+            .push(order_id);
+    }
 }
 
 impl Default for EngineState {
@@ -766,5 +810,52 @@ mod tests {
 
         assert_eq!(restored.get_account(account).unwrap().balance, 10000_000000);
         assert_eq!(restored.get_leverage(account, 0), 20);
+    }
+
+    #[test]
+    fn test_restore_order_populates_all_stores() {
+        use hypercore_primitives::{OrderRequest, OrderSide, OrderType};
+
+        let mut state = EngineState::new();
+        let account = Address::repeat_byte(1);
+        let market_id: MarketId = 0;
+
+        // Add a market first (creates orderbook and orders HashMap entries)
+        let btc = Market::new(MarketConfig::btc_perp(), Decimal::price("65000"), 0);
+        state.add_market(btc);
+
+        // Create an order to restore
+        let order = Order::new(
+            42,
+            account,
+            OrderRequest {
+                market_id,
+                side: OrderSide::Buy,
+                price: Decimal::price("64000"),
+                size: Decimal::size("1.0"),
+                order_type: OrderType::default(),
+                reduce_only: false,
+                client_order_id: None,
+            },
+            1000,
+        );
+
+        // Use restore_order (the method persistence uses)
+        state.restore_order(order);
+
+        // Verify orders HashMap is populated (used by get_all_orders_global → AppHash)
+        let all_orders = state.get_all_orders_global();
+        assert!(all_orders.contains_key(&market_id), "orders HashMap must contain market");
+        assert!(all_orders[&market_id].contains_key(&42), "orders HashMap must contain order 42");
+
+        // Verify orderbook is populated (used for matching)
+        let orderbook = state.get_orderbook(market_id).unwrap();
+        let book_orders = orderbook.get_all_orders();
+        assert_eq!(book_orders.len(), 1, "orderbook must contain the restored order");
+
+        // Verify account_orders index is populated (used for queries)
+        let user_orders = state.get_orders_by_account(account, market_id);
+        assert_eq!(user_orders.len(), 1, "account_orders must contain the restored order");
+        assert_eq!(user_orders[0].id, 42);
     }
 }

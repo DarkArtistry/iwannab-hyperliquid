@@ -197,7 +197,8 @@ impl Validator {
             | InfoRequest::SpotMeta
             | InfoRequest::SpotAllMids
             | InfoRequest::SpotTokenInfo { .. }
-            | InfoRequest::StateInfo => {}
+            | InfoRequest::StateInfo
+            | InfoRequest::EvidenceStatus => {}
             // State proof requires address validation
             InfoRequest::StateProof { user, .. } => {
                 self.validate_address(user)?;

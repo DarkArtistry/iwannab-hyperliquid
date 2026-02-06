@@ -52,11 +52,17 @@ export async function runMatchingTests(ctx: TestContext): Promise<void> {
 
     // Verify fills occurred
     await sleep(500);
-    const fills = (await infoRequest('userFills', { user: TEST_ACCOUNTS.ALICE.address })) as Array<{ px: string; sz: string }>;
+    const fills = (await infoRequest('userFills', { user: TEST_ACCOUNTS.ALICE.address })) as Array<{ px: string; sz: string; side: string; coin?: string }>;
     if (fills.length === 0) {
       throw new Error('No fills found after matching buy and sell at $65,000');
     }
-    logProgress(`Matched: ${fills.length} fill(s), price=${fills[0].px}, size=${fills[0].sz}`);
+    // Validate the most recent fill matches our order
+    const latestFill = fills[0];
+    const fillPrice = parseFloat(latestFill.px);
+    const fillSize = parseFloat(latestFill.sz);
+    if (fillPrice !== 65000) throw new Error(`Expected fill price 65000, got ${fillPrice}`);
+    if (Math.abs(fillSize - 0.001) > 0.0001) throw new Error(`Expected fill size ~0.001, got ${fillSize}`);
+    logProgress(`Matched at price=$${latestFill.px}, size=${latestFill.sz}, side=${latestFill.side}`);
   });
 
   await runTest(ctx, 'Match with price improvement', 'matching', 'Buy order at higher price should match sell at lower price', async () => {
@@ -84,11 +90,18 @@ export async function runMatchingTests(ctx: TestContext): Promise<void> {
 
     // Verify fills occurred
     await sleep(500);
-    const fills = (await infoRequest('userFills', { user: TEST_ACCOUNTS.ALICE.address })) as Array<{ px: string; sz: string }>;
+    const fills = (await infoRequest('userFills', { user: TEST_ACCOUNTS.ALICE.address })) as Array<{ px: string; sz: string; side: string }>;
     if (fills.length < 2) {
       throw new Error(`Expected at least 2 fills (basic + price improvement), got ${fills.length}`);
     }
-    logProgress(`Price improvement fill at price=${fills[0].px}`);
+    // The latest fill should be from price improvement - price should be at maker price ($66,000)
+    // or within the crossing range [$65,500, $66,000]
+    const latestFill = fills[0];
+    const fillPrice = parseFloat(latestFill.px);
+    if (fillPrice < 65500 || fillPrice > 66000) {
+      throw new Error(`Price improvement fill should be in range [65500, 66000], got ${fillPrice}`);
+    }
+    logProgress(`Price improvement: matched at $${fillPrice} (buy@66000 vs sell@65500)`);
   });
 
   await runTest(ctx, 'Partial fill test', 'matching', 'Large order should partially fill against smaller order', async () => {
@@ -116,12 +129,19 @@ export async function runMatchingTests(ctx: TestContext): Promise<void> {
 
     // Verify partial fill: Bob's larger order should have a resting remainder
     await sleep(500);
-    const bobOrders = (await infoRequest('openOrders', { user: TEST_ACCOUNTS.BOB.address })) as Array<{ sz: string; side: string }>;
+    const bobOrders = (await infoRequest('openOrders', { user: TEST_ACCOUNTS.BOB.address })) as Array<{ sz: string; side: string; limitPx: string }>;
     const bobFills = (await infoRequest('userFills', { user: TEST_ACCOUNTS.BOB.address })) as Array<{ px: string; sz: string }>;
     if (bobFills.length === 0) {
       throw new Error('No fills found for Bob after partial fill test');
     }
-    logProgress(`Partial fill: Bob has ${bobFills.length} fill(s) and ${bobOrders.length} resting order(s)`);
+    // Bob should have a resting buy order with remaining size (0.005 - 0.001 = 0.004)
+    const restingBuy = bobOrders.find(o => o.side === 'B');
+    if (!restingBuy) throw new Error('Bob should have a resting buy order after partial fill');
+    const restingSize = parseFloat(restingBuy.sz);
+    if (Math.abs(restingSize - 0.004) > 0.001) {
+      throw new Error(`Bob resting size should be ~0.004 (0.005 - 0.001 filled), got ${restingSize}`);
+    }
+    logProgress(`Partial fill verified: Bob filled=${bobFills[0].sz}, resting=${restingBuy.sz}`);
   });
 
   // Clean up orders after matching tests
@@ -136,6 +156,11 @@ export async function runMatchingTests(ctx: TestContext): Promise<void> {
     const { signature: sigB, nonce: nonceB } = await signAction(cancelBob, TEST_ACCOUNTS.BOB.privateKey);
     await exchangeRequest(cancelBob, sigB, nonceB);
 
-    logProgress('Cleanup complete');
+    await sleep(300);
+    const aliceOrders = (await infoRequest('openOrders', { user: TEST_ACCOUNTS.ALICE.address })) as unknown[];
+    const bobOrders = (await infoRequest('openOrders', { user: TEST_ACCOUNTS.BOB.address })) as unknown[];
+    if (aliceOrders.length !== 0) throw new Error(`Alice still has ${aliceOrders.length} orders after cancelAll`);
+    if (bobOrders.length !== 0) throw new Error(`Bob still has ${bobOrders.length} orders after cancelAll`);
+    logProgress('Cleanup verified: 0 orders for both accounts');
   });
 }

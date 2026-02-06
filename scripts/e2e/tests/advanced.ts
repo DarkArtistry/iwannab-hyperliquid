@@ -21,6 +21,7 @@ import {
   exchangeRequest,
   signAction,
   runTest,
+  assertErrorContains,
   sleep,
   logSection,
   log,
@@ -67,7 +68,20 @@ export async function runAdvancedTests(ctx: TestContext): Promise<void> {
     if (result.status !== 'ok') {
       throw new Error(`Withdraw request failed: ${result.error || JSON.stringify(result)}`);
     }
-    logProgress('Withdraw request accepted');
+
+    // Verify balance actually decreased
+    const afterBalance = (await infoRequest('spotBalances', { user: TEST_ACCOUNTS.ALICE.address })) as {
+      tokenIndex: number;
+      available: string;
+    }[];
+    const usdcAfter = afterBalance.find((b) => b.tokenIndex === 0);
+    const beforeVal = parseFloat(usdcBefore?.available || '0');
+    const afterVal = parseFloat(usdcAfter?.available || '0');
+
+    if (afterVal >= beforeVal) {
+      throw new Error(`Balance should have decreased after withdraw: before=${beforeVal}, after=${afterVal}`);
+    }
+    logProgress(`Withdraw verified: balance changed from ${beforeVal} to ${afterVal} (delta: ${afterVal - beforeVal})`);
   });
 
   // =========================================================================
@@ -133,7 +147,13 @@ export async function runAdvancedTests(ctx: TestContext): Promise<void> {
       }
       throw new Error('Reduce-only order should have been rejected with no existing position');
     }
-    logProgress('Reduce-only order correctly rejected (no position to reduce)');
+
+    // Validate the error message is about reduce-only / position
+    const errorStatus = statuses.find((s) => s.error);
+    if (errorStatus?.error) {
+      assertErrorContains(errorStatus.error, ['Reduce-only', 'reduce', 'position'], 'Reduce-only rejection');
+    }
+    logProgress(`Reduce-only order correctly rejected: ${errorStatus?.error || 'no position'}`);
   });
 
   // =========================================================================
@@ -210,13 +230,16 @@ export async function runAdvancedTests(ctx: TestContext): Promise<void> {
       if (result.status === 'ok' && !orderError) {
         throw new Error('Invalid price should have been rejected');
       }
-      logProgress(`Invalid price correctly rejected: ${result.error || orderError?.error || 'validation error'}`);
+      const errMsg = result.error || orderError?.error || '';
+      assertErrorContains(errMsg, ['Invalid', 'Validation error', 'price', 'parse'], 'Invalid price rejection');
+      logProgress(`Invalid price correctly rejected: ${errMsg}`);
     } catch (e) {
       const msg = (e as Error).message;
-      if (msg.includes('should have been rejected')) {
+      if (msg.includes('should have been rejected') || msg.includes('did not contain')) {
         throw e;
       }
-      // HTTP error (400/422) counts as rejection
+      // HTTP error (400/422) counts as rejection — validate error content
+      assertErrorContains(msg, ['Invalid', 'Validation error', 'price', 'parse', '400', '422'], 'Invalid price rejection');
       logProgress(`Invalid price format rejected with error: ${msg}`);
     }
   });
@@ -248,18 +271,25 @@ export async function runAdvancedTests(ctx: TestContext): Promise<void> {
           await exchangeRequest(cancelAction, cancelSig, cancelNonce);
           throw new Error('Server accepted order with negative size - missing validation');
         }
-        // Order rejected in status or silently dropped - either is correct
+        // Order must be explicitly rejected, not silently dropped
         const orderError = statuses.find((s) => s.error);
-        logProgress(`Negative size rejected: ${orderError?.error || 'order not created'}`);
+        if (!orderError) {
+          throw new Error('Negative size order was silently dropped without explicit error — server should return an error status');
+        }
+        assertErrorContains(orderError.error!, ['Invalid', 'size', 'Size', 'negative'], 'Negative size rejection');
+        logProgress(`Negative size rejected: ${orderError.error}`);
       } else {
-        logProgress(`Negative size rejected: ${result.error || 'validation error'}`);
+        const errMsg = result.error || '';
+        assertErrorContains(errMsg, ['Invalid', 'size', 'Size', 'negative'], 'Negative size rejection');
+        logProgress(`Negative size rejected: ${errMsg}`);
       }
     } catch (e) {
       const msg = (e as Error).message;
-      if (msg.includes('missing validation')) {
+      if (msg.includes('missing validation') || msg.includes('silently dropped') || msg.includes('did not contain')) {
         throw e;
       }
-      // HTTP error (400/422) counts as rejection
+      // HTTP error (400/422) counts as rejection — validate error content
+      assertErrorContains(msg, ['Invalid', 'size', 'Size', 'negative', '400', '422'], 'Negative size rejection');
       logProgress(`Negative size correctly rejected: ${msg}`);
     }
   });
@@ -290,13 +320,16 @@ export async function runAdvancedTests(ctx: TestContext): Promise<void> {
       if (!hasError) {
         throw new Error('Invalid market ID should have been rejected');
       }
-      logProgress(`Invalid market ID correctly rejected: ${result.error || orderError?.error || 'validation error'}`);
+      const errMsg = result.error || orderError?.error || '';
+      assertErrorContains(errMsg, ['Market not found', 'market', 'Market'], 'Invalid market rejection');
+      logProgress(`Invalid market ID correctly rejected: ${errMsg}`);
     } catch (e) {
       const msg = (e as Error).message;
-      if (msg.includes('should have been rejected')) {
+      if (msg.includes('should have been rejected') || msg.includes('did not contain')) {
         throw e;
       }
-      // HTTP error (400/422) counts as rejection
+      // HTTP error (400/422) counts as rejection — validate error content
+      assertErrorContains(msg, ['Market not found', 'market', 'Market', '400', '422'], 'Invalid market rejection');
       logProgress(`Invalid market correctly rejected with error: ${msg}`);
     }
   });
@@ -322,6 +355,24 @@ export async function runAdvancedTests(ctx: TestContext): Promise<void> {
     if (funding.length > 0) {
       const latest = funding[funding.length - 1];
       logProgress(`Latest: rate=${latest.fundingRate}, premium=${latest.premium}`);
+
+      // Validate fields exist
+      if (latest.coin === undefined) throw new Error('Funding entry missing coin field');
+      if (latest.fundingRate === undefined) throw new Error('Funding entry missing fundingRate field');
+      if (latest.time === undefined) throw new Error('Funding entry missing time field');
+
+      // Validate rate is within reasonable bounds [-0.0005, 0.0005] (0.05%)
+      const rate = parseFloat(latest.fundingRate);
+      if (isNaN(rate)) throw new Error(`Funding rate is not a number: ${latest.fundingRate}`);
+      if (rate < -0.0005 || rate > 0.0005) {
+        throw new Error(`Funding rate ${rate} outside expected bounds [-0.0005, 0.0005]`);
+      }
+
+      // Validate time is a positive number
+      if (typeof latest.time !== 'number' || latest.time <= 0) {
+        throw new Error(`Funding time should be positive number, got ${latest.time}`);
+      }
+      logProgress(`Rate ${rate} within bounds, time=${latest.time}`);
     }
   });
 
@@ -337,6 +388,152 @@ export async function runAdvancedTests(ctx: TestContext): Promise<void> {
       throw new Error(`Expected array for userFunding, got ${typeof payments}`);
     }
     logProgress(`Found ${payments.length} funding payment entries`);
+
+    if (payments.length > 0) {
+      const entry = payments[0] as {
+        coin?: string;
+        fundingRate?: string;
+        szi?: string;
+        usdc?: string;
+        time?: number;
+      };
+
+      // Validate required fields exist
+      if (entry.coin === undefined) throw new Error('User funding entry missing coin field');
+      if (entry.fundingRate === undefined) throw new Error('User funding entry missing fundingRate field');
+      if (entry.szi === undefined) throw new Error('User funding entry missing szi field');
+      if (entry.usdc === undefined) throw new Error('User funding entry missing usdc field');
+      if (entry.time === undefined) throw new Error('User funding entry missing time field');
+
+      // Validate parseability
+      if (isNaN(parseFloat(entry.fundingRate))) throw new Error(`fundingRate not parseable: ${entry.fundingRate}`);
+      if (isNaN(parseFloat(entry.szi))) throw new Error(`szi not parseable: ${entry.szi}`);
+      if (isNaN(parseFloat(entry.usdc))) throw new Error(`usdc not parseable: ${entry.usdc}`);
+
+      logProgress(`Entry: coin=${entry.coin}, rate=${entry.fundingRate}, szi=${entry.szi}, usdc=${entry.usdc}`);
+    }
+  });
+
+  await runTest(ctx, 'Funding rate within bounds', 'advanced', 'Verify all funding rates are within engine max bounds', async () => {
+    logProgress('Querying funding history for BTC-PERP...');
+
+    const funding = (await infoRequest('fundingHistory', { coin: 'BTC-PERP', startTime: 0 })) as {
+      coin?: string;
+      fundingRate?: string;
+      time?: number;
+    }[];
+
+    if (!Array.isArray(funding)) {
+      throw new Error(`Expected array for fundingHistory, got ${typeof funding}`);
+    }
+
+    if (funding.length === 0) {
+      logProgress('No funding entries yet (expected in short test window)');
+      return;
+    }
+
+    // Verify ALL rates are within engine max bounds (0.05% = 0.0005)
+    const MAX_RATE = 0.0005;
+    for (let i = 0; i < funding.length; i++) {
+      const entry = funding[i];
+      const rate = parseFloat(entry.fundingRate || '0');
+      if (isNaN(rate)) {
+        throw new Error(`Funding entry ${i}: rate not parseable: ${entry.fundingRate}`);
+      }
+      if (Math.abs(rate) > MAX_RATE) {
+        throw new Error(`Funding entry ${i}: rate ${rate} exceeds max bounds [-${MAX_RATE}, ${MAX_RATE}]`);
+      }
+    }
+    logProgress(`All ${funding.length} funding rates within bounds (max ±${MAX_RATE})`);
+
+    // Also verify mark price is queryable
+    const allMids = (await infoRequest('allMids')) as Record<string, string>;
+    const btcMid = allMids['BTC-PERP'];
+    if (btcMid) {
+      const price = parseFloat(btcMid);
+      if (isNaN(price) || price <= 0) {
+        throw new Error(`BTC-PERP mid price invalid: ${btcMid}`);
+      }
+      logProgress(`BTC-PERP mark price: $${price}`);
+    }
+  });
+
+  await runTest(ctx, 'Funding history data format', 'advanced', 'Validate fundingHistory and userFundingHistory API response schemas', async () => {
+    logProgress('Validating funding API response schemas...');
+
+    // Validate fundingHistory schema
+    const funding = (await infoRequest('fundingHistory', { coin: 'BTC-PERP', startTime: 0 })) as unknown[];
+    if (!Array.isArray(funding)) {
+      throw new Error(`fundingHistory should return array, got ${typeof funding}`);
+    }
+
+    if (funding.length > 0) {
+      const entry = funding[0] as Record<string, unknown>;
+      const requiredFields = ['coin', 'fundingRate', 'time'];
+      for (const field of requiredFields) {
+        if (entry[field] === undefined) {
+          throw new Error(`fundingHistory entry missing required field: ${field}`);
+        }
+      }
+      if (typeof entry.coin !== 'string') throw new Error(`coin should be string, got ${typeof entry.coin}`);
+      if (typeof entry.fundingRate !== 'string') throw new Error(`fundingRate should be string, got ${typeof entry.fundingRate}`);
+      if (typeof entry.time !== 'number') throw new Error(`time should be number, got ${typeof entry.time}`);
+      if (entry.coin !== 'BTC-PERP') throw new Error(`Expected coin BTC-PERP, got ${entry.coin}`);
+      logProgress(`fundingHistory schema valid (${funding.length} entries, coin=${entry.coin})`);
+    } else {
+      logProgress('fundingHistory: no entries (schema check skipped)');
+    }
+
+    // Validate userFundingHistory schema
+    const userFunding = (await infoRequest('userFundingHistory', {
+      user: TEST_ACCOUNTS.ALICE.address,
+      startTime: 0,
+    })) as unknown[];
+    if (!Array.isArray(userFunding)) {
+      throw new Error(`userFundingHistory should return array, got ${typeof userFunding}`);
+    }
+
+    if (userFunding.length > 0) {
+      const entry = userFunding[0] as Record<string, unknown>;
+      const requiredFields = ['coin', 'fundingRate', 'szi', 'usdc', 'time'];
+      for (const field of requiredFields) {
+        if (entry[field] === undefined) {
+          throw new Error(`userFundingHistory entry missing required field: ${field}`);
+        }
+      }
+      if (typeof entry.coin !== 'string') throw new Error(`coin should be string, got ${typeof entry.coin}`);
+      logProgress(`userFundingHistory schema valid (${userFunding.length} entries)`);
+    } else {
+      logProgress('userFundingHistory: no entries (schema check skipped)');
+    }
+  });
+
+  await runTest(ctx, 'Funding settlement not expected in test window', 'advanced', 'Verify no recent funding settlements (8h interval)', async () => {
+    logProgress('Checking for recent funding settlements...');
+
+    // Query user funding history for last 60 seconds only
+    const recentCutoff = Date.now() - 60_000;
+    const recentPayments = (await infoRequest('userFundingHistory', {
+      user: TEST_ACCOUNTS.ALICE.address,
+      startTime: recentCutoff,
+    })) as { time?: number }[];
+
+    if (!Array.isArray(recentPayments)) {
+      throw new Error(`Expected array for userFundingHistory, got ${typeof recentPayments}`);
+    }
+
+    // Funding settlement happens every 8 hours, so in a test that runs for seconds/minutes,
+    // we should see 0 recent settlements
+    logProgress(`Recent funding settlements (last 60s): ${recentPayments.length}`);
+    if (recentPayments.length > 0) {
+      logProgress(`Unexpected settlements found — this may indicate funding interval is shorter than expected`);
+      // Log but don't fail — there could be edge cases where test runs right at a settlement boundary
+      for (const p of recentPayments) {
+        logProgress(`  Settlement at time=${p.time}`);
+      }
+    } else {
+      logProgress('No recent settlements (correct — 8h funding interval)');
+    }
   });
 
   // =========================================================================
@@ -486,11 +683,9 @@ export async function runAdvancedTests(ctx: TestContext): Promise<void> {
       }
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
-      if (message.includes('400') || message.includes('Invalid leverage') || message.includes('Validation error')) {
-        logProgress('Excessive leverage correctly rejected with validation error');
-      } else {
-        throw err;
-      }
+      if (message.includes('should have been rejected')) throw err;
+      assertErrorContains(message, ['Invalid leverage', 'leverage', 'Validation error'], 'Exceed max leverage rejection');
+      logProgress(`Excessive leverage correctly rejected: ${message}`);
     }
   });
 
@@ -578,7 +773,11 @@ export async function runAdvancedTests(ctx: TestContext): Promise<void> {
     if (Math.abs(sizeAfterClose) >= Math.abs(sizeAfterOpen)) {
       throw new Error(`Position should have been reduced: was ${sizeAfterOpen}, still ${sizeAfterClose}`);
     }
-    logProgress(`Position reduced/closed: ${sizeAfterClose} BTC`);
+    // Position should be fully closed (reduce-only sell matched by Bob's buy at same size)
+    if (Math.abs(sizeAfterClose) > 0.0001) {
+      throw new Error(`Position should be fully closed (size ~0), got ${sizeAfterClose}`);
+    }
+    logProgress(`Position fully closed: ${sizeAfterClose} BTC`);
 
     // Cleanup
     for (const account of [TEST_ACCOUNTS.ALICE, TEST_ACCOUNTS.BOB]) {
@@ -679,7 +878,9 @@ export async function runAdvancedTests(ctx: TestContext): Promise<void> {
       await exchangeRequest(cancelAction, cancelSig, cancelNonce);
       throw new Error('Dust order (0.0000001 BTC) should have been rejected below minimum size');
     }
-    logProgress(`Dust order correctly rejected: ${result.error || orderError?.error || 'below minimum size'}`);
+    const errMsg = result.error || orderError?.error || '';
+    assertErrorContains(errMsg, ['size', 'Size too small', 'minimum', 'Invalid size'], 'Dust order rejection');
+    logProgress(`Dust order correctly rejected: ${errMsg}`);
   });
 
   // =========================================================================
@@ -689,35 +890,50 @@ export async function runAdvancedTests(ctx: TestContext): Promise<void> {
   await runTest(ctx, 'Multi-market order placement', 'advanced', 'Place orders on both BTC and ETH markets', async () => {
     logProgress('Testing multi-market orders...');
 
-    // Place BTC order
+    // Use prices far below market to ensure orders rest and don't match existing sells
+    // Place BTC order at $30,000 (well below any resting sell)
     const btcAction = {
       type: 'order',
-      orders: [{ a: 0, b: true, p: '60000', s: '0.001', r: false, t: { limit: { tif: 'Gtc' } } }],
+      orders: [{ a: 0, b: true, p: '30000', s: '0.001', r: false, t: { limit: { tif: 'Gtc' } } }],
       grouping: 'na',
     };
     const { signature: btcSig, nonce: btcNonce } = await signAction(btcAction, TEST_ACCOUNTS.ALICE.privateKey);
-    const btcResult = await exchangeRequest(btcAction, btcSig, btcNonce);
-    logProgress('BTC-PERP order placed');
+    const btcResult = (await exchangeRequest(btcAction, btcSig, btcNonce)) as {
+      status?: string;
+      response?: { data?: { statuses?: Array<{ resting?: { oid: number }; filled?: unknown; error?: string }> } };
+    };
+    if (btcResult.status !== 'ok') throw new Error(`BTC order failed: ${JSON.stringify(btcResult)}`);
+    const btcStatus = btcResult.response?.data?.statuses?.[0];
+    if (!btcStatus?.resting) throw new Error(`BTC order did not rest (filled or rejected): ${JSON.stringify(btcStatus)}`);
+    logProgress(`BTC-PERP order resting, oid=${btcStatus.resting.oid}`);
 
-    // Place ETH order
+    // Place ETH order at $1,000 (well below any resting sell)
     const ethAction = {
       type: 'order',
-      orders: [{ a: 1, b: true, p: '3000', s: '0.01', r: false, t: { limit: { tif: 'Gtc' } } }],
+      orders: [{ a: 1, b: true, p: '1000', s: '0.01', r: false, t: { limit: { tif: 'Gtc' } } }],
       grouping: 'na',
     };
     const { signature: ethSig, nonce: ethNonce } = await signAction(ethAction, TEST_ACCOUNTS.ALICE.privateKey);
-    const ethResult = await exchangeRequest(ethAction, ethSig, ethNonce);
-    logProgress('ETH-PERP order placed');
+    const ethResult = (await exchangeRequest(ethAction, ethSig, ethNonce)) as {
+      status?: string;
+      response?: { data?: { statuses?: Array<{ resting?: { oid: number }; filled?: unknown; error?: string }> } };
+    };
+    if (ethResult.status !== 'ok') throw new Error(`ETH order failed: ${JSON.stringify(ethResult)}`);
+    const ethStatus = ethResult.response?.data?.statuses?.[0];
+    if (!ethStatus?.resting) throw new Error(`ETH order did not rest (filled or rejected): ${JSON.stringify(ethStatus)}`);
+    logProgress(`ETH-PERP order resting, oid=${ethStatus.resting.oid}`);
 
-    // Verify both orders exist
+    // Verify both orders exist in the book
     const orders = (await infoRequest('openOrders', { user: TEST_ACCOUNTS.ALICE.address })) as {
       coin?: string;
       asset?: number;
     }[];
 
-    const btcOrders = orders.filter((o) => o.coin === 'BTC-PERP' || o.asset === 0);
-    const ethOrders = orders.filter((o) => o.coin === 'ETH-PERP' || o.asset === 1);
+    const btcOrders = orders.filter((o) => o.coin === 'BTC');
+    const ethOrders = orders.filter((o) => o.coin === 'ETH');
 
+    if (btcOrders.length === 0) throw new Error('BTC-PERP order not found in open orders');
+    if (ethOrders.length === 0) throw new Error('ETH-PERP order not found in open orders');
     logProgress(`Open orders: ${btcOrders.length} BTC, ${ethOrders.length} ETH`);
 
     // Cleanup

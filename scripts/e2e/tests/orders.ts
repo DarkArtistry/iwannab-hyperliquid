@@ -76,11 +76,16 @@ export async function runOrderTests(ctx: TestContext): Promise<void> {
     if (result.status !== 'ok') {
       throw new Error(`Order placement failed: ${JSON.stringify(result)}`);
     }
-    if (result.response?.data?.statuses?.[0]?.resting?.oid) {
-      placedOrderId = result.response.data.statuses[0].resting.oid;
-      logProgress(`Order placed successfully, ID: ${placedOrderId}`);
+    const statuses = result.response?.data?.statuses || [];
+    if (statuses.length === 0) throw new Error('No order statuses returned');
+    const status = statuses[0];
+    if (status?.resting?.oid) {
+      placedOrderId = status.resting.oid;
+      logProgress(`Order resting in book, ID: ${placedOrderId}`);
+    } else if (status?.filled) {
+      logProgress('Order filled immediately');
     } else {
-      logProgress('Order accepted (status: ok)');
+      throw new Error(`Order not resting or filled: ${JSON.stringify(status)}`);
     }
   });
 
@@ -103,11 +108,21 @@ export async function runOrderTests(ctx: TestContext): Promise<void> {
     };
 
     const { signature, nonce } = await signAction(action, TEST_ACCOUNTS.ALICE.privateKey);
-    const result = await exchangeRequest(action, signature, nonce) as { status?: string };
+    const result = await exchangeRequest(action, signature, nonce) as { status?: string; response?: { data?: { statuses?: Array<{ resting?: { oid?: string }; filled?: unknown; error?: string }> } } };
     if (result.status !== 'ok') {
       throw new Error(`Sell order failed: ${JSON.stringify(result)}`);
     }
-    logProgress('Sell order placed');
+    const statuses = result.response?.data?.statuses || [];
+    if (statuses.length === 0) throw new Error('No order statuses returned');
+    const status = statuses[0];
+    if (status?.error) throw new Error(`Sell order rejected: ${status.error}`);
+    if (status?.resting) {
+      logProgress(`Sell order resting, ID: ${status.resting.oid}`);
+    } else if (status?.filled) {
+      logProgress('Sell order filled');
+    } else {
+      throw new Error(`Sell order not resting or filled: ${JSON.stringify(status)}`);
+    }
   });
 
   await runTest(ctx, 'Place post-only order', 'orders', 'Place maker-only order that rejects if would cross', async () => {
@@ -129,11 +144,15 @@ export async function runOrderTests(ctx: TestContext): Promise<void> {
     };
 
     const { signature, nonce } = await signAction(action, TEST_ACCOUNTS.ALICE.privateKey);
-    const result = await exchangeRequest(action, signature, nonce) as { status?: string };
+    const result = await exchangeRequest(action, signature, nonce) as { status?: string; response?: { data?: { statuses?: Array<{ resting?: { oid?: string }; error?: string }> } } };
     if (result.status !== 'ok') {
       throw new Error(`Post-only order failed: ${JSON.stringify(result)}`);
     }
-    logProgress('Post-only order placed');
+    const statuses = result.response?.data?.statuses || [];
+    if (statuses.length === 0) throw new Error('No order statuses returned');
+    if (statuses[0]?.error) throw new Error(`Post-only order rejected: ${statuses[0].error}`);
+    if (!statuses[0]?.resting) throw new Error('Post-only order should rest on book (Alo tif)');
+    logProgress(`Post-only order resting, ID: ${statuses[0].resting?.oid}`);
   });
 
   await runTest(ctx, 'Place IOC order', 'orders', 'Place immediate-or-cancel order', async () => {
@@ -155,11 +174,25 @@ export async function runOrderTests(ctx: TestContext): Promise<void> {
     };
 
     const { signature, nonce } = await signAction(action, TEST_ACCOUNTS.ALICE.privateKey);
-    const result = await exchangeRequest(action, signature, nonce) as { status?: string };
+    const result = await exchangeRequest(action, signature, nonce) as { status?: string; response?: { data?: { statuses?: Array<{ resting?: { oid?: number }; filled?: unknown; error?: string }> } } };
     if (result.status !== 'ok') {
       throw new Error(`IOC order failed: ${JSON.stringify(result)}`);
     }
-    logProgress('IOC order submitted and handled');
+    // IOC at below-market price should NOT remain in the order book
+    // Note: the response may report "resting" due to a known limitation in extract_order_statuses
+    // (it doesn't distinguish IOC from GTC when fills=0), but the engine cancels it internally.
+    // Verify by checking openOrders — the IOC order should NOT be there.
+    await sleep(300);
+    const openOrders = (await infoRequest('openOrders', { user: TEST_ACCOUNTS.ALICE.address })) as Array<{ oid?: number; limitPx?: string }>;
+    const iocInBook = openOrders.find(o => o.limitPx === '50000');
+    if (iocInBook) {
+      // Clean up and fail
+      const cancelAction = { type: 'cancelAll' };
+      const { signature: cSig, nonce: cNonce } = await signAction(cancelAction, TEST_ACCOUNTS.ALICE.privateKey);
+      await exchangeRequest(cancelAction, cSig, cNonce);
+      throw new Error('IOC order at $50,000 should not persist in book, but found in openOrders');
+    }
+    logProgress('IOC order correctly not in book (cancelled by engine)');
   });
 
   await runTest(ctx, 'Batch place orders', 'orders', 'Place multiple orders in a single request', async () => {
@@ -176,11 +209,17 @@ export async function runOrderTests(ctx: TestContext): Promise<void> {
     };
 
     const { signature, nonce } = await signAction(action, TEST_ACCOUNTS.ALICE.privateKey);
-    const result = await exchangeRequest(action, signature, nonce) as { status?: string };
+    const result = await exchangeRequest(action, signature, nonce) as { status?: string; response?: { data?: { statuses?: Array<{ resting?: { oid?: string }; filled?: unknown; error?: string }> } } };
     if (result.status !== 'ok') {
       throw new Error(`Batch order failed: ${JSON.stringify(result)}`);
     }
-    logProgress('Batch orders placed');
+    const statuses = result.response?.data?.statuses || [];
+    if (statuses.length !== 3) throw new Error(`Expected 3 order statuses, got ${statuses.length}`);
+    for (let i = 0; i < statuses.length; i++) {
+      if (statuses[i]?.error) throw new Error(`Batch order ${i} rejected: ${statuses[i].error}`);
+      if (!statuses[i]?.resting && !statuses[i]?.filled) throw new Error(`Batch order ${i} not resting or filled: ${JSON.stringify(statuses[i])}`);
+    }
+    logProgress(`Batch: ${statuses.filter(s => s?.resting).length} resting, ${statuses.filter(s => s?.filled).length} filled`);
   });
 
   await runTest(ctx, 'Cancel single order', 'orders', 'Cancel a specific order by ID', async () => {
@@ -210,7 +249,15 @@ export async function runOrderTests(ctx: TestContext): Promise<void> {
 
       const { signature, nonce } = await signAction(cancelAction, TEST_ACCOUNTS.ALICE.privateKey);
       await exchangeRequest(cancelAction, signature, nonce);
-      logProgress('Order cancelled');
+
+      // Verify the order was actually removed
+      await sleep(300);
+      const afterCancel = (await infoRequest('openOrders', { user: TEST_ACCOUNTS.ALICE.address })) as Array<{ oid?: string }>;
+      const stillExists = afterCancel.find(o => o.oid === orderToCancel.oid);
+      if (stillExists) {
+        throw new Error(`Order ${orderToCancel.oid} still exists after cancel`);
+      }
+      logProgress(`Order ${orderToCancel.oid} cancelled and verified removed`);
     } else {
       logProgress('No orders available to cancel');
     }
@@ -270,7 +317,13 @@ export async function runOrderTests(ctx: TestContext): Promise<void> {
     if (result.status !== 'ok') {
       throw new Error(`Cancel by CLOID failed: ${JSON.stringify(result)}`);
     }
-    logProgress('Order cancelled by CLOID successfully');
+
+    // Verify order was actually removed from open orders
+    await sleep(300);
+    const remainingOrders = (await infoRequest('openOrders', { user: TEST_ACCOUNTS.ALICE.address })) as Array<{ cloid?: string }>;
+    const stillExists = remainingOrders.find(o => o.cloid === cloid);
+    if (stillExists) throw new Error(`Order with cloid ${cloid} still exists after cancel`);
+    logProgress('Order cancelled by CLOID and verified removed');
   });
 
   await runTest(ctx, 'USD transfer between accounts', 'orders', 'Transfer USDC between accounts on Core layer', async () => {
@@ -302,7 +355,16 @@ export async function runOrderTests(ctx: TestContext): Promise<void> {
     if (result.status !== 'ok') {
       throw new Error(`USD transfer failed: ${JSON.stringify(result)}`);
     }
-    logProgress(`USD transfer of ${transferAmount} USDC completed successfully`);
+
+    // Verify Alice's balance decreased
+    const afterResponse = await infoRequest('unifiedBalances', { user: TEST_ACCOUNTS.ALICE.address }) as {
+      balances: { tokenIndex: number; coreView: string }[];
+    };
+    const afterBalance = parseFloat(afterResponse.balances?.find((b) => b.tokenIndex === 0)?.coreView || '0');
+    if (afterBalance >= coreViewBalance - 0.01) {
+      throw new Error(`Alice balance should have decreased: before=${coreViewBalance}, after=${afterBalance}`);
+    }
+    logProgress(`USD transfer verified: Alice ${coreViewBalance.toFixed(2)} -> ${afterBalance.toFixed(2)}`);
 
     // Transfer back to restore balance
     logProgress('Transferring back to Alice...');

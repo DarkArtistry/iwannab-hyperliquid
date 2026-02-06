@@ -391,7 +391,10 @@ impl EvmExecutor {
 
         // Ensure sender account exists with sufficient balance
         // Phase 3B: Only auto-create account if gas fees NOT enforced (development mode)
-        if self.db.state.get_account(&tx.from).is_none() {
+        // CRITICAL: Only do this for actual transactions (commit_state=true), NOT simulations.
+        // Creating accounts during simulation (eth_estimateGas, eth_call) modifies EVM state
+        // and causes AppHash divergence between nodes.
+        if commit_state && self.db.state.get_account(&tx.from).is_none() {
             if !self.enforce_gas_fees {
                 // Development mode: auto-create account with balance for testing
                 self.db.state.set_balance(tx.from, U256::from(10u64).pow(U256::from(20)));

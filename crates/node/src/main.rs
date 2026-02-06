@@ -27,7 +27,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use hypercore_chain::{AbciService, HyperCoreApp};
 #[cfg(feature = "persistence")]
-use hypercore_chain::{extract_state, restore_state, restore_chain_state};
+use hypercore_chain::{extract_state, restore_state, restore_chain_state, restore_perp_engine_state};
 #[cfg(feature = "p2p")]
 use libp2p::Multiaddr;
 use hypercore_engine::{EngineState, SpotEngine};
@@ -251,6 +251,14 @@ async fn main() -> anyhow::Result<()> {
             // Track if state was restored from persistence
             #[cfg(feature = "persistence")]
             let mut state_restored = false;
+            #[cfg(feature = "persistence")]
+            let mut restored_height: u64 = 0;
+            #[cfg(feature = "persistence")]
+            let mut restored_timestamp: u64 = 0;
+            #[cfg(feature = "persistence")]
+            let mut restored_app_hash: [u8; 32] = [0u8; 32];
+            #[cfg(feature = "persistence")]
+            let mut restored_chain_data: Option<hypercore_persistence::PersistedState> = None;
 
             // === Phase 4B: State Restore from Persistence ===
             #[cfg(feature = "persistence")]
@@ -273,6 +281,10 @@ async fn main() -> anyhow::Result<()> {
                                     height, timestamp, &app_hash[..8]
                                 );
                                 state_restored = true;
+                                restored_height = height;
+                                restored_timestamp = timestamp;
+                                restored_app_hash = app_hash;
+                                restored_chain_data = Some(persisted_state);
                             }
                             Err(e) => {
                                 tracing::error!("Failed to restore state: {}", e);
@@ -327,27 +339,88 @@ async fn main() -> anyhow::Result<()> {
             // The Engine has its own EngineState (with orderbook, positions, fills)
             // separate from the gateway's EngineState (which has mark prices).
             // IMPORTANT: This must be created unconditionally so both single-node
-            // and CometBFT modes have a working perp engine. Markets are added here
-            // with default prices; in CometBFT mode, init_from_genesis also adds
-            // market metadata to the shared EngineState.
+            // and CometBFT modes have a working perp engine.
+            //
+            // When state is restored from persistence, use the restored mark prices
+            // instead of hardcoded defaults to ensure consistency with the shared
+            // EngineState (which was already restored).
             let perp_engine = {
                 use hypercore_engine::{Engine, EngineConfig};
                 let mut full_engine = Engine::with_unified_state(
                     EngineConfig::default(),
                     Arc::clone(&unified_state),
                 );
+
+                // Read mark prices from restored engine state (if available)
+                // NOTE: Use try_read() instead of blocking_read() because we are inside
+                // #[tokio::main] async context. blocking_read() panics in this context.
+                #[cfg(feature = "persistence")]
+                let restored_market_state = if state_restored {
+                    let eng = engine.try_read()
+                        .expect("Engine lock should be uncontested during startup");
+                    let btc_price = eng.get_market(0)
+                        .map(|m| m.state.mark_price)
+                        .unwrap_or_else(|| hypercore_primitives::Decimal::price("65000"));
+                    let eth_price = eng.get_market(1)
+                        .map(|m| m.state.mark_price)
+                        .unwrap_or_else(|| hypercore_primitives::Decimal::price("3500"));
+                    let btc_funding_time = eng.get_market(0)
+                        .map(|m| m.state.next_funding_time)
+                        .unwrap_or(0);
+                    let eth_funding_time = eng.get_market(1)
+                        .map(|m| m.state.next_funding_time)
+                        .unwrap_or(0);
+                    tracing::info!(
+                        "Using restored market state for perp engine: BTC price={} funding_time={}, ETH price={} funding_time={}",
+                        btc_price.to_string_trimmed(),
+                        btc_funding_time,
+                        eth_price.to_string_trimmed(),
+                        eth_funding_time,
+                    );
+                    Some((btc_price, eth_price, btc_funding_time, eth_funding_time))
+                } else {
+                    None
+                };
+
+                #[cfg(feature = "persistence")]
+                let (btc_price, eth_price, btc_funding_time, eth_funding_time) = restored_market_state.unwrap_or_else(|| {
+                    (
+                        hypercore_primitives::Decimal::price("65000"),
+                        hypercore_primitives::Decimal::price("3500"),
+                        0,
+                        0,
+                    )
+                });
+                #[cfg(not(feature = "persistence"))]
+                let (btc_price, eth_price, btc_funding_time, eth_funding_time) = (
+                    hypercore_primitives::Decimal::price("65000"),
+                    hypercore_primitives::Decimal::price("3500"),
+                    0,
+                    0,
+                );
+
                 full_engine.add_market(
                     hypercore_primitives::MarketConfig::btc_perp(),
-                    hypercore_primitives::Decimal::price("65000"),
-                    0,
+                    btc_price,
+                    btc_funding_time,
                 );
                 full_engine.add_market(
                     hypercore_primitives::MarketConfig::eth_perp(),
-                    hypercore_primitives::Decimal::price("3500"),
-                    0,
+                    eth_price,
+                    eth_funding_time,
                 );
+
                 Arc::new(RwLock::new(full_engine))
             };
+
+            // Restore perp_engine state from persistence (positions, orders, leverage, market state)
+            #[cfg(feature = "persistence")]
+            if state_restored {
+                if let Some(ref persisted) = restored_chain_data {
+                    restore_perp_engine_state(persisted, &perp_engine);
+                }
+            }
+
             tracing::info!("Initialized perp engine with matching (BTC-PERP, ETH-PERP)");
 
             // Create HyperCore application with SHARED unified state
@@ -368,6 +441,69 @@ async fn main() -> anyhow::Result<()> {
             let evm = Arc::new(RwLock::new(
                 EvmExecutor::with_unified_state(Arc::clone(&engine), Arc::clone(&unified_state), chain_id)
             ));
+
+            // Restore EVM state from persistence (if available)
+            // CRITICAL: Without this, restarted nodes have empty EVM state, causing
+            // different evm_root in compute_app_hash() and consensus failure.
+            #[cfg(feature = "persistence")]
+            if state_restored {
+                if let Some(ref persisted) = restored_chain_data {
+                    use hypercore_evm::{EvmAddress, B256, EvmU256};
+
+                    tracing::info!(
+                        "EVM state from persistence: {} accounts, {} storage slots, {} code entries, {} block hashes",
+                        persisted.evm.accounts.len(),
+                        persisted.evm.storage.len(),
+                        persisted.evm.code.len(),
+                        persisted.evm.block_hashes.len(),
+                    );
+
+                    if !persisted.evm.accounts.is_empty() ||
+                       !persisted.evm.storage.is_empty() ||
+                       !persisted.evm.code.is_empty() {
+                        let mut evm_guard = evm.write().await;
+                        let evm_state = evm_guard.state_mut();
+
+                        // Restore EVM accounts (address, nonce, code_hash)
+                        for entry in &persisted.evm.accounts {
+                            let address = EvmAddress::from_slice(&entry.address);
+                            let code_hash = entry.code_hash.map(B256::from);
+                            evm_state.restore_account(address, entry.nonce, code_hash);
+                        }
+
+                        // Restore EVM code (code_hash, bytecode) - BEFORE storage
+                        // because accounts reference code by hash
+                        for entry in &persisted.evm.code {
+                            let code_hash = B256::from(entry.code_hash);
+                            evm_state.restore_code(code_hash, entry.bytecode.clone());
+                        }
+
+                        // Restore EVM storage (address, slot, value)
+                        for entry in &persisted.evm.storage {
+                            let address = EvmAddress::from_slice(&entry.address);
+                            let slot = EvmU256::from_be_bytes(entry.slot);
+                            let value = EvmU256::from_be_bytes(entry.value);
+                            evm_state.restore_storage(address, slot, value);
+                        }
+
+                        // Restore EVM block hashes
+                        for entry in &persisted.evm.block_hashes {
+                            let hash = B256::from(entry.hash);
+                            evm_state.restore_block_hash(entry.height, hash);
+                        }
+
+                        tracing::info!(
+                            "Restored EVM state: {} accounts, {} storage slots, {} code entries, {} block hashes",
+                            persisted.evm.accounts.len(),
+                            persisted.evm.storage.len(),
+                            persisted.evm.code.len(),
+                            persisted.evm.block_hashes.len(),
+                        );
+                    } else {
+                        tracing::warn!("EVM state in persistence is empty - EVM executor will start fresh");
+                    }
+                }
+            }
 
             // Create EVM RPC server
             // In CometBFT mode, route eth_sendRawTransaction through consensus.
@@ -484,12 +620,29 @@ async fn main() -> anyhow::Result<()> {
             // Set up graceful shutdown
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
-            // Handle Ctrl+C
+            // Handle both SIGINT (Ctrl+C) and SIGTERM (docker stop)
             tokio::spawn(async move {
-                tokio::signal::ctrl_c()
-                    .await
-                    .expect("Failed to listen for ctrl+c");
-                tracing::info!("Received shutdown signal");
+                #[cfg(unix)]
+                {
+                    use tokio::signal::unix::{signal, SignalKind};
+                    let mut sigterm = signal(SignalKind::terminate())
+                        .expect("Failed to listen for SIGTERM");
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {
+                            tracing::info!("Received SIGINT (Ctrl+C), shutting down...");
+                        }
+                        _ = sigterm.recv() => {
+                            tracing::info!("Received SIGTERM (docker stop), shutting down...");
+                        }
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    tokio::signal::ctrl_c()
+                        .await
+                        .expect("Failed to listen for ctrl+c");
+                    tracing::info!("Received shutdown signal");
+                }
                 let _ = shutdown_tx.send(());
             });
 
@@ -564,6 +717,7 @@ async fn main() -> anyhow::Result<()> {
                                     result.app_hash,
                                     &state_unified,
                                     &state_engine,
+                                    None, // perp_engine not available in single-node BlockProducer path
                                     Some(&state_spot),
                                     &app.get_nonces(),
                                     &app.get_cloid_index(),
@@ -728,11 +882,66 @@ async fn main() -> anyhow::Result<()> {
                         Some(Arc::clone(&spot_engine)),
                     );
                     cometbft_hypercore_app.state.perp_engine = Some(Arc::clone(&perp_engine));
+
+                    // Apply persisted state to the CometBFT app so Info() returns
+                    // the correct height and CometBFT only replays missed blocks.
+                    #[cfg(feature = "persistence")]
+                    if state_restored {
+                        if let Some(ref persisted) = restored_chain_data {
+                            cometbft_hypercore_app.state.restore_chain_state(
+                                restored_height, restored_timestamp, restored_app_hash,
+                            );
+                            let mut nonces_map = std::collections::HashMap::new();
+                            let mut cloid_map = std::collections::HashMap::new();
+                            let mut block_hashes_map = std::collections::HashMap::new();
+                            restore_chain_state(persisted, &mut nonces_map, &mut cloid_map, &mut block_hashes_map);
+                            cometbft_hypercore_app.state.restore_nonces(nonces_map);
+                            cometbft_hypercore_app.state.restore_cloid_mappings(cloid_map);
+                            cometbft_hypercore_app.state.restore_block_hashes(block_hashes_map);
+                            tracing::info!(
+                                "CometBFT app state restored: height={}, app_hash={:?}",
+                                restored_height, &restored_app_hash[..8]
+                            );
+                        }
+                    }
+
                     let mut cometbft_app = CometBftApp::new(cometbft_hypercore_app)
                         .with_evm_executor(Arc::clone(&evm));
                     if let Some((receipts, transactions, block_number)) = evm_shared_stores {
                         cometbft_app = cometbft_app.with_evm_receipt_store(receipts, transactions, block_number);
                     }
+
+                    // Post-restore AppHash verification (Phase 4)
+                    // After ALL state is restored (unified, engine, perp_engine, EVM, chain meta),
+                    // recompute AppHash and compare against the stored value. This catches any
+                    // persistence/restoration bugs that would cause consensus divergence.
+                    #[cfg(feature = "persistence")]
+                    if state_restored {
+                        let (matches, recomputed) = cometbft_app.verify_app_hash(&restored_app_hash);
+                        if !matches {
+                            tracing::error!(
+                                "CRITICAL: AppHash mismatch after state restore! stored={} computed={}",
+                                hex::encode(&restored_app_hash[..]),
+                                hex::encode(&recomputed[..]),
+                            );
+                            tracing::error!(
+                                "This node's state diverges from the network. It may produce different \
+                                 blocks and be rejected by peers. Consider state sync or re-genesis."
+                            );
+                        } else {
+                            tracing::info!(
+                                "AppHash verified: restored state produces matching hash {}",
+                                hex::encode(&restored_app_hash[..8]),
+                            );
+                        }
+                    }
+
+                    // Pass persistence backend so FinalizeBlock can persist state
+                    #[cfg(feature = "persistence")]
+                    if let Some(ref db) = persistence {
+                        cometbft_app = cometbft_app.with_persistence(Arc::clone(db));
+                    }
+
                     let server = CometBftServer::new(cometbft_app);
 
                     tokio::task::spawn_blocking(move || {

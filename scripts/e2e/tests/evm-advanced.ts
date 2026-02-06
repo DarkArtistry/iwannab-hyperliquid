@@ -271,8 +271,9 @@ export async function runAdvancedEVMTests(ctx: TestContext): Promise<void> {
   await runTest(ctx, 'Check nonce increments correctly', 'evm-advanced', 'Verify nonce increases after transactions', async () => {
     const nonce = await publicClient.getTransactionCount({ address: TEST_ACCOUNTS.ALICE.address });
     logProgress(`Alice nonce after all transactions: ${nonce}`);
-    if (nonce < 2) {
-      throw new Error(`Expected nonce >= 2 after multiple transactions, got ${nonce}`);
+    // This file sends 5 txs: deploy, set(42), set(100), set(200), set(300)
+    if (nonce < 5) {
+      throw new Error(`Expected nonce >= 5 after 5 transactions in this file, got ${nonce}`);
     }
   });
 }

@@ -43,23 +43,24 @@ Thank you for your interest in contributing to HyperCore! This document provides
 
 6. **Run tests**
    ```bash
-   cargo test                    # Rust tests
-   cd contracts && forge test    # Solidity tests
-   cd sdk/typescript && pnpm test:integration  # TS tests
+   cargo test --workspace --features cometbft   # Rust tests (556 tests)
+   cd contracts && forge test                    # Solidity tests (49 tests)
+   ./scripts/e2e-test.sh                        # E2E integration (151 tests)
    ```
 
 ## Project Structure
 
 ```
 iwannab-hyperliquid/
-├── crates/                    # Rust workspace
-│   ├── primitives/            # Core types
-│   ├── engine/                # Matching engine
-│   ├── chain/                 # Consensus layer
-│   ├── evm/                   # EVM integration
-│   ├── gateway/               # API server
-│   ├── indexer/               # Data indexing
-│   └── node/                  # Entry point
+├── crates/                    # Rust workspace (8 crates)
+│   ├── primitives/            # Core types (Decimal, Order, Position, UnifiedState)
+│   ├── engine/                # Matching engine, risk, funding, liquidation
+│   ├── chain/                 # CometBFT ABCI app, Merkle proofs, attestation
+│   ├── evm/                   # HyperEVM with precompiles and JSON-RPC
+│   ├── gateway/               # HTTP/WebSocket API server with rate limiting
+│   ├── indexer/               # PostgreSQL data indexing and candle aggregation
+│   ├── persistence/           # RocksDB state persistence (24 column families)
+│   └── node/                  # Main binary (single-node & CometBFT modes)
 ├── contracts/                 # Solidity
 ├── sdk/
 │   ├── typescript/            # TypeScript SDK
@@ -92,17 +93,20 @@ Follow the coding standards below and ensure your changes:
 ### 3. Test Your Changes
 
 ```bash
-# Run all Rust tests
-cargo test
+# Run all Rust tests (556 tests)
+cargo test --workspace --features cometbft
 
-# Run with specific features
-cargo test --all-features
-
-# Run Solidity tests
+# Run Solidity tests (49 tests)
 cd contracts && forge test -vvv
 
-# Run TypeScript tests
-cd sdk/typescript && pnpm test
+# Run E2E integration tests (151 tests, requires Docker)
+./scripts/e2e-test.sh
+
+# Run multi-node tests (52 tests, requires Docker)
+make test-multinode-full
+
+# Run everything (823 tests total)
+make test-all
 ```
 
 ### 4. Commit Your Changes

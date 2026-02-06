@@ -54,8 +54,8 @@ HyperCore uses a **unified state model** where all components share the same bal
           ▼
 ┌───────────────────┐
 │     CometBFT      │
-│   (Consensus)     │
-│   [Phase 2B]      │
+│   (BFT Consensus) │
+│                   │
 └───────────────────┘
 ```
 
@@ -85,7 +85,7 @@ HyperCore uses a **unified state model** where all components share the same bal
 - **Rate Limiting**: Per-IP and per-endpoint rate limiting for DoS protection
 
 ### Developer Features
-- **TypeScript SDK**: Full-featured client with 135 E2E integration tests
+- **TypeScript SDK**: Full-featured client with 151 E2E integration tests
 - **Python SDK**: Async client for algorithmic trading
 - **Foundry Integration**: 49 Solidity tests for smart contracts
 - **Comprehensive Docs**: Architecture, API, and protocol specifications
@@ -109,8 +109,8 @@ cd iwannab-hyperliquid
 # Build all Rust crates
 cargo build
 
-# Run tests (85 Rust tests)
-cargo test
+# Run Rust unit tests (556 tests)
+cargo test --workspace --features cometbft
 ```
 
 ### 2. Start Services with Docker
@@ -146,7 +146,7 @@ forge script script/Deploy.s.sol \
 ```bash
 cd sdk/typescript
 pnpm install
-pnpm test:integration  # 86 tests
+pnpm test:integration
 ```
 
 See [QUICK_START.md](QUICK_START.md) for detailed setup instructions.
@@ -178,14 +178,15 @@ make test-multinode-keep
 
 ```
 iwannab-hyperliquid/
-├── crates/                    # Rust crates
-│   ├── primitives/            # Core types (Decimal, Order, Position)
-│   ├── engine/                # Matching engine, risk, funding
-│   ├── chain/                 # CometBFT ABCI application
-│   ├── evm/                   # HyperEVM with precompiles
-│   ├── gateway/               # HTTP/WebSocket API server
-│   ├── indexer/               # PostgreSQL data indexing
-│   └── node/                  # Main binary entry point
+├── crates/                    # Rust crates (8 crates)
+│   ├── primitives/            # Core types (Decimal, Order, Position, UnifiedState)
+│   ├── engine/                # Matching engine, risk, funding, liquidation
+│   ├── chain/                 # CometBFT ABCI application, Merkle proofs, attestation
+│   ├── evm/                   # HyperEVM with precompiles and JSON-RPC
+│   ├── gateway/               # HTTP/WebSocket API server with rate limiting
+│   ├── indexer/               # PostgreSQL data indexing and candle aggregation
+│   ├── persistence/           # RocksDB state persistence (24 column families)
+│   └── node/                  # Main binary entry point (single-node & CometBFT modes)
 │
 ├── contracts/                 # Solidity smart contracts
 │   ├── src/
@@ -195,7 +196,7 @@ iwannab-hyperliquid/
 │   └── test/                  # Foundry tests (49 tests)
 │
 ├── sdk/                       # Client SDKs
-│   ├── typescript/            # TypeScript SDK (86 integration tests)
+│   ├── typescript/            # TypeScript SDK
 │   └── python/                # Python SDK
 │
 ├── docs/                      # Documentation
@@ -270,12 +271,12 @@ contract MyStrategy {
 
 | Component | Tests | Description |
 |-----------|-------|-------------|
-| Rust Unit Tests | 531+ | Core engine, chain, gateway, primitives, multi-node |
+| Rust Unit Tests | 556 | Core engine, chain, gateway, primitives, persistence |
 | Solidity Contracts | 49 | CoreWriter, HyperCore, ValidatorRegistry |
-| E2E Integration | 144 | Full system integration (requires Docker) |
-| Multi-Node E2E (3-node) | 6 | Multi-validator consensus tests |
-| Multi-Node Full (5-node) | 22 | Comprehensive tx propagation + state sync |
-| **Total** | **752+** | **All Passing** |
+| E2E Integration | 151 | Full system integration (requires Docker) |
+| Multi-Node E2E (3-node) | 15 | Multi-validator consensus tests |
+| Multi-Node Full (5-node) | 52 | Comprehensive tx propagation, state sync, BFT |
+| **Total** | **823** | **All Passing** |
 
 ### Running Tests
 
@@ -287,17 +288,18 @@ make test-quick
 make test-all
 
 # Individual test commands
-make test               # Rust unit tests only (531+ tests)
+make test               # Rust unit tests only (556 tests)
 make test-contracts     # Solidity tests only (49 tests)
-make test-e2e           # E2E single-node integration (144 tests)
-make test-multinode     # 3-node multi-validator E2E (6 tests)
-make test-multinode-full  # 5-node comprehensive E2E (22 tests)
+make test-e2e           # E2E single-node integration (151 tests)
+make test-multinode     # 3-node multi-validator E2E (15 tests)
+make test-multinode-full  # 5-node comprehensive E2E (52 tests)
 
 # Crate-specific tests
-make test-engine        # Engine (matching, risk, funding - 105 tests)
-make test-chain         # Chain (Merkle, consensus, state, multi-node - 203 tests)
-make test-gateway       # Gateway (rate limit, validation - 81 tests)
-make test-primitives    # Primitives (types, EIP-712 - 59 tests)
+make test-engine        # Engine (matching, risk, funding, liquidation)
+make test-chain         # Chain (Merkle, consensus, attestation, state)
+make test-gateway       # Gateway (rate limit, validation, handlers)
+make test-primitives    # Primitives (Decimal, EIP-712, unified state)
+make test-persistence   # Persistence (RocksDB, state save/restore)
 ```
 
 ### Test Categories
@@ -352,7 +354,9 @@ See [scripts/e2e/README.md](scripts/e2e/README.md) for detailed test documentati
 | [docs/API.md](docs/API.md) | REST and WebSocket API reference |
 | [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md) | Detailed implementation analysis |
 | [docs/ORDERS_THROUGHPUT_UPGRADE.md](docs/ORDERS_THROUGHPUT_UPGRADE.md) | 100k orders/sec upgrade plan |
+| [docs/CONSENSUS.md](docs/CONSENSUS.md) | Consensus verification and BFT properties |
 | [TODO.md](TODO.md) | Development roadmap |
+| [MULTINODE_DEBUG.md](MULTINODE_DEBUG.md) | Multi-node debugging history (18 root causes fixed) |
 | [contracts/README.md](contracts/README.md) | Smart contract documentation |
 | [sdk/typescript/README.md](sdk/typescript/README.md) | TypeScript SDK guide |
 | [sdk/python/README.md](sdk/python/README.md) | Python SDK guide |
@@ -442,12 +446,14 @@ This is a development implementation. See [docs/IMPLEMENTATION_STATUS.md](docs/I
 | **Gas Fee Infrastructure** | ✅ | `crates/evm/src/executor.rs:apply_gas_fee()` |
 | **Persistence Layer** | ✅ | `crates/persistence/` (RocksDB, 24 column families) |
 | **State Commitment (Merkle)** | ✅ | `crates/chain/src/merkle.rs` (proofs, verification) |
+| **State Attestation (P2P)** | ✅ | `crates/chain/src/attestation.rs` (Ed25519, gossip) |
+| **Multi-Node Consensus** | ✅ | 5-validator BFT with 52 E2E tests |
 
-### What's Stubbed or Pending (⚠️)
+### What's Pending (⚠️)
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| **ABCI State Sync** | ⚠️ Pending | Snapshot methods for fast node bootstrap |
+| **External Security Audit** | ⚠️ Pending | Required before mainnet deployment |
 
 ### Development Phases
 
@@ -463,7 +469,7 @@ This is a development implementation. See [docs/IMPLEMENTATION_STATUS.md](docs/I
 | Phase 4A | Persistence Infrastructure (RocksDB) | ✅ Complete |
 | Phase 4B | State Save/Restore | ✅ Complete |
 
-**752+ total tests passing** (531 Rust + 144 E2E + 49 Solidity + 6+22 Multi-Node) - See [TODO.md](TODO.md) for the development roadmap.
+**823 total tests passing** (556 Rust + 151 E2E + 49 Solidity + 15+52 Multi-Node) - See [TODO.md](TODO.md) for the development roadmap.
 
 ## Contributing
 

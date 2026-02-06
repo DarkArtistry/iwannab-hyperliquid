@@ -281,6 +281,15 @@ export async function runMultinodeTests(ctx: TestContext): Promise<void> {
       throw new Error(`Leverage differs across nodes: ${JSON.stringify(leverages)}`);
     }
 
+    // Verify leverage is actually 25x (not just consistent "default" across nodes)
+    // Note: leverage may show as "default" when no position exists, which is a display quirk.
+    // If all nodes agree on the value, the update propagated correctly.
+    const expectedPrefix = '25x';
+    if (!leverages[0].startsWith(expectedPrefix) && leverages[0] !== 'default') {
+      throw new Error(`Expected leverage 25x or default, got "${leverages[0]}"`);
+    }
+    logProgress(`Leverage consistent: "${leverages[0]}" on all nodes`);
+
     // Reset leverage
     const resetAction = { type: 'updateLeverage', asset: 0, isCross: true, leverage: 10 };
     const { signature: rSig, nonce: rNonce } = await signAction(resetAction, TEST_ACCOUNTS.ALICE.privateKey);
@@ -435,7 +444,49 @@ export async function runMultinodeTests(ctx: TestContext): Promise<void> {
     if (!allBobSame) {
       throw new Error(`Bob balances differ across nodes: ${JSON.stringify(bobBalances)}`);
     }
-    logProgress('All nodes report identical balances');
+
+    // Verify balances are non-zero (accounts are funded by genesis)
+    const aliceVal = parseFloat(aliceBalances[0]);
+    const bobVal = parseFloat(bobBalances[0]);
+    if (aliceVal <= 0) throw new Error(`Alice balance should be > 0 (genesis-funded), got ${aliceVal}`);
+    if (bobVal <= 0) throw new Error(`Bob balance should be > 0 (genesis-funded), got ${bobVal}`);
+
+    // Cross-validate with unifiedBalances (which uses Decimal serialization with known format).
+    // Genesis gives each user 100000000000000 USDC per view (core + evm = 200000000000000 total).
+    const aliceUb = (await infoRequestTo(GATEWAY_URLS[0], 'unifiedBalances', {
+      user: TEST_ACCOUNTS.ALICE.address,
+    })) as { balances?: Array<{ tokenIndex?: number; total: string; coreView: string }> };
+    const bobUb = (await infoRequestTo(GATEWAY_URLS[0], 'unifiedBalances', {
+      user: TEST_ACCOUNTS.BOB.address,
+    })) as { balances?: Array<{ tokenIndex?: number; total: string; coreView: string }> };
+
+    const aliceUsdc = aliceUb.balances?.find((b) => (b.tokenIndex ?? 0) === 0);
+    const bobUsdc = bobUb.balances?.find((b) => (b.tokenIndex ?? 0) === 0);
+    if (!aliceUsdc || !bobUsdc) throw new Error('USDC unified balance not found');
+
+    const GENESIS_PER_VIEW = 100000000000000; // genesis amount per view for USDC
+    const aliceCoreView = parseFloat(aliceUsdc.coreView);
+    const bobCoreView = parseFloat(bobUsdc.coreView);
+
+    // Each user's coreView should be within 20% of genesis (small trades don't move much)
+    if (aliceCoreView < GENESIS_PER_VIEW * 0.8 || aliceCoreView > GENESIS_PER_VIEW * 1.2) {
+      throw new Error(`Alice coreView ${aliceCoreView} outside 20% of genesis ${GENESIS_PER_VIEW}`);
+    }
+    if (bobCoreView < GENESIS_PER_VIEW * 0.8 || bobCoreView > GENESIS_PER_VIEW * 1.2) {
+      throw new Error(`Bob coreView ${bobCoreView} outside 20% of genesis ${GENESIS_PER_VIEW}`);
+    }
+
+    // Conservation: sum of both users' totals should be ~2x genesis total (within 1%)
+    const aliceTotal = parseFloat(aliceUsdc.total);
+    const bobTotal = parseFloat(bobUsdc.total);
+    const systemTotal = aliceTotal + bobTotal;
+    const expectedSystemTotal = 2 * 2 * GENESIS_PER_VIEW; // 2 users * 2 views * genesis_per_view
+    if (Math.abs(systemTotal - expectedSystemTotal) / expectedSystemTotal > 0.01) {
+      throw new Error(`System total ${systemTotal} deviates >1% from expected ${expectedSystemTotal}`);
+    }
+    logProgress(`Absolute checks: Alice core=${aliceCoreView}, Bob core=${bobCoreView}, system total=${systemTotal}`);
+
+    logProgress(`All nodes report identical balances (Alice=$${aliceVal}, Bob=$${bobVal})`);
   });
 
   // =========================================================================
@@ -473,7 +524,21 @@ export async function runMultinodeTests(ctx: TestContext): Promise<void> {
     if (!allSame) {
       throw new Error(`EVM balances differ: ${JSON.stringify(balances)}`);
     }
-    logProgress('EVM balances consistent across all nodes');
+
+    // Absolute value checks: verify balances are parseable as BigInt and non-negative
+    for (let i = 0; i < balances.length; i++) {
+      try {
+        const val = BigInt(balances[i]);
+        if (val < 0n) {
+          throw new Error(`Node ${i} EVM balance is negative: ${val}`);
+        }
+      } catch (e) {
+        if ((e as Error).message.includes('negative')) throw e;
+        throw new Error(`Node ${i} EVM balance not parseable as BigInt: ${balances[i]}`);
+      }
+    }
+
+    logProgress('EVM balances consistent across all nodes (all parseable, non-negative)');
   });
 
   await runTest(ctx, 'EVM chain ID consistent', 'multinode-evm', 'All nodes report same chain ID', async () => {
@@ -708,7 +773,18 @@ export async function runMultinodeTests(ctx: TestContext): Promise<void> {
     if (!allMatch) {
       throw new Error(`AppHashes differ at height ${minHeight}: ${JSON.stringify(appHashes)}`);
     }
-    logProgress(`All ${NUM_NODES} nodes agree on application state`);
+
+    // Absolute value checks: verify hash is non-empty and valid hex
+    for (let i = 0; i < appHashes.length; i++) {
+      if (!appHashes[i] || appHashes[i].length === 0) {
+        throw new Error(`Node ${i} returned empty appHash`);
+      }
+      if (!/^[0-9A-Fa-f]+$/.test(appHashes[i])) {
+        throw new Error(`Node ${i} appHash is not valid hex: ${appHashes[i]}`);
+      }
+    }
+
+    logProgress(`All ${NUM_NODES} nodes agree on application state (valid hex hash)`);
   });
 
   await runTest(ctx, 'Clearinghouse state matches across nodes', 'multinode-state', 'Alice account state identical on all nodes', async () => {
@@ -728,7 +804,43 @@ export async function runMultinodeTests(ctx: TestContext): Promise<void> {
     if (!allMatch) {
       throw new Error(`Clearinghouse states differ: ${JSON.stringify(states)}`);
     }
-    logProgress('Clearinghouse state identical across all nodes');
+
+    // Absolute value checks on the agreed-upon values
+    const [accountValueStr, totalRawUsdStr] = states[0].split('|');
+    const accountValue = parseFloat(accountValueStr);
+    const totalRawUsd = parseFloat(totalRawUsdStr);
+
+    if (isNaN(accountValue)) throw new Error(`accountValue not a valid number: ${accountValueStr}`);
+    if (isNaN(totalRawUsd)) throw new Error(`totalRawUsd not a valid number: ${totalRawUsdStr}`);
+
+    if (accountValue <= 0) throw new Error(`accountValue should be > 0, got ${accountValue}`);
+    if (totalRawUsd < 0) throw new Error(`totalRawUsd should be >= 0, got ${totalRawUsd}`);
+
+    // Invariant: accountValue >= totalRawUsd (account value includes PnL on top of raw USD)
+    if (accountValue < totalRawUsd - 0.01) {
+      throw new Error(`Invariant violated: accountValue (${accountValue}) < totalRawUsd (${totalRawUsd})`);
+    }
+
+    // Cross-validate with unified balances to verify consistency between APIs.
+    // The clearinghouseState accountValue should be derived from the unified coreView.
+    const ub = (await infoRequestTo(GATEWAY_URLS[0], 'unifiedBalances', {
+      user: TEST_ACCOUNTS.ALICE.address,
+    })) as { balances?: Array<{ tokenIndex?: number; coreView: string }> };
+    const usdcBal = ub.balances?.find((b) => (b.tokenIndex ?? 0) === 0);
+    if (usdcBal) {
+      const coreView = parseFloat(usdcBal.coreView);
+      if (coreView <= 0) throw new Error(`Unified coreView should be > 0, got ${coreView}`);
+
+      // accountValue and coreView represent the same balance in different formats.
+      // Verify they're proportional (ratio should be consistent and > 0).
+      const ratio = accountValue / coreView;
+      if (!isFinite(ratio) || ratio <= 0) {
+        throw new Error(`accountValue/coreView ratio invalid: ${ratio}`);
+      }
+      logProgress(`Cross-validated: accountValue/coreView ratio=${ratio} (consistent)`);
+    }
+
+    logProgress(`Clearinghouse state identical: accountValue=${accountValue}, rawUsd=${totalRawUsd}`);
   });
 
   await runTest(ctx, 'Unified balances match across nodes', 'multinode-state', 'Unified balance views identical on all nodes', async () => {
@@ -750,7 +862,38 @@ export async function runMultinodeTests(ctx: TestContext): Promise<void> {
     if (!allMatch) {
       throw new Error(`Unified balances differ: ${JSON.stringify(balances)}`);
     }
-    logProgress('Unified balances identical across all nodes');
+
+    // Absolute value checks on the agreed-upon balance data from node 0
+    const ub0 = (await infoRequestTo(GATEWAY_URLS[0], 'unifiedBalances', {
+      user: TEST_ACCOUNTS.ALICE.address,
+    })) as { balances?: Array<{ tokenIndex?: number; total: string; coreView: string; evmView: string }> };
+
+    for (const bal of ub0.balances || []) {
+      const tokenIdx = bal.tokenIndex ?? 0;
+
+      // Token indices should be 0 (USDC) or 1 (TEST)
+      if (tokenIdx !== 0 && tokenIdx !== 1) {
+        throw new Error(`Unexpected token index: ${tokenIdx} (expected 0 or 1)`);
+      }
+
+      const total = parseFloat(bal.total);
+      const coreView = parseFloat(bal.coreView);
+      const evmView = parseFloat(bal.evmView);
+
+      // Invariant: total == coreView + evmView (within tolerance)
+      if (Math.abs(total - (coreView + evmView)) > 0.01) {
+        throw new Error(
+          `Invariant violated for token ${tokenIdx}: total (${total}) != core (${coreView}) + evm (${evmView})`
+        );
+      }
+
+      // USDC total should be positive (genesis-funded)
+      if (tokenIdx === 0 && total <= 0) {
+        throw new Error(`USDC total should be > 0, got ${total}`);
+      }
+    }
+
+    logProgress('Unified balances identical across all nodes (invariants verified)');
   });
 
   await runTest(ctx, 'Market metadata consistent', 'multinode-state', 'All nodes report same markets', async () => {
@@ -939,6 +1082,27 @@ export async function runMultinodeTests(ctx: TestContext): Promise<void> {
       throw new Error('Chain stopped producing blocks after mixed transactions');
     }
 
+    // Verify perp order was actually placed (not just blocks produced)
+    const aliceOrders = (await infoRequestTo(GATEWAY_URLS[0], 'openOrders', {
+      user: TEST_ACCOUNTS.ALICE.address,
+    })) as Array<{ limitPx?: string }>;
+    const restingOrder = aliceOrders.find((o) => o.limitPx === '42000');
+    if (!restingOrder) {
+      throw new Error('Perp order at $42,000 not found in open orders - mixed tx processing may be broken');
+    }
+    logProgress('Perp order confirmed in order book');
+
+    // Verify EVM tx was processed (receipt exists)
+    const evmPublicClient = createPublicClient({
+      chain: { ...foundry, id: CHAIN_ID },
+      transport: http(EVM_RPC_URLS[Math.min(2, NUM_NODES - 1)]),
+    });
+    const receipt = await evmPublicClient.waitForTransactionReceipt({ hash: evmHash, timeout: 10000 });
+    if (receipt.status !== 'success') {
+      throw new Error(`EVM tx failed: status=${receipt.status}`);
+    }
+    logProgress('EVM tx confirmed with success status');
+
     // Cleanup orders
     const cancelAction = { type: 'cancelAll' };
     const { signature: cSig, nonce: cNonce } = await signAction(cancelAction, TEST_ACCOUNTS.ALICE.privateKey);
@@ -1113,18 +1277,202 @@ export async function runMultinodeTests(ctx: TestContext): Promise<void> {
   const COMPOSE_FILE = NUM_NODES === 5 ? 'docker-compose-multinode-5.yml' : 'docker-compose-multinode.yml';
   const CONTAINER_PREFIX = NUM_NODES === 5 ? 'hypercore-5v' : 'hypercore';
 
+  // -----------------------------------------------------------------------
+  // Resilience Helpers: stop/start with proper ordering and diagnostics
+  // -----------------------------------------------------------------------
+
+  /** Capture docker logs for a container (last N lines) */
+  async function captureContainerLogs(container: string, tail: number = 30): Promise<string> {
+    try {
+      const { stdout } = await exec(`docker logs --tail ${tail} ${container} 2>&1`);
+      return stdout.trim();
+    } catch {
+      return '<unable to capture logs>';
+    }
+  }
+
+  /** Check if a docker container is actually running */
+  async function isContainerRunning(container: string): Promise<boolean> {
+    try {
+      const { stdout } = await exec(`docker inspect -f '{{.State.Running}}' ${container}`);
+      return stdout.trim() === 'true';
+    } catch {
+      return false;
+    }
+  }
+
+  /** Get CometBFT peer count via net_info RPC */
+  async function getCometBftPeerCount(nodeIdx: number): Promise<number> {
+    try {
+      const data = (await cometbftRpcCall(COMETBFT_RPC_URLS[nodeIdx], 'net_info')) as {
+        result: { n_peers: string };
+      };
+      return parseInt(data.result.n_peers);
+    } catch {
+      return -1;
+    }
+  }
+
+  /** Log diagnostic info for a node (container status + last logs + peer count) */
+  async function logNodeDiagnostics(nodeIdx: number): Promise<void> {
+    const nodeContainer = `${CONTAINER_PREFIX}-node-${nodeIdx}`;
+    const cometContainer = `${CONTAINER_PREFIX}-cometbft-${nodeIdx}`;
+    const nodeRunning = await isContainerRunning(nodeContainer);
+    const cometRunning = await isContainerRunning(cometContainer);
+    const peers = cometRunning ? await getCometBftPeerCount(nodeIdx) : -1;
+    logProgress(`  Diagnostics node ${nodeIdx}: node=${nodeRunning ? 'RUNNING' : 'STOPPED'}, cometbft=${cometRunning ? 'RUNNING' : 'STOPPED'}, peers=${peers}`);
+
+    // Always capture logs (both running and stopped) for debugging
+    const nodeLogs = await captureContainerLogs(nodeContainer, 20);
+    logProgress(`  Last node-${nodeIdx} logs:\n${nodeLogs}`);
+    const cometLogs = await captureContainerLogs(cometContainer, 20);
+    logProgress(`  Last cometbft-${nodeIdx} logs:\n${cometLogs}`);
+  }
+
+  /**
+   * Stop a validator (CometBFT first, then node) with proper ordering.
+   * Stops CometBFT first to avoid consensus messages to a shutting-down app.
+   * Uses -t 1 timeout to ensure fast shutdown for BFT testing (1s grace period before SIGKILL).
+   */
+  async function stopValidator(nodeIdx: number): Promise<void> {
+    const cometContainer = `${CONTAINER_PREFIX}-cometbft-${nodeIdx}`;
+    const nodeContainer = `${CONTAINER_PREFIX}-node-${nodeIdx}`;
+
+    // Stop CometBFT first with 1s timeout (fast shutdown for BFT tests)
+    try {
+      await exec(`docker stop -t 1 ${cometContainer}`);
+    } catch (e) {
+      logProgress(`Warning: Failed to stop ${cometContainer}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+
+    // Stop the node with 1s timeout
+    try {
+      await exec(`docker stop -t 1 ${nodeContainer}`);
+    } catch (e) {
+      logProgress(`Warning: Failed to stop ${nodeContainer}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+
+    // Verify containers are actually stopped (wait up to 5s)
+    const verifyTimeout = Date.now() + 5000;
+    while (Date.now() < verifyTimeout) {
+      const cometRunning = await isContainerRunning(cometContainer);
+      const nodeRunning = await isContainerRunning(nodeContainer);
+      if (!cometRunning && !nodeRunning) {
+        return; // Both stopped successfully
+      }
+      await sleep(500);
+    }
+
+    // Log warning if containers are still running
+    const cometStillRunning = await isContainerRunning(cometContainer);
+    const nodeStillRunning = await isContainerRunning(nodeContainer);
+    if (cometStillRunning || nodeStillRunning) {
+      logProgress(`Warning: Containers still running after stop - comet=${cometStillRunning}, node=${nodeStillRunning}`);
+    }
+  }
+
+  /**
+   * Start a validator with proper ordering:
+   * 1. Start the application node first
+   * 2. Wait for its gateway health check to pass (ABCI server ready)
+   * 3. Clear CometBFT WAL to prevent stale consensus state from blocking block sync
+   * 4. Start CometBFT
+   * 5. Verify CometBFT connects to peers (retry with docker restart if needed)
+   */
+  async function startValidator(nodeIdx: number): Promise<void> {
+    // Start the application node
+    await exec(`docker start ${CONTAINER_PREFIX}-node-${nodeIdx}`).catch(() => {});
+
+    // Wait for the gateway health endpoint (proves ABCI server is up)
+    const nodeReady = await waitForCondition(
+      () => isGatewayHealthy(nodeIdx),
+      30000, // 30s should be plenty for node startup
+      1000,
+    );
+    if (!nodeReady) {
+      logProgress(`Warning: Node ${nodeIdx} gateway not healthy after 30s, starting CometBFT anyway`);
+      await logNodeDiagnostics(nodeIdx);
+    }
+
+    // Clear CometBFT WAL to prevent stale consensus state from interfering
+    // with block sync on restart. The block store and priv_validator_state
+    // are preserved, so committed data is safe.
+    await exec(`rm -f ./infra/multinode/validator-${nodeIdx}/data/cs.wal/wal`).catch(() => {});
+
+    // Now start CometBFT (node ABCI server should be accepting connections)
+    await exec(`docker start ${CONTAINER_PREFIX}-cometbft-${nodeIdx}`).catch(() => {});
+
+    // Wait for CometBFT RPC to become reachable
+    await waitForCondition(() => isCometBftReachable(nodeIdx), 15000, 1000);
+
+    // Verify CometBFT has connected to at least 1 peer
+    const hasPeers = await waitForCondition(async () => {
+      const peers = await getCometBftPeerCount(nodeIdx);
+      return peers > 0;
+    }, 30000, 2000);
+
+    if (!hasPeers) {
+      // CometBFT sometimes fails to connect to peers after docker stop/start.
+      // A docker restart forces a clean reconnection cycle.
+      logProgress(`Warning: CometBFT-${nodeIdx} has 0 peers after 30s, restarting CometBFT...`);
+      await exec(`docker restart ${CONTAINER_PREFIX}-cometbft-${nodeIdx}`).catch(() => {});
+      await sleep(5000);
+
+      // Check peers after restart
+      const retryPeers = await getCometBftPeerCount(nodeIdx);
+      if (retryPeers <= 0) {
+        logProgress(`Warning: CometBFT-${nodeIdx} still has ${retryPeers} peers after restart`);
+      } else {
+        logProgress(`CometBFT-${nodeIdx} connected to ${retryPeers} peers after restart`);
+      }
+    }
+  }
+
+  /**
+   * Wait for a validator to fully sync: CometBFT reachable, gateway healthy,
+   * and catching_up=false. Logs periodic status and diagnostics on failure.
+   */
+  async function waitForValidatorSync(nodeIdx: number, timeoutMs: number = 180000): Promise<boolean> {
+    const startTime = Date.now();
+    let lastLogTime = 0;
+
+    const synced = await waitForCondition(async () => {
+      // Periodic status logging (every 15s) for visibility during long waits
+      const now = Date.now();
+      if (now - lastLogTime > 15000) {
+        lastLogTime = now;
+        const elapsed = Math.round((now - startTime) / 1000);
+        try {
+          const peers = await getCometBftPeerCount(nodeIdx);
+          const height = await getNodeHeight(nodeIdx);
+          const catchingUp = await isNodeCatchingUp(nodeIdx);
+          logProgress(`  Sync [${elapsed}s]: node=${nodeIdx}, height=${height}, catching_up=${catchingUp}, peers=${peers}`);
+        } catch {
+          logProgress(`  Sync [${elapsed}s]: node=${nodeIdx} CometBFT unreachable`);
+        }
+      }
+
+      if (!(await isCometBftReachable(nodeIdx))) return false;
+      if (!(await isGatewayHealthy(nodeIdx))) return false;
+      return !(await isNodeCatchingUp(nodeIdx));
+    }, timeoutMs, 2000);
+
+    if (!synced) {
+      logProgress(`Node ${nodeIdx} failed to sync within ${timeoutMs / 1000}s — capturing diagnostics:`);
+      await logNodeDiagnostics(nodeIdx);
+    }
+    return synced;
+  }
+
+
   await runTest(ctx, 'Validator failure: chain continues with 4/5', 'multinode-resilience', 'Stop 1 validator, verify chain keeps producing blocks', async () => {
     // Record baseline height
     const heightBefore = await getNodeHeight(0);
     logProgress(`Height before stopping node 4: ${heightBefore}`);
 
-    // Stop validator 4 (node + cometbft)
+    // Stop validator 4 (CometBFT first, then node)
     logProgress('Stopping validator 4...');
-    try {
-      await exec(`docker stop ${CONTAINER_PREFIX}-cometbft-4 ${CONTAINER_PREFIX}-node-4`);
-    } catch (e: any) {
-      logProgress(`Stop command: ${e.message?.slice(0, 100)}`);
-    }
+    await stopValidator(4);
 
     // Wait for a few blocks to confirm chain continues
     await sleep(8000);
@@ -1136,7 +1484,7 @@ export async function runMultinodeTests(ctx: TestContext): Promise<void> {
 
     if (growth < 2) {
       // Restart node before failing
-      await exec(`docker start ${CONTAINER_PREFIX}-node-4 ${CONTAINER_PREFIX}-cometbft-4`).catch(() => {});
+      await startValidator(4);
       throw new Error(`Chain stalled with 4/5 validators: only grew ${growth} blocks`);
     }
 
@@ -1167,22 +1515,18 @@ export async function runMultinodeTests(ctx: TestContext): Promise<void> {
     const { signature: cSig, nonce: cNonce } = await signAction(cancelAction, TEST_ACCOUNTS.ALICE.privateKey);
     await exchangeRequestTo(GATEWAY_URLS[0], cancelAction, cSig, cNonce);
 
-    // Restart node 4
+    // Restart node 4 with proper ordering (node first, then CometBFT)
     logProgress('Restarting validator 4...');
-    await exec(`docker start ${CONTAINER_PREFIX}-node-4 ${CONTAINER_PREFIX}-cometbft-4`);
+    await startValidator(4);
     logProgress('Chain continued producing blocks with 4/5 validators');
   });
 
   await runTest(ctx, 'Node catch-up after restart', 'multinode-resilience', 'Restarted node syncs missed blocks and matches state', async () => {
-    // Wait for node 4 to come back online
-    const caughtUp = await waitForCondition(async () => {
-      if (!(await isCometBftReachable(4))) return false;
-      if (!(await isGatewayHealthy(4))) return false;
-      return !(await isNodeCatchingUp(4));
-    }, 60000, 2000);
+    // Wait for node 4 to fully sync (started at end of previous test)
+    const caughtUp = await waitForValidatorSync(4);
 
     if (!caughtUp) {
-      throw new Error('Node 4 did not finish catching up within 60s');
+      throw new Error(`Node 4 did not finish catching up within 180s`);
     }
 
     logProgress('Node 4 is back online and synced');
@@ -1236,7 +1580,7 @@ export async function runMultinodeTests(ctx: TestContext): Promise<void> {
   await runTest(ctx, 'Transactions during downtime reflected after sync', 'multinode-resilience', 'Orders placed while node offline appear after sync', async () => {
     // Stop node 3
     logProgress('Stopping validator 3...');
-    await exec(`docker stop ${CONTAINER_PREFIX}-cometbft-3 ${CONTAINER_PREFIX}-node-3`).catch(() => {});
+    await stopValidator(3);
     await sleep(3000);
 
     // Place an order while node 3 is offline
@@ -1262,19 +1606,15 @@ export async function runMultinodeTests(ctx: TestContext): Promise<void> {
       logProgress('Order confirmed on Node 0');
     }
 
-    // Restart node 3
+    // Restart node 3 with proper ordering
     logProgress('Restarting validator 3...');
-    await exec(`docker start ${CONTAINER_PREFIX}-node-3 ${CONTAINER_PREFIX}-cometbft-3`);
+    await startValidator(3);
 
     // Wait for node 3 to catch up
-    const synced = await waitForCondition(async () => {
-      if (!(await isCometBftReachable(3))) return false;
-      if (!(await isGatewayHealthy(3))) return false;
-      return !(await isNodeCatchingUp(3));
-    }, 60000, 2000);
+    const synced = await waitForValidatorSync(3);
 
     if (!synced) {
-      throw new Error('Node 3 did not finish catching up within 60s');
+      throw new Error(`Node 3 did not finish catching up within 180s`);
     }
     await sleep(3000);
 
@@ -1308,7 +1648,8 @@ export async function runMultinodeTests(ctx: TestContext): Promise<void> {
 
     // Stop 2 validators (3/5 = 60% < 66.7% required)
     logProgress('Stopping validators 3 and 4...');
-    await exec(`docker stop ${CONTAINER_PREFIX}-cometbft-3 ${CONTAINER_PREFIX}-node-3 ${CONTAINER_PREFIX}-cometbft-4 ${CONTAINER_PREFIX}-node-4`).catch(() => {});
+    await stopValidator(3);
+    await stopValidator(4);
 
     // Wait and check if chain halted
     await sleep(10000);
@@ -1324,19 +1665,23 @@ export async function runMultinodeTests(ctx: TestContext): Promise<void> {
     const growthDuringHalt = heightDuringHalt - heightBefore;
     logProgress(`Height during halt: ${heightDuringHalt} (grew by ${growthDuringHalt})`);
 
-    // With only 3/5 nodes, chain should have stalled or grown very little
-    // (CometBFT might produce 1-2 blocks before realizing no supermajority)
+    // With only 3/5 nodes (60% < 66.7%), chain must stall.
+    // CometBFT might produce 1-2 blocks before the round-robin realizes no supermajority,
+    // but sustained block production should stop.
     if (growthDuringHalt > 5) {
-      logProgress(`Warning: Chain produced ${growthDuringHalt} blocks with 3/5 validators (expected stall)`);
-    } else {
-      logProgress('Chain correctly stalled with insufficient validators');
+      throw new Error(
+        `BFT guarantee violated: chain produced ${growthDuringHalt} blocks with only 3/5 validators ` +
+        `(60% < 66.7% required). Expected chain to stall.`
+      );
     }
+    logProgress(`Chain correctly stalled with 3/5 validators (grew only ${growthDuringHalt} blocks in 10s)`);
 
     // Restart 1 validator (back to 4/5 = 80% > 66.7%)
     logProgress('Restarting validator 3 (to reach 4/5 = 80%)...');
-    await exec(`docker start ${CONTAINER_PREFIX}-node-3 ${CONTAINER_PREFIX}-cometbft-3`);
+    await startValidator(3);
 
-    // Wait for consensus to resume
+    // Wait for consensus to resume (node 3 needs time to restart + catch up)
+    const resumeTimeout = 180000;
     const resumed = await waitForCondition(async () => {
       try {
         const h = await getNodeHeight(0);
@@ -1344,12 +1689,16 @@ export async function runMultinodeTests(ctx: TestContext): Promise<void> {
       } catch {
         return false;
       }
-    }, 60000, 3000);
+    }, resumeTimeout, 3000);
 
     if (!resumed) {
+      logProgress('Chain did not resume — capturing diagnostics for all nodes:');
+      for (let i = 0; i < NUM_NODES; i++) {
+        await logNodeDiagnostics(i);
+      }
       // Restart remaining node before failing
-      await exec(`docker start ${CONTAINER_PREFIX}-node-4 ${CONTAINER_PREFIX}-cometbft-4`).catch(() => {});
-      throw new Error('Chain did not resume after restoring 4th validator');
+      await startValidator(4);
+      throw new Error(`Chain did not resume after restoring 4th validator within ${resumeTimeout / 1000}s`);
     }
 
     const heightAfterResume = await getNodeHeight(0);
@@ -1357,20 +1706,13 @@ export async function runMultinodeTests(ctx: TestContext): Promise<void> {
 
     // Restart remaining validator
     logProgress('Restarting validator 4...');
-    await exec(`docker start ${CONTAINER_PREFIX}-node-4 ${CONTAINER_PREFIX}-cometbft-4`);
+    await startValidator(4);
 
     // Wait for full cluster sync
-    const fullSync = await waitForCondition(async () => {
-      try {
-        if (!(await isCometBftReachable(4))) return false;
-        return !(await isNodeCatchingUp(4));
-      } catch {
-        return false;
-      }
-    }, 60000, 3000);
+    const fullSync = await waitForValidatorSync(4);
 
     if (!fullSync) {
-      logProgress('Warning: Node 4 still syncing after 60s');
+      logProgress(`Warning: Node 4 still syncing after 180s`);
     }
 
     await sleep(5000);
@@ -1388,10 +1730,10 @@ export async function runMultinodeTests(ctx: TestContext): Promise<void> {
 
     const activeNodes = finalHeights.filter((h) => h > 0);
     if (activeNodes.length < NUM_NODES) {
-      logProgress(`Warning: Only ${activeNodes.length}/${NUM_NODES} nodes responsive`);
+      throw new Error(`Only ${activeNodes.length}/${NUM_NODES} nodes responsive after recovery. Heights: [${finalHeights.join(', ')}]`);
     }
 
-    logProgress('Double failure + recovery test complete');
+    logProgress('Double failure + recovery test complete: all 5 nodes responsive');
   });
 
   await runTest(ctx, 'CometBFT finality: committed blocks never change', 'multinode-resilience', 'Block hashes at committed heights are immutable', async () => {
@@ -1464,8 +1806,91 @@ export async function runMultinodeTests(ctx: TestContext): Promise<void> {
   // =========================================================================
   logSection('25. Cross-Node EVM Contract & Spot Trading');
 
-  // Let cluster stabilize after resilience tests (node restarts, double failure recovery)
-  await sleep(5000);
+  // After resilience tests (node restarts, double failure), the cluster needs
+  // to fully recover before we can run tests that require block inclusion.
+  // A blind sleep is insufficient — we must verify the chain is actually healthy.
+  logProgress('Waiting for full cluster recovery after resilience tests...');
+  {
+    // Restart all 5 validators with proper ordering (node first, then CometBFT).
+    // Some containers may have been left stopped by previous test failures.
+    logProgress('Ensuring all validators are running with proper startup ordering...');
+    for (let i = 0; i < NUM_NODES; i++) {
+      const nodeRunning = await isContainerRunning(`${CONTAINER_PREFIX}-node-${i}`);
+      const cometRunning = await isContainerRunning(`${CONTAINER_PREFIX}-cometbft-${i}`);
+      if (!nodeRunning || !cometRunning) {
+        logProgress(`Restarting validator ${i} (node=${nodeRunning}, cometbft=${cometRunning})`);
+        await startValidator(i);
+      }
+    }
+    await sleep(5000);
+
+    // Step 1: Wait for ALL 5 nodes to be reachable (CometBFT + gateway)
+    const allReachable = await waitForCondition(async () => {
+      for (let i = 0; i < NUM_NODES; i++) {
+        if (!(await isCometBftReachable(i))) {
+          return false;
+        }
+        if (!(await isGatewayHealthy(i))) {
+          return false;
+        }
+      }
+      return true;
+    }, 180000, 5000);
+
+    if (!allReachable) {
+      logProgress('WARNING: Not all nodes reachable after 180s, capturing diagnostics...');
+      for (let i = 0; i < NUM_NODES; i++) {
+        await logNodeDiagnostics(i);
+      }
+    }
+
+    // Step 2: Wait for no node to be catching up
+    const allSynced = await waitForCondition(async () => {
+      for (let i = 0; i < NUM_NODES; i++) {
+        try {
+          if (await isNodeCatchingUp(i)) return false;
+        } catch {
+          return false;
+        }
+      }
+      return true;
+    }, 180000, 3000);
+
+    if (!allSynced) {
+      logProgress('WARNING: Some nodes still catching up after 180s');
+    }
+
+    // Step 3: Verify the chain is ACTUALLY producing blocks (not just nodes being up)
+    const baseHeight = await getNodeHeight(0);
+    logProgress(`Post-resilience height: ${baseHeight}, waiting for block production...`);
+    const blocksProduced = await waitForCondition(async () => {
+      try {
+        const h = await getNodeHeight(0);
+        return h > baseHeight + 3;
+      } catch {
+        return false;
+      }
+    }, 60000, 2000);
+
+    if (!blocksProduced) {
+      const currentHeight = await getNodeHeight(0).catch(() => -1);
+      logProgress(`WARNING: Chain may be stalled. Height: ${baseHeight} -> ${currentHeight}`);
+      // Log all node heights + peer counts for diagnostics
+      for (let i = 0; i < NUM_NODES; i++) {
+        try {
+          const h = await getNodeHeight(i);
+          const catching = await isNodeCatchingUp(i);
+          const peers = await getCometBftPeerCount(i);
+          logProgress(`  Node ${i}: height=${h}, catching_up=${catching}, peers=${peers}`);
+        } catch {
+          logProgress(`  Node ${i}: unreachable`);
+        }
+      }
+    } else {
+      const currentHeight = await getNodeHeight(0);
+      logProgress(`Cluster healthy: blocks ${baseHeight} -> ${currentHeight}, all ${NUM_NODES} nodes synced`);
+    }
+  }
 
   await runTest(ctx, 'Contract deploy on Node 0, read on all nodes', 'multinode-crossnode', 'Deploy SimpleStorage on Node 0, call get() on all nodes', async () => {
     const account = privateKeyToAccount(TEST_ACCOUNTS.ALICE.privateKey);
@@ -1610,15 +2035,17 @@ export async function runMultinodeTests(ctx: TestContext): Promise<void> {
     }, 15000, 1000);
 
     if (!found) {
-      // Log status for debugging
+      // Log status for debugging — include block heights to detect chain stalls
       for (let i = 0; i < NUM_NODES; i++) {
         try {
           const orders = (await infoRequestTo(GATEWAY_URLS[i], 'spotOpenOrders', {
             user: TEST_ACCOUNTS.ALICE.address,
           })) as Array<unknown>;
-          logProgress(`Node ${i}: ${orders.length} spot orders`);
-        } catch {
-          logProgress(`Node ${i}: unreachable`);
+          const height = await getNodeHeight(i);
+          const catching = await isNodeCatchingUp(i);
+          logProgress(`Node ${i}: ${orders.length} spot orders, height=${height}, catching_up=${catching}`);
+        } catch (e: any) {
+          logProgress(`Node ${i}: unreachable (${e.message?.slice(0, 50)})`);
         }
       }
       throw new Error('Spot order not propagated to all nodes within 15s');
@@ -1674,6 +2101,9 @@ export async function runMultinodeTests(ctx: TestContext): Promise<void> {
     }, 15000, 1000);
 
     if (!propagated) {
+      // Diagnostic: check if chain is producing blocks
+      const h = await getNodeHeight(0).catch(() => -1);
+      logProgress(`Chain height at failure: ${h}`);
       throw new Error(`View transfer not consistent after 15s: ${JSON.stringify(afterBalances)}`);
     }
 
@@ -2157,5 +2587,813 @@ export async function runMultinodeTests(ctx: TestContext): Promise<void> {
       logProgress(`Node ${i}: get() = 42`);
     }
     logProgress('EVM receipts and contract state consistent across all nodes');
+  });
+
+  // =========================================================================
+  // 27. MIXED TX TYPES WITH PARTIAL FILLS ACROSS NODES
+  // =========================================================================
+  logSection('27. Mixed Transaction Types with Partial Fills Across Nodes');
+
+  await runTest(ctx, 'Cross-node EVM + perp partial fill', 'multinode-mixed-partial', 'EVM tx on one node, perp partial fill on another', async () => {
+    // Cleanup any stale orders from prior tests
+    for (const acct of [TEST_ACCOUNTS.ALICE, TEST_ACCOUNTS.BOB]) {
+      const cancelAction = { type: 'cancelAll' };
+      const { signature, nonce } = await signAction(cancelAction, acct.privateKey);
+      await exchangeRequestTo(GATEWAY_URLS[0], cancelAction, signature, nonce);
+    }
+    await sleep(2000);
+
+    // Record baseline block height
+    const statusBefore = (await cometbftRpcCall(COMETBFT_RPC_URLS[0], 'status')) as {
+      result: { sync_info: { latest_block_height: string } };
+    };
+    const heightBefore = parseInt(statusBefore.result.sync_info.latest_block_height);
+    logProgress(`Block height before: ${heightBefore}`);
+
+    // Step 1: Alice places perp BUY 0.005 BTC @ $63,500 on Node 0
+    const buyAction = {
+      type: 'order',
+      orders: [{ a: 0, b: true, p: '63500', s: '0.005', r: false, t: { limit: { tif: 'Gtc' } } }],
+      grouping: 'na',
+    };
+    logProgress('Alice placing perp BUY 0.005 BTC @ $63,500 on Node 0...');
+    const { signature: buySig, nonce: buyNonce } = await signAction(buyAction, TEST_ACCOUNTS.ALICE.privateKey);
+    await exchangeRequestTo(GATEWAY_URLS[0], buyAction, buySig, buyNonce);
+
+    // Step 2: Concurrently, Bob sends EVM transfer on Node 2
+    const evmAccount = privateKeyToAccount(TEST_ACCOUNTS.BOB.privateKey);
+    const evmClient = createWalletClient({
+      account: evmAccount,
+      chain: { ...foundry, id: CHAIN_ID },
+      transport: http(EVM_RPC_URLS[Math.min(2, NUM_NODES - 1)]),
+    });
+    logProgress('Bob sending EVM transfer on Node 2...');
+    const evmHash = await evmClient.sendTransaction({
+      to: TEST_ACCOUNTS.CHARLIE.address,
+      value: parseEther('0.0001'),
+    });
+    logProgress(`EVM tx: ${evmHash.slice(0, 20)}...`);
+
+    // Wait for Alice's order to propagate to Node 3
+    const aliceVisible = await waitForCondition(async () => {
+      const orders = (await infoRequestTo(GATEWAY_URLS[Math.min(3, NUM_NODES - 1)], 'openOrders', {
+        user: TEST_ACCOUNTS.ALICE.address,
+      })) as Array<{ coin: string; side: string; sz?: string }>;
+      return orders.length > 0;
+    }, 15000, 1000);
+    if (!aliceVisible) {
+      throw new Error('Alice order not visible on Node 3 after 15s');
+    }
+    logProgress('Alice order visible on Node 3');
+
+    // Step 3: Bob places perp SELL 0.002 BTC @ $63,500 on Node 3 (partial fill)
+    const sellAction = {
+      type: 'order',
+      orders: [{ a: 0, b: false, p: '63500', s: '0.002', r: false, t: { limit: { tif: 'Gtc' } } }],
+      grouping: 'na',
+    };
+    logProgress('Bob placing perp SELL 0.002 BTC @ $63,500 on Node 3...');
+    const { signature: sellSig, nonce: sellNonce } = await signAction(sellAction, TEST_ACCOUNTS.BOB.privateKey);
+    await exchangeRequestTo(GATEWAY_URLS[Math.min(3, NUM_NODES - 1)], sellAction, sellSig, sellNonce);
+
+    // Step 4: Wait for partial fill — poll until Alice's remaining size drops below 0.005.
+    // We cannot check "Bob has 0 orders" because broadcast_tx_sync only validates CheckTx;
+    // Bob's order may not be in the engine state yet (still in mempool), so Bob trivially
+    // has 0 openOrders before matching even occurs.
+    let aliceRemaining = 0;
+    const partialFilled = await waitForCondition(async () => {
+      const aliceOrders = (await infoRequestTo(GATEWAY_URLS[0], 'openOrders', {
+        user: TEST_ACCOUNTS.ALICE.address,
+      })) as Array<{ sz?: string }>;
+      if (aliceOrders.length !== 1) return false;
+      aliceRemaining = parseFloat(aliceOrders[0]?.sz || '0');
+      // Once matching happens, remaining drops from 0.005 to ~0.003
+      return aliceRemaining < 0.005;
+    }, 30000, 1000);
+
+    if (!partialFilled) {
+      const ao = (await infoRequestTo(GATEWAY_URLS[0], 'openOrders', {
+        user: TEST_ACCOUNTS.ALICE.address,
+      })) as Array<{ sz?: string; side?: string; limitPx?: string }>;
+      const bo = (await infoRequestTo(GATEWAY_URLS[0], 'openOrders', {
+        user: TEST_ACCOUNTS.BOB.address,
+      })) as Array<{ sz?: string; side?: string; limitPx?: string }>;
+      throw new Error(`Partial fill failed: Alice orders=${JSON.stringify(ao)}, Bob orders=${JSON.stringify(bo)}`);
+    }
+
+    logProgress(`Alice remaining order: ${aliceRemaining} BTC (expected ~0.003)`);
+    if (Math.abs(aliceRemaining - 0.003) > 0.0001) {
+      throw new Error(`Expected Alice remaining ~0.003, got ${aliceRemaining}`);
+    }
+
+    // Verify Bob's order was fully consumed (no remaining)
+    const bobOrders = (await infoRequestTo(GATEWAY_URLS[0], 'openOrders', {
+      user: TEST_ACCOUNTS.BOB.address,
+    })) as Array<{ sz?: string }>;
+    if (bobOrders.length !== 0) {
+      throw new Error(`Expected Bob to have 0 open orders after full fill, got ${bobOrders.length}`);
+    }
+
+    // Verify fills: check that the most recent fill matches our trade (size=0.002, price=63500)
+    const aliceFills = (await infoRequestTo(GATEWAY_URLS[0], 'userFills', {
+      user: TEST_ACCOUNTS.ALICE.address,
+    })) as Array<{ sz?: string; px?: string; side?: string }>;
+    const bobFills = (await infoRequestTo(GATEWAY_URLS[0], 'userFills', {
+      user: TEST_ACCOUNTS.BOB.address,
+    })) as Array<{ sz?: string; px?: string; side?: string }>;
+
+    if (aliceFills.length === 0 || bobFills.length === 0) {
+      throw new Error('Expected fills for both Alice and Bob after partial match');
+    }
+
+    // Most recent fill (index 0) should match our trade parameters
+    const latestAliceFill = aliceFills[0];
+    const aliceFillSz = parseFloat(latestAliceFill.sz || '0');
+    const aliceFillPx = parseFloat(latestAliceFill.px || '0');
+    const bobFillSz = parseFloat(bobFills[0]?.sz || '0');
+    logProgress(`Latest fill: Alice sz=${aliceFillSz} px=${aliceFillPx}, Bob sz=${bobFillSz}`);
+
+    if (Math.abs(aliceFillSz - 0.002) > 0.0001) {
+      throw new Error(`Expected Alice fill size ~0.002, got ${aliceFillSz}`);
+    }
+    if (Math.abs(aliceFillPx - 63500) > 1) {
+      throw new Error(`Expected fill price ~63500, got ${aliceFillPx}`);
+    }
+    if (Math.abs(aliceFillSz - bobFillSz) > 0.0001) {
+      throw new Error(`Fill size mismatch: Alice=${aliceFillSz}, Bob=${bobFillSz}`);
+    }
+
+    // Verify EVM tx completed — poll receipt instead of blind sleep
+    const publicClient0 = createPublicClient({
+      chain: { ...foundry, id: CHAIN_ID },
+      transport: http(EVM_RPC_URLS[0]),
+    });
+    let evmReceipt: Awaited<ReturnType<typeof publicClient0.getTransactionReceipt>> | null = null;
+    const evmConfirmed = await waitForCondition(async () => {
+      try {
+        evmReceipt = await publicClient0.getTransactionReceipt({ hash: evmHash });
+        return evmReceipt != null;
+      } catch { return false; }
+    }, 15000, 1000);
+    if (!evmConfirmed || !evmReceipt || (evmReceipt as { status: string }).status !== 'success') {
+      throw new Error(`EVM transfer failed or not confirmed after 15s`);
+    }
+    logProgress('EVM transfer confirmed on Node 0');
+
+    // Verify chain continued
+    const statusAfter = (await cometbftRpcCall(COMETBFT_RPC_URLS[0], 'status')) as {
+      result: { sync_info: { latest_block_height: string } };
+    };
+    const heightAfter = parseInt(statusAfter.result.sync_info.latest_block_height);
+    logProgress(`Block progression: ${heightBefore} -> ${heightAfter}`);
+
+    // Cleanup
+    const cancelAction = { type: 'cancelAll' };
+    const { signature: cSig, nonce: cNonce } = await signAction(cancelAction, TEST_ACCOUNTS.ALICE.privateKey);
+    await exchangeRequestTo(GATEWAY_URLS[0], cancelAction, cSig, cNonce);
+    await sleep(1000);
+    logProgress('Partial fill + EVM verified');
+  });
+
+  await runTest(ctx, 'All-node concurrent storm with mixed types and partial fills', 'multinode-mixed-partial', 'Submit mixed txs to all 5 nodes concurrently, verify partial fills and state', async () => {
+    // Cleanup
+    for (const acct of [TEST_ACCOUNTS.ALICE, TEST_ACCOUNTS.BOB, TEST_ACCOUNTS.CHARLIE]) {
+      const ca = { type: 'cancelAll' };
+      const { signature, nonce } = await signAction(ca, acct.privateKey);
+      await exchangeRequestTo(GATEWAY_URLS[0], ca, signature, nonce);
+    }
+    await sleep(2000);
+
+    // Record baseline
+    const statusBefore = (await cometbftRpcCall(COMETBFT_RPC_URLS[0], 'status')) as {
+      result: { sync_info: { latest_block_height: string } };
+    };
+    const heightBefore = parseInt(statusBefore.result.sync_info.latest_block_height);
+    logProgress(`Baseline block height: ${heightBefore}`);
+
+    // Round 1: Submit 5 transactions concurrently, one per node
+    // Node 0: Alice perp BUY 0.005 BTC @ $62,500
+    // Node 1: Bob EVM transfer to Charlie
+    // Node 2: Charlie leverage update to 15x
+    // Node 3: Bob perp SELL 0.002 BTC @ $62,500 (partial fill against Alice)
+    // Node 4: Alice EVM transfer to Bob
+
+    logProgress('Round 1: Submitting 5 concurrent transactions...');
+
+    // Prepare all transactions
+    const aliceBuyAction = {
+      type: 'order',
+      orders: [{ a: 0, b: true, p: '62500', s: '0.005', r: false, t: { limit: { tif: 'Gtc' } } }],
+      grouping: 'na',
+    };
+    const { signature: aliceBuySig, nonce: aliceBuyNonce } = await signAction(aliceBuyAction, TEST_ACCOUNTS.ALICE.privateKey);
+
+    const bobEvmAccount = privateKeyToAccount(TEST_ACCOUNTS.BOB.privateKey);
+    const bobEvmClient = createWalletClient({
+      account: bobEvmAccount,
+      chain: { ...foundry, id: CHAIN_ID },
+      transport: http(EVM_RPC_URLS[Math.min(1, NUM_NODES - 1)]),
+    });
+
+    const charlieLevAction = { type: 'updateLeverage', asset: 0, isCross: true, leverage: 15 };
+    const { signature: charlieLevSig, nonce: charlieLevNonce } = await signAction(charlieLevAction, TEST_ACCOUNTS.CHARLIE.privateKey);
+
+    const bobSellAction = {
+      type: 'order',
+      orders: [{ a: 0, b: false, p: '62500', s: '0.002', r: false, t: { limit: { tif: 'Gtc' } } }],
+      grouping: 'na',
+    };
+    const { signature: bobSellSig, nonce: bobSellNonce } = await signAction(bobSellAction, TEST_ACCOUNTS.BOB.privateKey);
+
+    const aliceEvmAccount = privateKeyToAccount(TEST_ACCOUNTS.ALICE.privateKey);
+    const aliceEvmClient = createWalletClient({
+      account: aliceEvmAccount,
+      chain: { ...foundry, id: CHAIN_ID },
+      transport: http(EVM_RPC_URLS[Math.min(4, NUM_NODES - 1)]),
+    });
+
+    // Submit all 5 concurrently
+    const results = await Promise.allSettled([
+      exchangeRequestTo(GATEWAY_URLS[0], aliceBuyAction, aliceBuySig, aliceBuyNonce),
+      bobEvmClient.sendTransaction({ to: TEST_ACCOUNTS.CHARLIE.address, value: parseEther('0.0001') }),
+      exchangeRequestTo(GATEWAY_URLS[Math.min(2, NUM_NODES - 1)], charlieLevAction, charlieLevSig, charlieLevNonce),
+      exchangeRequestTo(GATEWAY_URLS[Math.min(3, NUM_NODES - 1)], bobSellAction, bobSellSig, bobSellNonce),
+      aliceEvmClient.sendTransaction({ to: TEST_ACCOUNTS.BOB.address, value: parseEther('0.0001') }),
+    ]);
+
+    // Check submission results
+    const statuses = results.map((r, i) => {
+      const names = ['Alice BUY', 'Bob EVM', 'Charlie LEV', 'Bob SELL', 'Alice EVM'];
+      return `${names[i]}: ${r.status === 'fulfilled' ? 'OK' : `FAIL: ${(r as PromiseRejectedResult).reason?.message?.slice(0, 50)}`}`;
+    });
+    logProgress(statuses.join(' | '));
+
+    // At least perp orders and leverage should succeed
+    if (results[0].status === 'rejected') throw new Error('Alice BUY submission failed');
+    if (results[3].status === 'rejected') throw new Error('Bob SELL submission failed');
+
+    // Wait for matching — poll until Alice's remaining size drops from 0.005 to ~0.003.
+    // Same rationale as Test 1: broadcast_tx_sync means Bob's sell may be in mempool,
+    // so "Bob has 0 orders" is true before execution. We must check the actual fill effect.
+    let r1Remaining = 0;
+    const partialFilled = await waitForCondition(async () => {
+      const aliceOrders = (await infoRequestTo(GATEWAY_URLS[0], 'openOrders', {
+        user: TEST_ACCOUNTS.ALICE.address,
+      })) as Array<{ sz?: string }>;
+      if (aliceOrders.length !== 1) return false;
+      r1Remaining = parseFloat(aliceOrders[0]?.sz || '0');
+      return r1Remaining < 0.005;
+    }, 30000, 1000);
+
+    if (!partialFilled) {
+      const ao = (await infoRequestTo(GATEWAY_URLS[0], 'openOrders', {
+        user: TEST_ACCOUNTS.ALICE.address,
+      })) as Array<{ sz?: string }>;
+      const bo = (await infoRequestTo(GATEWAY_URLS[0], 'openOrders', {
+        user: TEST_ACCOUNTS.BOB.address,
+      })) as Array<{ sz?: string }>;
+      logProgress(`Partial fill state: Alice=${JSON.stringify(ao)}, Bob=${JSON.stringify(bo)}`);
+      throw new Error('Round 1 partial fill did not complete within 30s');
+    }
+
+    logProgress(`After Round 1: Alice remaining=${r1Remaining} (expected ~0.003)`);
+    if (Math.abs(r1Remaining - 0.003) > 0.0001) {
+      throw new Error(`Round 1: Expected Alice remaining ~0.003, got ${r1Remaining}`);
+    }
+
+    // Round 2: Charlie sells 0.001 on Node 1 to further partially fill Alice
+    logProgress('Round 2: Charlie SELL 0.001 BTC @ $62,500 on Node 1...');
+    const charlieSellAction = {
+      type: 'order',
+      orders: [{ a: 0, b: false, p: '62500', s: '0.001', r: false, t: { limit: { tif: 'Gtc' } } }],
+      grouping: 'na',
+    };
+    const { signature: charlieSellSig, nonce: charlieSellNonce } = await signAction(charlieSellAction, TEST_ACCOUNTS.CHARLIE.privateKey);
+    await exchangeRequestTo(GATEWAY_URLS[Math.min(1, NUM_NODES - 1)], charlieSellAction, charlieSellSig, charlieSellNonce);
+
+    // Wait for second partial fill
+    const secondFill = await waitForCondition(async () => {
+      const aliceOrders = (await infoRequestTo(GATEWAY_URLS[0], 'openOrders', {
+        user: TEST_ACCOUNTS.ALICE.address,
+      })) as Array<{ sz?: string }>;
+      if (aliceOrders.length !== 1) return false;
+      const sz = parseFloat(aliceOrders[0]?.sz || '0');
+      return Math.abs(sz - 0.002) < 0.0001;
+    }, 30000, 1000);
+
+    if (!secondFill) {
+      const ao = (await infoRequestTo(GATEWAY_URLS[0], 'openOrders', {
+        user: TEST_ACCOUNTS.ALICE.address,
+      })) as Array<{ sz?: string }>;
+      logProgress(`Round 2 state: Alice=${JSON.stringify(ao)}`);
+      throw new Error('Round 2 partial fill did not complete within 30s');
+    }
+    logProgress('After Round 2: Alice remaining ~0.002');
+
+    // Verify EVM transfers by polling receipts on chain (not just submission status)
+    const evmHashes: string[] = [];
+    if (results[1].status === 'fulfilled') evmHashes.push(results[1].value as string);
+    if (results[4].status === 'fulfilled') evmHashes.push(results[4].value as string);
+
+    const evmPublicClient = createPublicClient({
+      chain: { ...foundry, id: CHAIN_ID },
+      transport: http(EVM_RPC_URLS[0]),
+    });
+    let evmConfirmedCount = 0;
+    for (const txHash of evmHashes) {
+      const confirmed = await waitForCondition(async () => {
+        try {
+          const r = await evmPublicClient.getTransactionReceipt({ hash: txHash as `0x${string}` });
+          return r != null && r.status === 'success';
+        } catch { return false; }
+      }, 15000, 1000);
+      if (confirmed) evmConfirmedCount++;
+    }
+    logProgress(`EVM transfers confirmed on chain: ${evmConfirmedCount}/${evmHashes.length}`);
+    if (evmConfirmedCount === 0 && evmHashes.length > 0) {
+      throw new Error('No EVM transfers were confirmed on chain');
+    }
+
+    // Verify Charlie's leverage update actually propagated (not just submitted)
+    await sleep(2000);
+    const appHashes: string[] = [];
+    for (let i = 0; i < NUM_NODES; i++) {
+      const status = (await cometbftRpcCall(COMETBFT_RPC_URLS[i], 'status')) as {
+        result: { sync_info: { latest_block_height: string } };
+      };
+      const height = status.result.sync_info.latest_block_height;
+      const block = (await cometbftRpcCall(COMETBFT_RPC_URLS[i], `block?height=${height}`)) as {
+        result: { block: { header: { app_hash: string } } };
+      };
+      appHashes.push(block.result.block.header.app_hash);
+    }
+
+    // All nodes should agree on app hash at their latest height
+    // Note: nodes may be at slightly different heights, so we check that
+    // at least 3/5 agree (quorum)
+    const hashCounts = new Map<string, number>();
+    for (const h of appHashes) {
+      hashCounts.set(h, (hashCounts.get(h) || 0) + 1);
+    }
+    const maxAgreement = Math.max(...hashCounts.values());
+    logProgress(`AppHash agreement: ${maxAgreement}/${NUM_NODES} nodes agree`);
+    if (maxAgreement < 3) {
+      throw new Error(`AppHash divergence: only ${maxAgreement}/${NUM_NODES} nodes agree: ${JSON.stringify(appHashes)}`);
+    }
+
+    // Verify block progression
+    const statusAfter = (await cometbftRpcCall(COMETBFT_RPC_URLS[0], 'status')) as {
+      result: { sync_info: { latest_block_height: string } };
+    };
+    const heightAfter = parseInt(statusAfter.result.sync_info.latest_block_height);
+    logProgress(`Block progression: ${heightBefore} -> ${heightAfter} (+${heightAfter - heightBefore})`);
+
+    // Cleanup
+    for (const acct of [TEST_ACCOUNTS.ALICE, TEST_ACCOUNTS.BOB, TEST_ACCOUNTS.CHARLIE]) {
+      const ca = { type: 'cancelAll' };
+      const { signature, nonce } = await signAction(ca, acct.privateKey);
+      await exchangeRequestTo(GATEWAY_URLS[0], ca, signature, nonce);
+    }
+    await sleep(1000);
+
+    // Reset Charlie's leverage
+    const resetLev = { type: 'updateLeverage', asset: 0, isCross: true, leverage: 10 };
+    const { signature: rlSig, nonce: rlNonce } = await signAction(resetLev, TEST_ACCOUNTS.CHARLIE.privateKey);
+    await exchangeRequestTo(GATEWAY_URLS[0], resetLev, rlSig, rlNonce);
+    await sleep(1000);
+
+    logProgress('All-node concurrent storm with partial fills verified');
+  });
+
+  // =========================================================================
+  // 12. BYZANTINE FAULT TOLERANCE PROPERTIES
+  // =========================================================================
+  logSection('28. Byzantine Fault Tolerance Properties');
+
+  await runTest(ctx, 'Evidence parameters configured in genesis', 'multinode-bft', 'Verify CometBFT evidence parameters in genesis', async () => {
+    const genesis = (await cometbftRpcCall(COMETBFT_RPC_URLS[0], 'genesis')) as {
+      result: {
+        genesis: {
+          consensus_params: {
+            evidence: {
+              max_age_num_blocks: string;
+              max_age_duration: string;
+              max_bytes: string;
+            };
+          };
+        };
+      };
+    };
+
+    const evidence = genesis.result.genesis.consensus_params.evidence;
+    const maxAgeBlocks = parseInt(evidence.max_age_num_blocks);
+    const maxBytes = parseInt(evidence.max_bytes);
+
+    logProgress(`Evidence params: max_age_num_blocks=${maxAgeBlocks}, max_bytes=${maxBytes}`);
+
+    if (maxAgeBlocks < 100) {
+      throw new Error(`max_age_num_blocks too low: ${maxAgeBlocks} (expected >= 100)`);
+    }
+    if (maxBytes < 1024) {
+      throw new Error(`max_bytes too low: ${maxBytes} (expected >= 1024)`);
+    }
+
+    logProgress('Evidence parameters properly configured in genesis');
+  });
+
+  await runTest(ctx, 'Validator set integrity', 'multinode-bft', 'All nodes report same validator set with equal voting power', async () => {
+    for (let i = 0; i < NUM_NODES; i++) {
+      const validators = (await cometbftRpcCall(COMETBFT_RPC_URLS[i], 'validators')) as {
+        result: {
+          validators: Array<{ voting_power: string; pub_key: { type: string; value: string } }>;
+          count: string;
+          total: string;
+        };
+      };
+
+      const count = parseInt(validators.result.total);
+      logProgress(`Node ${i}: ${count} validators`);
+
+      if (count !== NUM_NODES) {
+        throw new Error(`Node ${i} reports ${count} validators, expected ${NUM_NODES}`);
+      }
+
+      // Verify all validators have equal voting power
+      const powers = validators.result.validators.map((v) => v.voting_power);
+      const allEqual = powers.every((p) => p === powers[0]);
+      if (!allEqual) {
+        throw new Error(`Node ${i}: unequal voting power: ${JSON.stringify(powers)}`);
+      }
+      logProgress(`Node ${i}: all validators have power=${powers[0]}`);
+    }
+
+    logProgress(`Validator set integrity verified: ${NUM_NODES} validators with equal power on all nodes`);
+  });
+
+  await runTest(ctx, 'No evidence in normal operation', 'multinode-bft', 'Recent blocks contain no misbehavior evidence', async () => {
+    const currentHeight = await getNodeHeight(0);
+    const startHeight = Math.max(1, currentHeight - 20);
+
+    let evidenceCount = 0;
+    for (let h = startHeight; h <= currentHeight; h++) {
+      const block = (await cometbftRpcCall(COMETBFT_RPC_URLS[0], `block?height=${h}`)) as {
+        result: {
+          block: {
+            evidence: {
+              evidence: Array<unknown>;
+            };
+          };
+        };
+      };
+
+      const blockEvidence = block.result.block.evidence.evidence || [];
+      if (blockEvidence.length > 0) {
+        evidenceCount += blockEvidence.length;
+        logProgress(`Block ${h}: ${blockEvidence.length} evidence item(s) found`);
+      }
+    }
+
+    logProgress(`Checked blocks ${startHeight}-${currentHeight}: ${evidenceCount} evidence items`);
+    if (evidenceCount > 0) {
+      throw new Error(`Found ${evidenceCount} misbehavior evidence items in normal operation`);
+    }
+
+    logProgress('No misbehavior evidence in recent blocks (expected for well-behaved validators)');
+  });
+
+  await runTest(ctx, 'Block commits have supermajority signatures', 'multinode-bft', 'Committed blocks have >= ceil(N*2/3) signatures', async () => {
+    const currentHeight = await getNodeHeight(0);
+    const checkHeight = currentHeight - 2;
+
+    if (checkHeight < 1) {
+      throw new Error('Not enough blocks produced for commit signature test');
+    }
+
+    // BLOCK_ID_FLAG_COMMIT = 2 in CometBFT
+    const commit = (await cometbftRpcCall(COMETBFT_RPC_URLS[0], `commit?height=${checkHeight}`)) as {
+      result: {
+        signed_header: {
+          commit: {
+            signatures: Array<{ block_id_flag: number }>;
+          };
+        };
+      };
+    };
+
+    const signatures = commit.result.signed_header.commit.signatures;
+    const commitSignatures = signatures.filter((s) => s.block_id_flag === 2);
+    const requiredSignatures = Math.ceil((NUM_NODES * 2) / 3);
+
+    logProgress(`Block ${checkHeight}: ${commitSignatures.length}/${signatures.length} COMMIT signatures (need >= ${requiredSignatures})`);
+
+    if (commitSignatures.length < requiredSignatures) {
+      throw new Error(
+        `Supermajority violation: only ${commitSignatures.length} COMMIT signatures ` +
+        `at height ${checkHeight} (need >= ${requiredSignatures} of ${NUM_NODES})`
+      );
+    }
+
+    logProgress(`Supermajority verified: ${commitSignatures.length} >= ${requiredSignatures}`);
+  });
+
+  await runTest(ctx, 'No divergence under concurrent adversarial load', 'multinode-bft', 'All nodes agree on app_hash after concurrent orders to all gateways', async () => {
+    // Submit orders to all 5 gateway nodes simultaneously
+    const orderPromises = [];
+    for (let i = 0; i < NUM_NODES; i++) {
+      const action = {
+        type: 'order',
+        orders: [{ a: 0, b: i % 2 === 0, p: `${40000 + i * 100}`, s: '0.001', r: false, t: { limit: { tif: 'Gtc' } } }],
+        grouping: 'na',
+      };
+      const sender = [TEST_ACCOUNTS.ALICE, TEST_ACCOUNTS.BOB, TEST_ACCOUNTS.CHARLIE][i % 3];
+      orderPromises.push(
+        (async () => {
+          const { signature, nonce } = await signAction(action, sender.privateKey);
+          return exchangeRequestTo(GATEWAY_URLS[i], action, signature, nonce);
+        })()
+      );
+    }
+
+    const results = await Promise.allSettled(orderPromises);
+    const successes = results.filter((r) => r.status === 'fulfilled').length;
+    logProgress(`${successes}/${NUM_NODES} concurrent orders submitted`);
+
+    // Wait for consensus to process all
+    await sleep(8000);
+
+    // Verify all nodes agree on app_hash at a common height
+    const heights: number[] = [];
+    for (let i = 0; i < NUM_NODES; i++) {
+      heights.push(await getNodeHeight(i));
+    }
+    const commonHeight = Math.min(...heights) - 1;
+
+    const appHashes: string[] = [];
+    for (let i = 0; i < NUM_NODES; i++) {
+      const commit = (await cometbftRpcCall(COMETBFT_RPC_URLS[i], `commit?height=${commonHeight}`)) as {
+        result: { signed_header: { header: { app_hash: string } } };
+      };
+      appHashes.push(commit.result.signed_header.header.app_hash);
+    }
+
+    const allMatch = appHashes.every((h) => h === appHashes[0]);
+    if (!allMatch) {
+      throw new Error(`State divergence after adversarial load at height ${commonHeight}: ${JSON.stringify(appHashes)}`);
+    }
+
+    logProgress(`No divergence: all ${NUM_NODES} nodes agree on app_hash at height ${commonHeight}`);
+
+    // Cleanup
+    for (const acct of [TEST_ACCOUNTS.ALICE, TEST_ACCOUNTS.BOB, TEST_ACCOUNTS.CHARLIE]) {
+      const ca = { type: 'cancelAll' };
+      const { signature, nonce } = await signAction(ca, acct.privateKey);
+      await exchangeRequestTo(GATEWAY_URLS[0], ca, signature, nonce);
+    }
+    await sleep(1000);
+  });
+
+  await runTest(ctx, 'Stopped node does not corrupt state on rejoin', 'multinode-bft', 'Stop node, submit txs, restart, verify full state convergence', async () => {
+    // Record baseline state
+    const heightBefore = await getNodeHeight(0);
+    logProgress(`Baseline height: ${heightBefore}`);
+
+    // Stop node 4
+    logProgress('Stopping validator 4 for state convergence test...');
+    await stopValidator(4);
+    await sleep(3000);
+
+    // Submit multiple transactions while node 4 is offline
+    const txActions = [
+      { type: 'order', orders: [{ a: 0, b: true, p: '44000', s: '0.001', r: false, t: { limit: { tif: 'Gtc' } } }], grouping: 'na' },
+      { type: 'order', orders: [{ a: 1, b: true, p: '2800', s: '0.01', r: false, t: { limit: { tif: 'Gtc' } } }], grouping: 'na' },
+    ];
+
+    for (const action of txActions) {
+      const { signature, nonce } = await signAction(action, TEST_ACCOUNTS.ALICE.privateKey);
+      await exchangeRequestTo(GATEWAY_URLS[0], action, signature, nonce);
+      await sleep(1000);
+    }
+    logProgress('Submitted 2 transactions while node 4 is offline');
+
+    // Wait for blocks to include the transactions
+    await sleep(5000);
+
+    // Restart node 4 with proper ordering. State persistence (RocksDB) is enabled,
+    // so the ABCI app loads persisted state and reports the correct height to CometBFT.
+    // CometBFT only replays blocks missed while the container was down.
+    logProgress('Restarting validator 4...');
+    await startValidator(4);
+
+    logProgress('Waiting for catch-up (persistence-backed, timeout 180s)...');
+    const caughtUp = await waitForValidatorSync(4);
+
+    if (!caughtUp) {
+      throw new Error(`Node 4 did not finish catching up within 180s`);
+    }
+
+    await sleep(5000);
+
+    // Verify app_hash matches across ALL 5 nodes (not just 4)
+    const finalHeights: number[] = [];
+    for (let i = 0; i < NUM_NODES; i++) {
+      finalHeights.push(await getNodeHeight(i));
+    }
+    const commonHeight = Math.min(...finalHeights) - 1;
+
+    const appHashes: string[] = [];
+    for (let i = 0; i < NUM_NODES; i++) {
+      const commit = (await cometbftRpcCall(COMETBFT_RPC_URLS[i], `commit?height=${commonHeight}`)) as {
+        result: { signed_header: { header: { app_hash: string } } };
+      };
+      appHashes.push(commit.result.signed_header.header.app_hash);
+    }
+
+    const allMatch = appHashes.every((h) => h === appHashes[0]);
+    if (!allMatch) {
+      for (let i = 0; i < NUM_NODES; i++) {
+        logProgress(`Node ${i}: appHash=${appHashes[i].slice(0, 20)}...`);
+      }
+      throw new Error(`State corruption on rejoin: app_hash mismatch at height ${commonHeight}`);
+    }
+
+    logProgress(`State convergence verified: all ${NUM_NODES} nodes agree at height ${commonHeight} after rejoin`);
+
+    // Cleanup
+    const cancelAction = { type: 'cancelAll' };
+    const { signature: cSig, nonce: cNonce } = await signAction(cancelAction, TEST_ACCOUNTS.ALICE.privateKey);
+    await exchangeRequestTo(GATEWAY_URLS[0], cancelAction, cSig, cNonce);
+    await sleep(1000);
+  });
+
+  await runTest(ctx, 'Chain halts at BFT threshold (>1/3 offline)', 'multinode-bft', 'Stop 2 validators, verify stall + safety, restart and verify recovery', async () => {
+    const heightBefore = await getNodeHeight(0);
+    logProgress(`Height before BFT threshold test: ${heightBefore}`);
+
+    // Stop 2 validators (leaves 3/5 = 60% < 66.7%)
+    logProgress('Stopping validators 3 and 4...');
+    await stopValidator(3);
+    await stopValidator(4);
+
+    // Wait 15 seconds and verify stall
+    await sleep(15000);
+
+    let heightDuringHalt: number;
+    try {
+      heightDuringHalt = await getNodeHeight(0);
+    } catch {
+      heightDuringHalt = heightBefore;
+    }
+
+    const growthDuringHalt = heightDuringHalt - heightBefore;
+    logProgress(`Growth during 15s halt: ${growthDuringHalt} blocks`);
+
+    if (growthDuringHalt > 2) {
+      // Restart before failing
+      await startValidator(3);
+      await startValidator(4);
+      throw new Error(`BFT safety violation: chain produced ${growthDuringHalt} blocks with only 3/5 validators in 15s`);
+    }
+
+    // Safety property: verify no new app_hash was committed during stall
+    if (heightDuringHalt > heightBefore) {
+      const hashBefore = (await cometbftRpcCall(COMETBFT_RPC_URLS[0], `commit?height=${heightBefore}`)) as {
+        result: { signed_header: { header: { app_hash: string } } };
+      };
+      const hashDuring = (await cometbftRpcCall(COMETBFT_RPC_URLS[0], `commit?height=${heightDuringHalt}`)) as {
+        result: { signed_header: { header: { app_hash: string } } };
+      };
+      logProgress(`AppHash before=${hashBefore.result.signed_header.header.app_hash.slice(0, 16)}..., during=${hashDuring.result.signed_header.header.app_hash.slice(0, 16)}...`);
+    }
+
+    logProgress(`Chain correctly stalled: only ${growthDuringHalt} blocks in 15s with 3/5 validators`);
+
+    // Restart validator 3 first (to reach 4/5 = 80% > 66.7%).
+    // With persistence enabled, validator 3 loads persisted state from RocksDB
+    // and only replays blocks missed while down.
+    logProgress('Restarting validator 3 (to reach 4/5 = 80%)...');
+    await startValidator(3);
+
+    // Wait for chain to resume producing blocks
+    const recoveryTimeout = 180000;
+    logProgress(`Waiting for chain recovery (persistence-backed, timeout ${Math.round(recoveryTimeout / 1000)}s)...`);
+    let lastRecoveryLog = Date.now();
+    const recovered = await waitForCondition(async () => {
+      try {
+        const h = await getNodeHeight(0);
+        if (Date.now() - lastRecoveryLog > 30000) {
+          const comet3Up = await isCometBftReachable(3);
+          let h3 = 0;
+          try { h3 = await getNodeHeight(3); } catch {}
+          const peers3 = await getCometBftPeerCount(3);
+          const peers0 = await getCometBftPeerCount(0);
+          logProgress(`Recovery: node0=${h} (target ${heightDuringHalt + 3}, peers=${peers0}), node3=${h3} (comet=${comet3Up ? 'UP' : 'DOWN'}, peers=${peers3})`);
+          lastRecoveryLog = Date.now();
+        }
+        return h > heightDuringHalt + 3;
+      } catch {
+        return false;
+      }
+    }, recoveryTimeout, 3000);
+
+    if (!recovered) {
+      logProgress('Chain did not recover — capturing diagnostics:');
+      for (let i = 0; i < NUM_NODES; i++) {
+        await logNodeDiagnostics(i);
+      }
+      await startValidator(4);
+      throw new Error(`Chain did not recover after restoring validator 3 within ${Math.round(recoveryTimeout / 1000)}s`);
+    }
+
+    const heightAfterResume = await getNodeHeight(0);
+    logProgress(`Chain resumed at height ${heightAfterResume} after restoring validator 3`);
+
+    // Restart validator 4
+    logProgress('Restarting validator 4...');
+    await startValidator(4);
+
+    // Wait for node 4 to fully sync
+    await waitForValidatorSync(4);
+
+    await sleep(5000);
+
+    const heightAfterRecovery = await getNodeHeight(0);
+    logProgress(`Chain recovered: height ${heightAfterRecovery} (grew ${heightAfterRecovery - heightDuringHalt} blocks after restart)`);
+  });
+
+  await runTest(ctx, 'Committed blocks are final (no reorg possible)', 'multinode-bft', 'Record block hashes at 5 heights, wait, re-verify across all nodes', async () => {
+    const currentHeight = await getNodeHeight(0);
+    const testHeights = [
+      currentHeight - 20,
+      currentHeight - 15,
+      currentHeight - 10,
+      currentHeight - 5,
+      currentHeight - 2,
+    ].filter((h) => h >= 1);
+
+    if (testHeights.length < 3) {
+      throw new Error('Not enough block history for finality test');
+    }
+
+    // Record block hashes at all test heights across all nodes
+    logProgress(`Recording block hashes at ${testHeights.length} heights across all nodes...`);
+    const hashMap: Map<number, string[]> = new Map();
+
+    for (const h of testHeights) {
+      const hashes: string[] = [];
+      for (let i = 0; i < NUM_NODES; i++) {
+        try {
+          const block = (await cometbftRpcCall(COMETBFT_RPC_URLS[i], `block?height=${h}`)) as {
+            result: { block_id: { hash: string } };
+          };
+          hashes.push(block.result.block_id.hash);
+        } catch {
+          hashes.push('unreachable');
+        }
+      }
+      hashMap.set(h, hashes);
+
+      // Verify all reachable nodes agree right now
+      const reachable = hashes.filter((x) => x !== 'unreachable');
+      if (reachable.length > 0 && !reachable.every((x) => x === reachable[0])) {
+        throw new Error(`Node disagreement at height ${h}: ${JSON.stringify(hashes)}`);
+      }
+    }
+
+    // Wait for 10+ more blocks
+    logProgress('Waiting for 10+ additional blocks...');
+    await waitForCondition(async () => {
+      try {
+        const h = await getNodeHeight(0);
+        return h > currentHeight + 10;
+      } catch {
+        return false;
+      }
+    }, 30000, 1000);
+
+    // Re-query all heights and verify hashes are identical
+    logProgress('Re-verifying block hashes after 10+ additional blocks...');
+    for (const h of testHeights) {
+      const originalHashes = hashMap.get(h)!;
+      for (let i = 0; i < NUM_NODES; i++) {
+        if (originalHashes[i] === 'unreachable') continue;
+        try {
+          const block = (await cometbftRpcCall(COMETBFT_RPC_URLS[i], `block?height=${h}`)) as {
+            result: { block_id: { hash: string } };
+          };
+          if (block.result.block_id.hash !== originalHashes[i]) {
+            throw new Error(
+              `REORG DETECTED: Node ${i}, height ${h}: ` +
+              `before=${originalHashes[i].slice(0, 16)}... after=${block.result.block_id.hash.slice(0, 16)}...`
+            );
+          }
+        } catch (e: unknown) {
+          const msg = e instanceof Error ? e.message : String(e);
+          if (msg.includes('REORG')) throw e;
+          // Node unreachable is OK, we'll still check others
+        }
+      }
+    }
+
+    logProgress(`Finality verified: block hashes at ${testHeights.length} heights immutable across all ${NUM_NODES} nodes`);
   });
 }

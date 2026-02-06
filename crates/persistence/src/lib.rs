@@ -51,9 +51,9 @@ pub use snapshot::{
 pub use state::{
     AccountEntry, BalanceEntry, BlockMetaEntry, ChainState, CloidEntry, CoreState,
     EvmAccountEntry, EvmBlockHashEntry, EvmCodeEntry, EvmStateData, EvmStorageEntry,
-    LeverageEntry, MarketEntry, NonceEntry, OrderEntry, PersistedState, PositionEntry,
-    ReservedEntry, SpotMarketEntry, SpotState, SpotTokenEntry, StateSnapshot,
-    UnifiedBalanceData, SCHEMA_VERSION,
+    LeverageEntry, MarketEntry, NonceEntry, OrderEntry, PerpState, PersistedState,
+    PositionEntry, ReservedEntry, SpotMarketEntry, SpotState, SpotTokenEntry,
+    StateSnapshot, UnifiedBalanceData, SCHEMA_VERSION,
 };
 
 

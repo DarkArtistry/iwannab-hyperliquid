@@ -80,6 +80,8 @@ pub struct AppState {
     block_events: HashMap<BlockHeight, Vec<serde_json::Value>>,
     /// Client Order ID to Order ID mapping (for CancelByCloid)
     cloid_to_oid: HashMap<(AccountAddress, String), (MarketId, OrderId)>,
+    /// Reverse mapping: Order ID to CLOID (for cleanup when orders are filled)
+    oid_to_cloid: HashMap<(MarketId, OrderId), (AccountAddress, String)>,
     /// Last timestamp nonce per account (for timestamp-based nonce validation)
     last_timestamp_nonces: HashMap<AccountAddress, u64>,
     /// Pending block events (accumulated during block execution)
@@ -90,6 +92,10 @@ pub struct AppState {
     unified_state_tree: Option<MerkleTree>,
     /// Cached nonce Merkle tree (rebuilt on end_block)
     nonce_tree: Option<MerkleTree>,
+    /// Number of misbehavior evidence items in the last block
+    pub last_evidence_count: usize,
+    /// Total number of misbehavior evidence items seen across all blocks
+    pub total_evidence_count: usize,
 }
 
 impl AppState {
@@ -114,11 +120,14 @@ impl AppState {
             block_metadata: HashMap::new(),
             block_events: HashMap::new(),
             cloid_to_oid: HashMap::new(),
+            oid_to_cloid: HashMap::new(),
             last_timestamp_nonces: HashMap::new(),
             pending_block_events: Vec::new(),
             next_trade_id: 1,
             unified_state_tree: None,
             nonce_tree: None,
+            last_evidence_count: 0,
+            total_evidence_count: 0,
         }
     }
 
@@ -143,11 +152,14 @@ impl AppState {
             block_metadata: HashMap::new(),
             block_events: HashMap::new(),
             cloid_to_oid: HashMap::new(),
+            oid_to_cloid: HashMap::new(),
             last_timestamp_nonces: HashMap::new(),
             pending_block_events: Vec::new(),
             next_trade_id: 1,
             unified_state_tree: None,
             nonce_tree: None,
+            last_evidence_count: 0,
+            total_evidence_count: 0,
         }
     }
 
@@ -174,11 +186,14 @@ impl AppState {
             block_metadata: HashMap::new(),
             block_events: HashMap::new(),
             cloid_to_oid: HashMap::new(),
+            oid_to_cloid: HashMap::new(),
             last_timestamp_nonces: HashMap::new(),
             pending_block_events: Vec::new(),
             next_trade_id: 1,
             unified_state_tree: None,
             nonce_tree: None,
+            last_evidence_count: 0,
+            total_evidence_count: 0,
         }
     }
 
@@ -203,7 +218,9 @@ impl AppState {
 
     /// Register a client order ID mapping
     pub fn register_cloid(&mut self, owner: AccountAddress, cloid: String, market_id: MarketId, order_id: OrderId) {
-        self.cloid_to_oid.insert((owner, cloid), (market_id, order_id));
+        self.cloid_to_oid.insert((owner, cloid.clone()), (market_id, order_id));
+        // Also add reverse mapping for cleanup when orders are filled
+        self.oid_to_cloid.insert((market_id, order_id), (owner, cloid));
     }
 
     /// Lookup order by client order ID
@@ -211,9 +228,23 @@ impl AppState {
         self.cloid_to_oid.get(&(owner, cloid.to_string())).copied()
     }
 
-    /// Remove client order ID mapping
+    /// Remove client order ID mapping by CLOID
     pub fn remove_cloid(&mut self, owner: AccountAddress, cloid: &str) {
-        self.cloid_to_oid.remove(&(owner, cloid.to_string()));
+        // Also remove from reverse mapping if it exists
+        if let Some((market_id, order_id)) = self.cloid_to_oid.remove(&(owner, cloid.to_string())) {
+            self.oid_to_cloid.remove(&(market_id, order_id));
+        }
+    }
+
+    /// Remove client order ID mapping by order ID (for cleanup when orders are filled)
+    /// Returns true if a CLOID was removed
+    pub fn remove_cloid_by_order(&mut self, market_id: MarketId, order_id: OrderId) -> bool {
+        if let Some((owner, cloid)) = self.oid_to_cloid.remove(&(market_id, order_id)) {
+            self.cloid_to_oid.remove(&(owner, cloid));
+            true
+        } else {
+            false
+        }
     }
 
     /// Store block metadata
@@ -423,29 +454,51 @@ impl AppState {
         let nonce_root = self.compute_nonce_root();
         hasher.update(&nonce_root);
 
-        // === Engine State (Phase 3C-extended) ===
-        // Acquire engine lock ONCE for all engine state computations.
-        // This prevents TryLockError panics when concurrent tasks (e.g., price feed)
-        // briefly hold the engine write lock.
-        {
+        // === Engine State ===
+        // Read ALL trading state (positions, orders, markets, leverage, scalars) from the
+        // perp_engine when available. The perp_engine holds the actual trading state with
+        // real positions, orders, leverage, and updated scalars. The shared `engine` is a
+        // legacy compatibility layer that has empty positions/orders/leverage during normal
+        // CometBFT operation.
+        //
+        // IMPORTANT: Use try_read() with retry loop instead of blocking_read() to be safe
+        // in ALL contexts. blocking_read() panics if called inside a tokio runtime (e.g.,
+        // during startup AppHash verification in #[tokio::main]). The retry loop achieves
+        // the same deterministic result: it always acquires the perp_engine lock and never
+        // falls back to a different data source.
+        let (positions_root, orders_root, markets_root, leverage_root, scalars_hash) = if let Some(ref perp) = self.perp_engine {
+            let perp_eng = Self::acquire_rw_lock_read(perp, "perp_engine");
+            let p = Self::positions_root_from_engine(&perp_eng.state);
+            let o = Self::orders_root_from_engine(&perp_eng.state);
+            let m = Self::markets_root_from_engine(&perp_eng.state);
+            let l = Self::leverage_root_from_engine(&perp_eng.state);
+            let s = Self::scalars_hash_from_engine(&perp_eng.state);
+
+            hasher.update(&p);
+            hasher.update(&o);
+            hasher.update(&m);
+            hasher.update(&l);
+            hasher.update(&s);
+
+            (p, o, m, l, s)
+        } else {
+            // Fallback for tests and environments without perp_engine
             let engine = self.acquire_engine_read();
+            let p = Self::positions_root_from_engine(&engine);
+            let o = Self::orders_root_from_engine(&engine);
+            let m = Self::markets_root_from_engine(&engine);
+            let l = Self::leverage_root_from_engine(&engine);
+            let s = Self::scalars_hash_from_engine(&engine);
 
-            // Positions
-            hasher.update(&Self::positions_root_from_engine(&engine));
+            hasher.update(&p);
+            hasher.update(&o);
+            hasher.update(&m);
+            hasher.update(&l);
+            hasher.update(&s);
 
-            // Open orders
-            hasher.update(&Self::orders_root_from_engine(&engine));
-
-            // Market state (prices, funding, OI)
-            hasher.update(&Self::markets_root_from_engine(&engine));
-
-            // Leverage settings
-            hasher.update(&Self::leverage_root_from_engine(&engine));
-
-            // Scalar values (insurance fund, next order ID)
-            hasher.update(&Self::scalars_hash_from_engine(&engine));
-        }
-        // Engine lock released here before acquiring EVM lock
+            (p, o, m, l, s)
+        };
+        // Engine/perp lock released here before acquiring EVM lock
 
         // Client order ID mappings (no engine lock needed)
         let cloid_root = self.compute_cloid_root();
@@ -455,16 +508,40 @@ impl AppState {
         // When EVM executor is set, include EVM state in consensus commitment.
         // Note: EVM balances are already included via unified_state_root (evm_view).
         // This adds: account nonces, code hashes, contract storage, and deployed code.
-        if let Some(ref evm) = self.evm_executor {
-            let evm_root = {
-                let executor = evm.try_read()
-                    .expect("EVM executor lock should not be held during state commitment");
+        let evm_root = if let Some(ref evm) = self.evm_executor {
+            // Use try_read() with retry loop instead of blocking_read() to be safe
+            // in ALL contexts (ABCI spawn_blocking AND startup verification in async main).
+            // In CometBFT mode, the EVM write lock is only held briefly by RPC handlers.
+            let root = {
+                let executor = Self::acquire_rw_lock_read(evm, "evm_executor");
                 executor.state_root()
             };
-            hasher.update(&evm_root);
-        }
+            hasher.update(&root);
+            Some(root)
+        } else {
+            None
+        };
 
-        hasher.finalize().into()
+        let result: [u8; 32] = hasher.finalize().into();
+
+        // Log component hashes for debugging consensus divergence
+        tracing::debug!(
+            "AppHash components at height {}: prev={} unified={} nonces={} positions={} orders={} markets={} leverage={} scalars={} cloid={} evm={} => {}",
+            self.height,
+            hex::encode(&self.app_hash[..8]),
+            hex::encode(&unified_root[..8]),
+            hex::encode(&nonce_root[..8]),
+            hex::encode(&positions_root[..8]),
+            hex::encode(&orders_root[..8]),
+            hex::encode(&markets_root[..8]),
+            hex::encode(&leverage_root[..8]),
+            hex::encode(&scalars_hash[..8]),
+            hex::encode(&cloid_root[..8]),
+            evm_root.map(|r| hex::encode(&r[..8])).unwrap_or_else(|| "none".to_string()),
+            hex::encode(&result[..8]),
+        );
+
+        result
     }
 
     /// Acquire engine read lock with retry for concurrent writer contention.
@@ -498,6 +575,43 @@ impl AppState {
         panic!(
             "Failed to acquire engine read lock for state commitment after retries. \
              A concurrent writer has held the lock for >100ms."
+        );
+    }
+
+    /// Acquire a tokio RwLock read guard with retry, safe in ALL contexts.
+    ///
+    /// Unlike `blocking_read()`, this works inside a tokio runtime (e.g., startup
+    /// verification in `#[tokio::main]`). Unlike `try_read()` alone, it retries
+    /// until the lock is available, guaranteeing deterministic results.
+    ///
+    /// Uses the same spin-then-sleep pattern as `acquire_engine_read()`.
+    fn acquire_rw_lock_read<'a, T>(lock: &'a RwLock<T>, name: &str) -> tokio::sync::RwLockReadGuard<'a, T> {
+        // Fast path: usually succeeds immediately (uncontested at startup,
+        // brief writer holds during ABCI operation)
+        if let Ok(guard) = lock.try_read() {
+            return guard;
+        }
+
+        // Slow path: spin-loop for brief contention (e.g., RPC handler holding write lock)
+        for _ in 0..10_000 {
+            std::hint::spin_loop();
+            if let Ok(guard) = lock.try_read() {
+                return guard;
+            }
+        }
+
+        // Very slow path: sleep-based retry for extended contention
+        for _ in 0..100 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            if let Ok(guard) = lock.try_read() {
+                return guard;
+            }
+        }
+
+        panic!(
+            "Failed to acquire {} read lock after retries. \
+             A concurrent writer has held the lock for >100ms.",
+            name
         );
     }
 
@@ -920,6 +1034,11 @@ impl AppState {
         &self.cloid_to_oid
     }
 
+    /// Get current CLOID count (for debugging state divergence)
+    pub fn cloid_count(&self) -> usize {
+        self.cloid_to_oid.len()
+    }
+
     /// Get all block metadata (for persistence)
     pub fn get_all_block_metadata(&self) -> &HashMap<BlockHeight, BlockMeta> {
         &self.block_metadata
@@ -937,6 +1056,11 @@ impl AppState {
 
     /// Restore CLOID mappings from persistence
     pub fn restore_cloid_mappings(&mut self, cloids: HashMap<(AccountAddress, String), (MarketId, OrderId)>) {
+        // Build the reverse mapping from the forward mapping
+        self.oid_to_cloid.clear();
+        for ((owner, cloid), (market_id, order_id)) in &cloids {
+            self.oid_to_cloid.insert((*market_id, *order_id), (*owner, cloid.clone()));
+        }
         self.cloid_to_oid = cloids;
     }
 

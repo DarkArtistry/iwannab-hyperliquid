@@ -90,6 +90,15 @@ async fn process_info_request(
         InfoRequest::StateInfo | InfoRequest::StateProof { .. } => {
             return process_state_proof_request(app, request).await;
         }
+        // Handle evidence status query
+        InfoRequest::EvidenceStatus => {
+            let app_guard = app.read().await;
+            return Ok(json!({
+                "lastEvidenceCount": app_guard.state.last_evidence_count,
+                "totalEvidenceCount": app_guard.state.total_evidence_count,
+                "validatorCount": 5
+            }));
+        }
         _ => {}
     }
 
@@ -194,60 +203,42 @@ async fn process_info_request(
         InfoRequest::ClearinghouseState { user } => {
             let address = parse_address(&user)?;
 
-            // Try perp engine (has positions from matching)
-            if let Some(ref pe) = perp_engine_ref {
-                let perp = pe.read().await;
-                if let Some(account) = perp.state.get_account(address) {
-                    return Ok(json!({
-                        "marginSummary": {
-                            "accountValue": account.balance.to_string(),
-                            "totalNtlPos": "0",
-                            "totalRawUsd": account.balance.to_string(),
-                            "totalMarginUsed": "0",
-                            "withdrawable": account.balance.to_string(),
-                        },
-                        "crossMarginSummary": {},
-                        "crossMaintenanceMarginUsed": "0",
-                        "assetPositions": perp.state.get_all_positions(address).iter().map(|(market_id, pos)| {
-                            json!({
-                                "position": {
-                                    "asset": market_id,
-                                    "szi": pos.size.to_string_trimmed(),
-                                    "entryPx": pos.entry_price().map(|p| p.to_string_trimmed()).unwrap_or_default(),
-                                }
-                            })
-                        }).collect::<Vec<_>>(),
-                    }));
-                }
-            }
+            // Read balance from unified state (source of truth)
+            let balance_str = {
+                let spot = spot_engine.read().await;
+                let unified_ref = spot.unified_state();
+                let unified = unified_ref.read().unwrap();
+                unified.get_core_view(address, 0).to_string_trimmed()
+            };
 
-            if let Some(account) = engine.get_account(address) {
-                Ok(json!({
-                    "marginSummary": {
-                        "accountValue": account.balance.to_string(),
-                        "totalNtlPos": "0",
-                        "totalRawUsd": account.balance.to_string(),
-                        "totalMarginUsed": "0",
-                        "withdrawable": account.balance.to_string(),
-                    },
-                    "crossMarginSummary": {},
-                    "crossMaintenanceMarginUsed": "0",
-                    "assetPositions": [],
-                }))
+            // Get positions from perp engine
+            let positions = if let Some(ref pe) = perp_engine_ref {
+                let perp = pe.read().await;
+                perp.state.get_all_positions(address).iter().map(|(market_id, pos)| {
+                    json!({
+                        "position": {
+                            "asset": market_id,
+                            "szi": pos.size.to_string_trimmed(),
+                            "entryPx": pos.entry_price().map(|p| p.to_string_trimmed()).unwrap_or_default(),
+                        }
+                    })
+                }).collect::<Vec<_>>()
             } else {
-                Ok(json!({
-                    "marginSummary": {
-                        "accountValue": "0",
-                        "totalNtlPos": "0",
-                        "totalRawUsd": "0",
-                        "totalMarginUsed": "0",
-                        "withdrawable": "0",
-                    },
-                    "crossMarginSummary": {},
-                    "crossMaintenanceMarginUsed": "0",
-                    "assetPositions": [],
-                }))
-            }
+                vec![]
+            };
+
+            Ok(json!({
+                "marginSummary": {
+                    "accountValue": balance_str,
+                    "totalNtlPos": "0",
+                    "totalRawUsd": balance_str,
+                    "totalMarginUsed": "0",
+                    "withdrawable": balance_str,
+                },
+                "crossMarginSummary": {},
+                "crossMaintenanceMarginUsed": "0",
+                "assetPositions": positions,
+            }))
         }
 
         InfoRequest::OpenOrders { user } => {
@@ -294,7 +285,7 @@ async fn process_info_request(
                 let fills_json: Vec<Value> = fills.iter().map(|f| json!({
                     "coin": coin_name_from_market_id(f.market_id),
                     "px": Decimal::from_raw(f.price as i128, 8).to_string_trimmed(),
-                    "sz": Decimal::from_raw(f.size as i128, 6).to_string_trimmed(),
+                    "sz": Decimal::from_raw(f.size as i128, Decimal::SIZE_DECIMALS).to_string_trimmed(),
                     "side": if f.is_taker_buy { "B" } else { "A" },
                     "time": f.timestamp,
                     "fee": Decimal::from_raw(f.taker_fee as i128, 6).to_string_trimmed(),
@@ -307,7 +298,7 @@ async fn process_info_request(
             let fills_json: Vec<Value> = fills.iter().map(|f| json!({
                 "coin": coin_name_from_market_id(f.market_id),
                 "px": Decimal::from_raw(f.price as i128, 8).to_string_trimmed(),
-                "sz": Decimal::from_raw(f.size as i128, 6).to_string_trimmed(),
+                "sz": Decimal::from_raw(f.size as i128, Decimal::SIZE_DECIMALS).to_string_trimmed(),
                 "side": if f.is_taker_buy { "B" } else { "A" },
                 "time": f.timestamp,
                 "fee": Decimal::from_raw(f.taker_fee as i128, 6).to_string_trimmed(),
@@ -394,6 +385,11 @@ async fn process_info_request(
         // State proof requests are handled above
         InfoRequest::StateInfo | InfoRequest::StateProof { .. } => {
             unreachable!("State proof requests handled in process_state_proof_request")
+        }
+
+        // Evidence status is handled above
+        InfoRequest::EvidenceStatus => {
+            unreachable!("Evidence status handled in process_info_request")
         }
     }
 }

@@ -48,6 +48,33 @@ fn acquire_write_with_retry<'a, T>(lock: &'a RwLock<T>, label: &str) -> Result<t
     Err(AppError::Internal(format!("{} lock contention (100 retries exhausted)", label)))
 }
 
+/// Acquire a read lock on a tokio RwLock with retry.
+///
+/// Similar to acquire_write_with_retry, but for read locks.
+/// CRITICAL: This is needed for CLOID cleanup during FinalizeBlock. Using try_read()
+/// could fail non-deterministically (e.g., if a write lock is held by another component
+/// on some nodes but not others), causing state divergence.
+fn acquire_read_with_retry<'a, T>(lock: &'a RwLock<T>, label: &str) -> Result<tokio::sync::RwLockReadGuard<'a, T>, AppError> {
+    // First try without sleeping (covers the uncontested case)
+    if let Ok(guard) = lock.try_read() {
+        return Ok(guard);
+    }
+
+    // Retry with short sleeps - writes should finish quickly
+    for attempt in 1..=100 {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        if let Ok(guard) = lock.try_read() {
+            if attempt > 5 {
+                tracing::debug!("{}: acquired read lock after {} retries", label, attempt);
+            }
+            return Ok(guard);
+        }
+    }
+
+    tracing::error!("{}: failed to acquire read lock after 100 retries", label);
+    Err(AppError::Internal(format!("{} lock contention (100 retries exhausted)", label)))
+}
+
 /// HyperCore application
 pub struct HyperCoreApp {
     /// Application state
@@ -320,6 +347,8 @@ impl HyperCoreApp {
         let mut events = Vec::new();
         // Collect CLOIDs to register after releasing engine locks
         let mut cloids_to_register: Vec<(String, MarketId, OrderId)> = Vec::new();
+        // Collect order IDs that were fully filled (for CLOID cleanup)
+        let mut filled_order_cloids: Vec<(MarketId, OrderId)> = Vec::new();
 
         for order_wire in orders {
             let market_id = order_wire.a;
@@ -339,13 +368,21 @@ impl HyperCoreApp {
 
                 match result {
                     Ok((order, fills)) => {
+                        // Only register CLOID if order is resting (not fully filled immediately)
                         if let Some(ref cloid) = order.client_order_id {
-                            cloids_to_register.push((cloid.clone(), market_id, order.id));
+                            if !order.is_filled() && !order.remaining_size.is_zero() {
+                                cloids_to_register.push((cloid.clone(), market_id, order.id));
+                            }
                         }
 
                         // Create BlockEvent::Fill for each spot fill
+                        // Also track maker orders that may have been fully filled
+                        let mut spot_filled_maker_orders: Vec<(MarketId, OrderId)> = Vec::new();
                         for fill in &fills {
                             let trade_id = self.state.next_trade_id();
+
+                            // Track maker order for CLOID cleanup check
+                            spot_filled_maker_orders.push((fill.market_id, fill.maker_order_id));
 
                             // Maker side: opposite of taker
                             // If taker is buying, maker is selling
@@ -384,6 +421,22 @@ impl HyperCoreApp {
                             });
                             if let Ok(json) = serde_json::to_value(&taker_event) {
                                 self.state.add_pending_block_event(json);
+                            }
+                        }
+
+                        // Clean up CLOIDs for fully filled spot maker orders
+                        if !spot_filled_maker_orders.is_empty() {
+                            if let Some(spot_engine) = &self.state.spot_engine {
+                                if let Ok(engine) = spot_engine.try_read() {
+                                    for (mkt_id, oid) in spot_filled_maker_orders {
+                                        // Check if order still exists
+                                        let order_exists = engine.state.get_order(mkt_id, oid).is_some();
+                                        if !order_exists {
+                                            // Order was fully filled, schedule CLOID removal
+                                            filled_order_cloids.push((mkt_id, oid));
+                                        }
+                                    }
+                                }
                             }
                         }
 
@@ -432,15 +485,25 @@ impl HyperCoreApp {
 
                 match result {
                     Some(Ok((order, fills))) => {
+                        // Only register CLOID if order is resting (not fully filled immediately)
                         if let Some(ref cloid) = order.client_order_id {
-                            cloids_to_register.push((cloid.clone(), market_id, order.id));
+                            if !order.is_filled() && order.should_rest() {
+                                cloids_to_register.push((cloid.clone(), market_id, order.id));
+                            }
+                            // Note: If taker order was fully filled, we don't register its CLOID
+                            // because there's no order to look up by CLOID anymore
                         }
 
                         // Create BlockEvent::Fill for each fill (both maker and taker)
+                        // Also track maker orders that may have been fully filled
+                        let mut filled_maker_orders: Vec<(MarketId, OrderId)> = Vec::new();
                         for fill in &fills {
                             let trade_id = self.state.next_trade_id();
                             let fill_price = Decimal::from_raw(fill.price as i128, Decimal::PRICE_DECIMALS);
                             let fill_size = Decimal::from_raw(fill.size as i128, Decimal::SIZE_DECIMALS);
+
+                            // Track maker order for CLOID cleanup check
+                            filled_maker_orders.push((fill.market_id, fill.maker_order_id));
 
                             // Maker fill event
                             let maker_side = if fill.is_taker_buy { OrderSide::Sell } else { OrderSide::Buy };
@@ -489,6 +552,28 @@ impl HyperCoreApp {
                                 .add_attribute("market_id", &fill.market_id.to_string()));
                         }
 
+                        // Clean up CLOIDs for fully filled maker orders
+                        // If the order is no longer in the orderbook, it was fully filled
+                        // CRITICAL: We MUST use blocking_read() here, not try_read(), because
+                        // try_read() can fail non-deterministically (e.g., RPC handler holds lock
+                        // on some nodes but not others), causing CLOID state divergence.
+                        if !filled_maker_orders.is_empty() {
+                            if let Some(perp_engine) = &self.state.perp_engine {
+                                let engine = acquire_read_with_retry(perp_engine, "Perp engine (CLOID cleanup)")?;
+                                for (mkt_id, oid) in filled_maker_orders {
+                                    // Check if order still exists in orderbook
+                                    let order_exists = engine.state
+                                        .get_orderbook(mkt_id)
+                                        .map(|book| book.get(oid).is_some())
+                                        .unwrap_or(false);
+                                    if !order_exists {
+                                        // Order was fully filled, schedule CLOID removal
+                                        filled_order_cloids.push((mkt_id, oid));
+                                    }
+                                }
+                            }
+                        }
+
                         // Emit OrderPlaced event for resting order
                         if !order.is_filled() && order.should_rest() {
                             let order_placed = BlockEvent::OrderPlaced(OrderPlacedEvent {
@@ -533,6 +618,14 @@ impl HyperCoreApp {
         // Register CLOIDs after releasing engine locks
         for (cloid, market_id, order_id) in cloids_to_register {
             self.state.register_cloid(sender, cloid, market_id, order_id);
+        }
+
+        // Remove CLOIDs for fully filled orders (makers that were matched)
+        // This is critical for state determinism: if a maker order with a CLOID is fully
+        // filled during matching, we must remove its CLOID to prevent state divergence
+        // between nodes that process different transactions at different times.
+        for (market_id, order_id) in filled_order_cloids {
+            self.state.remove_cloid_by_order(market_id, order_id);
         }
 
         Ok(events)

@@ -27,4 +27,4 @@ export { infoRequest, exchangeRequest } from './api.js';
 export { signAction } from './signing.js';
 
 // Test runner
-export { runTest, skipTest, sleep } from './testing.js';
+export { runTest, skipTest, sleep, assertErrorContains } from './testing.js';

@@ -93,7 +93,7 @@ pub use cometbft::{CometBftApp, CometBftServer, Validator, ValidatorSet};
 
 // Re-export persistence integration types when feature is enabled
 #[cfg(feature = "persistence")]
-pub use persistence_integration::{extract_state, restore_state, restore_chain_state, RestoreError};
+pub use persistence_integration::{extract_state, restore_state, restore_chain_state, restore_perp_engine_state, RestoreError};
 
 // Re-export P2P gossip types when feature is enabled
 #[cfg(feature = "p2p")]

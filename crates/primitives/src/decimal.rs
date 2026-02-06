@@ -26,8 +26,17 @@ impl Serialize for Decimal {
     where
         S: Serializer,
     {
-        // Serialize as string to preserve precision
-        serializer.serialize_str(&self.to_string_trimmed())
+        if serializer.is_human_readable() {
+            // JSON: serialize as string for API compatibility
+            serializer.serialize_str(&self.to_string_trimmed())
+        } else {
+            // Binary format (bincode): preserve exact (value, decimals) representation
+            use serde::ser::SerializeTuple;
+            let mut tup = serializer.serialize_tuple(2)?;
+            tup.serialize_element(&self.value)?;
+            tup.serialize_element(&self.decimals)?;
+            tup.end()
+        }
     }
 }
 
@@ -36,10 +45,16 @@ impl<'de> Deserialize<'de> for Decimal {
     where
         D: Deserializer<'de>,
     {
-        let s = String::deserialize(deserializer)?;
-        // Default to 8 decimal places when parsing
-        Self::from_str_exact(&s, Self::PRICE_DECIMALS)
-            .ok_or_else(|| serde::de::Error::custom(format!("Invalid decimal: {}", s)))
+        if deserializer.is_human_readable() {
+            // JSON: parse from string with default precision
+            let s = String::deserialize(deserializer)?;
+            Self::from_str_exact(&s, Self::PRICE_DECIMALS)
+                .ok_or_else(|| serde::de::Error::custom(format!("Invalid decimal: {}", s)))
+        } else {
+            // Binary format (bincode): read exact (value, decimals) pair
+            let (value, decimals) = <(i128, u8)>::deserialize(deserializer)?;
+            Ok(Decimal::from_raw(value, decimals))
+        }
     }
 }
 
@@ -106,7 +121,7 @@ impl Decimal {
             0
         };
 
-        let value = integer_part * scale + decimal_part;
+        let value = integer_part.checked_mul(scale)?.checked_add(decimal_part)?;
         Some(Self {
             value: if negative { -value } else { value },
             decimals,
@@ -428,5 +443,39 @@ mod tests {
         let converted = usdc.to_decimals(8);
         assert_eq!(converted.raw(), 100_050_000_000);
         assert_eq!(converted.to_string_trimmed(), "1000.5");
+    }
+
+    #[test]
+    fn test_bincode_roundtrip_preserves_precision() {
+        // This is the exact scenario that caused consensus failure:
+        // A Decimal with decimals=10 (RATE_DECIMALS) was persisted via bincode,
+        // but the old serde impl always deserialized with decimals=8 (PRICE_DECIMALS),
+        // changing the raw value and causing hash divergence.
+        let cases = vec![
+            Decimal::from_raw(1_000_000_000, 10),  // 0.1 with RATE_DECIMALS
+            Decimal::from_raw(10_000_000, 8),       // 0.1 with PRICE_DECIMALS
+            Decimal::from_raw(100_000, 6),           // 0.1 with USDC_DECIMALS
+            Decimal::from_raw(-500_000_000, 10),    // negative rate
+            Decimal::from_raw(0, 10),                // zero with non-default decimals
+            Decimal::from_raw(123_456_789, 8),      // arbitrary value
+        ];
+
+        for original in &cases {
+            let bytes = bincode::serialize(original).unwrap();
+            let restored: Decimal = bincode::deserialize(&bytes).unwrap();
+            assert_eq!(original.raw(), restored.raw(),
+                "raw value mismatch for {:?}: {} != {}", original, original.raw(), restored.raw());
+            assert_eq!(original.decimals(), restored.decimals(),
+                "decimals mismatch for {:?}: {} != {}", original, original.decimals(), restored.decimals());
+        }
+    }
+
+    #[test]
+    fn test_json_roundtrip_uses_string() {
+        let d = Decimal::from_str_exact("123.456", 8).unwrap();
+        let json = serde_json::to_string(&d).unwrap();
+        assert_eq!(json, "\"123.456\"");
+        let restored: Decimal = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.to_string_trimmed(), "123.456");
     }
 }

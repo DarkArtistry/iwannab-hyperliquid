@@ -28,6 +28,8 @@ pub fn extract_unified_balances(state: &UnifiedState) -> Vec<BalanceEntry> {
                 total: balance.total.to_string_trimmed(),
                 core_view: balance.core_view.to_string_trimmed(),
                 evm_view: balance.evm_view.to_string_trimmed(),
+                // Use the decimal precision from the balance itself
+                decimals: balance.total.decimals(),
             },
         })
         .collect()

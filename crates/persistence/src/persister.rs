@@ -55,6 +55,10 @@ impl<'a, B: PersistenceBackend> StatePersister<'a, B> {
     ///
     /// This method extracts data from all state components and atomically
     /// writes them to RocksDB.
+    ///
+    /// IMPORTANT: For column families that represent "full state snapshots" (CLOIDs, Orders,
+    /// Positions), we first delete all existing entries before writing new ones. This ensures
+    /// that removed/filled/closed items don't persist as stale data.
     pub fn persist_state(&self, state: &PersistedState) -> Result<()> {
         info!("Persisting state at height {}", state.height);
 
@@ -62,6 +66,46 @@ impl<'a, B: PersistenceBackend> StatePersister<'a, B> {
         state.validate().map_err(PersistenceError::invalid_state)?;
 
         let mut batch = self.backend.create_batch();
+
+        // === Clear stale entries from column families that are fully replaced ===
+        // CLOIDs: When orders are cancelled/filled, CLOIDs are removed from memory but
+        // were never deleted from RocksDB. This caused stale CLOIDs to accumulate.
+        let existing_cloids = self.backend.prefix_scan(ColumnFamily::CloidIndex, &[])?;
+        for (key, _) in existing_cloids {
+            batch.delete(ColumnFamily::CloidIndex, key);
+        }
+
+        // Orders: Same issue - cancelled/filled orders need to be removed
+        let existing_orders = self.backend.prefix_scan(ColumnFamily::Orders, &[])?;
+        for (key, _) in existing_orders {
+            batch.delete(ColumnFamily::Orders, key);
+        }
+
+        // Positions: Closed positions need to be removed
+        let existing_positions = self.backend.prefix_scan(ColumnFamily::Positions, &[])?;
+        for (key, _) in existing_positions {
+            batch.delete(ColumnFamily::Positions, key);
+        }
+
+        // Leverage: Remove stale leverage entries for closed positions
+        let existing_leverage = self.backend.prefix_scan(ColumnFamily::Leverage, &[])?;
+        for (key, _) in existing_leverage {
+            batch.delete(ColumnFamily::Leverage, key);
+        }
+
+        // Balances: While balances are keyed by (account, token), if an account is removed
+        // or a token balance becomes zero, the entry should be deleted to prevent stale data.
+        // Clear all and re-write the current balances.
+        let existing_balances = self.backend.prefix_scan(ColumnFamily::Balances, &[])?;
+        for (key, _) in existing_balances {
+            batch.delete(ColumnFamily::Balances, key);
+        }
+
+        // Nonces: Same issue - accounts might have been removed or nonces reset
+        let existing_nonces = self.backend.prefix_scan(ColumnFamily::Nonces, &[])?;
+        for (key, _) in existing_nonces {
+            batch.delete(ColumnFamily::Nonces, key);
+        }
 
         // Persist unified balances
         for balance in &state.core.balances {
@@ -79,30 +123,37 @@ impl<'a, B: PersistenceBackend> StatePersister<'a, B> {
             batch.put(ColumnFamily::Accounts, key, value);
         }
 
-        // Persist positions
-        for position in &state.core.positions {
+        // Persist positions (prefer perp field, fall back to core)
+        // In CometBFT mode, extract_state() writes positions to perp.positions (canonical).
+        // The core.positions field is empty in CometBFT mode (shared EngineState has no positions).
+        let positions = if !state.perp.positions.is_empty() { &state.perp.positions } else { &state.core.positions };
+        for position in positions {
             let key = KeyEncoder::position_key(&position.account, position.market);
             let value = bincode::serialize(&position.position)
                 .map_err(PersistenceError::serialization)?;
             batch.put(ColumnFamily::Positions, key, value);
         }
 
-        // Persist leverage settings
-        for leverage in &state.core.leverage {
-            let key = KeyEncoder::position_key(&leverage.account, leverage.market);
-            batch.put(ColumnFamily::Leverage, key, vec![leverage.leverage]);
+        // Persist leverage settings (prefer perp field, fall back to core)
+        let leverage = if !state.perp.leverage.is_empty() { &state.perp.leverage } else { &state.core.leverage };
+        for lev in leverage {
+            let key = KeyEncoder::position_key(&lev.account, lev.market);
+            batch.put(ColumnFamily::Leverage, key, vec![lev.leverage]);
         }
 
-        // Persist markets
-        for market in &state.core.markets {
+        // Persist markets (prefer perp field, fall back to core)
+        // In CometBFT mode, perp.markets has current mark_price, funding state, fee rates.
+        let markets = if !state.perp.markets.is_empty() { &state.perp.markets } else { &state.core.markets };
+        for market in markets {
             let key = KeyEncoder::market_key(market.id);
             let value = serde_json::to_vec(market)
                 .map_err(PersistenceError::serialization)?;
             batch.put(ColumnFamily::Markets, key, value);
         }
 
-        // Persist orders
-        for order in &state.core.orders {
+        // Persist orders (prefer perp field, fall back to core)
+        let orders = if !state.perp.orders.is_empty() { &state.perp.orders } else { &state.core.orders };
+        for order in orders {
             let key = KeyEncoder::order_key(order.market, order.order_id);
             let value = bincode::serialize(&order.order)
                 .map_err(PersistenceError::serialization)?;
@@ -567,6 +618,7 @@ mod tests {
                 total: "100".to_string(),
                 core_view: "60".to_string(),
                 evm_view: "40".to_string(),
+                decimals: 6,
             },
         });
 
@@ -589,6 +641,7 @@ mod tests {
                 total: "100".to_string(),
                 core_view: "60".to_string(),
                 evm_view: "50".to_string(), // 60 + 50 != 100
+                decimals: 6,
             },
         });
 
@@ -618,15 +671,17 @@ mod tests {
                 total: "100000000000".to_string(), // 100,000 USDC
                 core_view: "80000000000".to_string(),
                 evm_view: "20000000000".to_string(),
+                decimals: 6,
             },
         });
         state.core.balances.push(BalanceEntry {
             account: account1,
             token: 1, // TEST
             balance: UnifiedBalanceData {
-                total: "5000000000000000000000".to_string(), // 5,000 TEST
-                core_view: "5000000000000000000000".to_string(),
+                total: "5000".to_string(), // 5,000 TEST (human-readable, parsed with 18 decimals)
+                core_view: "5000".to_string(),
                 evm_view: "0".to_string(),
+                decimals: 18,
             },
         });
         state.core.balances.push(BalanceEntry {
@@ -636,6 +691,7 @@ mod tests {
                 total: "50000000000".to_string(),
                 core_view: "50000000000".to_string(),
                 evm_view: "0".to_string(),
+                decimals: 6,
             },
         });
 
@@ -831,6 +887,7 @@ mod tests {
                 total: "100".to_string(),
                 core_view: "70".to_string(),
                 evm_view: "40".to_string(), // 70 + 40 = 110 != 100
+                decimals: 6,
             },
         });
         assert!(invalid_state.validate().is_err());
@@ -995,6 +1052,7 @@ mod tests {
                 total: "500".to_string(),
                 core_view: "500".to_string(),
                 evm_view: "0".to_string(),
+                decimals: 6,
             },
         });
         persister.persist_state(&state1).expect("Failed to persist state1");
@@ -1010,6 +1068,7 @@ mod tests {
                 total: "1000".to_string(),
                 core_view: "1000".to_string(),
                 evm_view: "0".to_string(),
+                decimals: 6,
             },
         });
         persister.persist_state(&state2).expect("Failed to persist state2");
@@ -1043,6 +1102,7 @@ mod tests {
                     total: format!("{}", 1000 * (i + 1)),
                     core_view: format!("{}", 1000 * (i + 1)),
                     evm_view: "0".to_string(),
+                    decimals: 6,
                 },
             });
         }

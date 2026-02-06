@@ -24,21 +24,29 @@ export async function runConnectionTests(ctx: TestContext): Promise<void> {
 
   await runTest(ctx, 'Info endpoint available', 'connection', 'Verify /info POST endpoint accepts requests', async () => {
     logProgress('Sending POST /info request...');
-    const result = await infoRequest('meta');
+    const result = (await infoRequest('meta')) as { universe?: unknown[] };
     if (!result) throw new Error('Empty response');
-    logProgress('Info endpoint responding');
+    if (!result.universe || !Array.isArray(result.universe)) {
+      throw new Error(`Expected meta response with universe array, got: ${JSON.stringify(result).slice(0, 100)}`);
+    }
+    logProgress(`Info endpoint responding, ${result.universe.length} markets`);
   });
 
-  await runTest(ctx, 'Exchange endpoint available', 'connection', 'Verify /exchange POST endpoint exists', async () => {
-    logProgress('Sending POST /exchange probe...');
+  await runTest(ctx, 'Exchange endpoint available', 'connection', 'Verify /exchange POST endpoint exists and rejects bad requests', async () => {
+    logProgress('Sending POST /exchange probe with empty body...');
     const response = await fetch(`${CONFIG.GATEWAY_URL}/exchange`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({}),
     });
-    // We expect an error response, but the endpoint should exist
+    // Endpoint should exist (not 404) and reject bad input (400 or 422)
+    // axum returns 422 Unprocessable Entity when JSON deserialization fails
     if (response.status === 404) throw new Error('Exchange endpoint not found');
-    logProgress('Exchange endpoint exists');
+    if (response.status >= 500) throw new Error(`Exchange endpoint returned server error: ${response.status}`);
+    if (response.status !== 400 && response.status !== 422) {
+      throw new Error(`Expected 400 or 422 for empty body, got ${response.status}`);
+    }
+    logProgress(`Exchange endpoint returned status ${response.status} (validates input correctly)`);
   });
 
   await runTest(ctx, 'EVM RPC available', 'connection', 'Verify EVM JSON-RPC endpoint is responding', async () => {

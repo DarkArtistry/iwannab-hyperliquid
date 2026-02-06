@@ -85,10 +85,14 @@ export async function runStateProofTests(ctx: TestContext): Promise<void> {
     };
 
     if (stateInfo.blockHeight === undefined) throw new Error('Missing blockHeight');
+    if (typeof stateInfo.blockHeight !== 'number' || stateInfo.blockHeight < 1) throw new Error(`Invalid blockHeight: ${stateInfo.blockHeight}`);
     if (!stateInfo.appHash) throw new Error('Missing appHash');
+    if (!stateInfo.appHash.startsWith('0x') || stateInfo.appHash.length !== 66) throw new Error(`Invalid appHash format: ${stateInfo.appHash.slice(0, 20)}...`);
     if (!stateInfo.stateRoots) throw new Error('Missing stateRoots');
     if (!stateInfo.stateRoots.unifiedState) throw new Error('Missing unified state root');
+    if (!stateInfo.stateRoots.unifiedState.startsWith('0x')) throw new Error(`Invalid unified state root format`);
     if (!stateInfo.stateRoots.nonces) throw new Error('Missing nonce root');
+    if (!stateInfo.stateRoots.nonces.startsWith('0x')) throw new Error(`Invalid nonce root format`);
 
     initialStateRoot = stateInfo.stateRoots.unifiedState;
 
@@ -239,11 +243,14 @@ export async function runStateProofTests(ctx: TestContext): Promise<void> {
     }
 
     // State roots should be identical if no transactions between requests
+    // Both queries happen in rapid succession, so they should match
     if (info1.stateRoots.unifiedState !== info2.stateRoots.unifiedState) {
-      logProgress('State roots differ - this may be expected if transactions occurred');
-    } else {
-      logProgress('State roots are consistent');
+      throw new Error(
+        `State roots differ between two rapid successive queries: ` +
+        `${info1.stateRoots.unifiedState.slice(0, 18)}... vs ${info2.stateRoots.unifiedState.slice(0, 18)}...`
+      );
     }
+    logProgress('State roots are consistent across requests');
   });
 
   // Test 7: Multiple token proofs
@@ -262,8 +269,15 @@ export async function runStateProofTests(ctx: TestContext): Promise<void> {
       token: 1,
     })) as { error?: string; verified?: boolean };
 
-    logProgress(`Token 0: ${proof0.error ? 'no balance' : (proof0.verified ? 'verified' : 'failed')}`);
-    logProgress(`Token 1: ${proof1.error ? 'no balance' : (proof1.verified ? 'verified' : 'failed')}`);
+    // Alice should have USDC (token 0) from genesis
+    if (proof0.error) throw new Error(`Token 0 (USDC) proof error: ${proof0.error}`);
+    if (!proof0.verified) throw new Error('Token 0 (USDC) proof verification failed');
+    logProgress(`Token 0 (USDC): verified`);
+
+    // Alice should have TEST (token 1) from genesis
+    if (proof1.error) throw new Error(`Token 1 (TEST) proof error: ${proof1.error}`);
+    if (!proof1.verified) throw new Error('Token 1 (TEST) proof verification failed');
+    logProgress(`Token 1 (TEST): verified`);
   });
 
   // Test 8: Proof includes all expected fields
@@ -283,15 +297,21 @@ export async function runStateProofTests(ctx: TestContext): Promise<void> {
 
     const proof = proofResult.proof as Record<string, unknown>;
     if (!('leafHash' in proof)) throw new Error('Missing leafHash in proof');
+    if (typeof proof.leafHash !== 'string' || !proof.leafHash.startsWith('0x')) throw new Error(`Invalid leafHash format: ${proof.leafHash}`);
     if (!('leafIndex' in proof)) throw new Error('Missing leafIndex in proof');
+    if (typeof proof.leafIndex !== 'number' || proof.leafIndex < 0) throw new Error(`Invalid leafIndex: ${proof.leafIndex}`);
     if (!('siblings' in proof)) throw new Error('Missing siblings in proof');
+    if (!Array.isArray(proof.siblings)) throw new Error(`siblings should be array, got ${typeof proof.siblings}`);
     if (!('directions' in proof)) throw new Error('Missing directions in proof');
+    if (!Array.isArray(proof.directions)) throw new Error(`directions should be array, got ${typeof proof.directions}`);
+    if (proof.siblings.length !== proof.directions.length) throw new Error(`siblings (${proof.siblings.length}) and directions (${proof.directions.length}) length mismatch`);
     if (!('proofHex' in proof)) throw new Error('Missing proofHex in proof');
 
     if (!('root' in proofResult)) throw new Error('Missing root field');
     if (!('verified' in proofResult)) throw new Error('Missing verified field');
+    if (proofResult.verified !== true) throw new Error('Proof should be verified for Alice USDC');
 
-    logProgress('All proof fields present');
+    logProgress(`All proof fields present and valid (${proof.siblings.length} proof steps)`);
   });
 
   // Test 9: App hash derivation

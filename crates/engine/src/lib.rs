@@ -176,6 +176,33 @@ impl Engine {
             |maker_addr| positions_snapshot.get(&maker_addr).cloned(),
         )?;
 
+        // Sync state maps for maker orders affected by matching.
+        // The matching engine updates the orderbook BTreeMap, but the orders HashMap
+        // and account_orders index must also be updated for query consistency.
+        {
+            let mut fully_filled_makers: Vec<OrderId> = Vec::new();
+            let mut partially_filled_makers: Vec<(OrderId, Decimal)> = Vec::new();
+
+            if let Some(book) = self.state.get_orderbook(market_id) {
+                let mut seen = std::collections::HashSet::new();
+                for fill in &fills {
+                    if seen.insert(fill.maker_order_id) {
+                        match book.get(fill.maker_order_id) {
+                            None => fully_filled_makers.push(fill.maker_order_id),
+                            Some(order) => partially_filled_makers.push((fill.maker_order_id, order.remaining_size)),
+                        }
+                    }
+                }
+            }
+
+            for maker_id in fully_filled_makers {
+                self.state.remove_order(market_id, maker_id);
+            }
+            for (maker_id, new_remaining) in partially_filled_makers {
+                self.state.update_order_remaining(market_id, maker_id, new_remaining);
+            }
+        }
+
         // Apply fills and calculate realized PnL
         for fill in &mut fills {
             // Calculate realized PnL BEFORE applying the fill
@@ -194,6 +221,14 @@ impl Engine {
                 let pnl = taker_pos.calculate_fill_pnl(fill_size, fill_price, fill.is_taker_buy);
                 fill.realized_pnl_taker = pnl.raw_value();
             }
+
+            // Calculate fees from market config
+            let notional = fill_size * fill_price;
+            let notional_usdc = notional.to_decimals(Decimal::USDC_DECIMALS);
+            let maker_fee = market.config.maker_fee(notional_usdc);
+            let taker_fee = market.config.taker_fee(notional_usdc);
+            fill.maker_fee = maker_fee.raw_value();
+            fill.taker_fee = taker_fee.raw_value() as u128;
 
             // Now apply the fill
             self.apply_fill(fill, &market.config)?;
@@ -417,11 +452,16 @@ impl Engine {
         }
 
         // Deduct fees from unified state (source of truth)
+        // Note: maker_fee can be negative (rebate). Positive = charge, negative = credit.
         if let Some(ref us) = self.unified_state {
             let mut unified = us.write().unwrap();
             if fill.maker_fee > 0 {
                 let fee = Decimal::from_raw(fill.maker_fee, Decimal::USDC_DECIMALS);
                 unified.debit_core(fill.maker, 0, fee);
+            } else if fill.maker_fee < 0 {
+                // Negative maker fee = rebate: credit the maker
+                let rebate = Decimal::from_raw(-fill.maker_fee, Decimal::USDC_DECIMALS);
+                unified.credit(fill.maker, 0, rebate);
             }
             if fill.taker_fee > 0 {
                 let fee = Decimal::from_raw(fill.taker_fee as i128, Decimal::USDC_DECIMALS);
@@ -862,6 +902,53 @@ mod tests {
         // Taker bought 0.1, so should have +0.1 position (long)
         assert!(taker_pos.is_long());
         assert_eq!(taker_pos.abs_size(), Decimal::size("0.1"));
+
+        // Verify state maps are synced: maker order should still exist with updated remaining
+        let maker_orders = engine.state.get_orders_by_account(maker, 0);
+        assert_eq!(maker_orders.len(), 1, "Maker should still have 1 resting order");
+        assert_eq!(maker_orders[0].remaining_size, Decimal::size("0.1"),
+            "Maker remaining should be 0.1 (0.2 - 0.1 filled)");
+    }
+
+    #[test]
+    fn test_order_matching_full_fill_removes_from_state() {
+        let mut engine = setup_engine();
+        let maker = Address::repeat_byte(1);
+        let taker = Address::repeat_byte(2);
+
+        engine.state.deposit(maker, 10000_000000);
+        engine.state.deposit(taker, 10000_000000);
+
+        // Maker posts sell
+        let maker_request = OrderRequest {
+            market_id: 0,
+            side: OrderSide::Sell,
+            price: Decimal::price("65000"),
+            size: Decimal::size("0.1"),
+            order_type: OrderType::default(),
+            reduce_only: false,
+            client_order_id: None,
+        };
+        engine.place_order(maker, maker_request, 1000).unwrap();
+        assert_eq!(engine.state.get_orders_by_account(maker, 0).len(), 1);
+
+        // Taker buys same size - full fill
+        let taker_request = OrderRequest {
+            market_id: 0,
+            side: OrderSide::Buy,
+            price: Decimal::price("65000"),
+            size: Decimal::size("0.1"),
+            order_type: OrderType::default(),
+            reduce_only: false,
+            client_order_id: None,
+        };
+        let (_, fills) = engine.place_order(taker, taker_request, 2000).unwrap();
+        assert_eq!(fills.len(), 1);
+
+        // Maker order should be removed from state maps
+        let maker_orders = engine.state.get_orders_by_account(maker, 0);
+        assert_eq!(maker_orders.len(), 0,
+            "Fully filled maker order should be removed from state");
     }
 
     #[test]

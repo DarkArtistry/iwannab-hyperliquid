@@ -53,10 +53,15 @@ services:
       context: .
       dockerfile: infra/docker/Dockerfile.node
     container_name: hypercore-5v-node-0
+    command: ["start", "--enable-persistence"]
+    restart: on-failure
+    stop_grace_period: 15s
     ports:
       - "26658:26658"
       - "8545:8545"
       - "3000:3000"
+    volumes:
+      - node0_data:/data
     environment:
       RUST_LOG: info,hypercore=debug
       DATABASE_URL: postgres://hypercore:hypercore@postgres:5432/hypercore
@@ -80,6 +85,7 @@ services:
   cometbft-0:
     image: cometbft/cometbft:v0.38.5
     container_name: hypercore-5v-cometbft-0
+    restart: on-failure
     ports:
       - "26656:26656"
       - "26657:26657"
@@ -91,7 +97,8 @@ services:
       - ./infra/multinode/validator-0/config/priv_validator_key.json:/cometbft/config/priv_validator_key.json:ro
     command: start --proxy_app=tcp://node-0:26658
     depends_on:
-      - node-0
+      node-0:
+        condition: service_healthy
     networks:
       - hypercore-5v
 
@@ -103,10 +110,15 @@ services:
       context: .
       dockerfile: infra/docker/Dockerfile.node
     container_name: hypercore-5v-node-1
+    command: ["start", "--enable-persistence"]
+    restart: on-failure
+    stop_grace_period: 15s
     ports:
       - "26668:26658"
       - "8555:8545"
       - "3010:3000"
+    volumes:
+      - node1_data:/data
     environment:
       RUST_LOG: info,hypercore=debug
       DATABASE_URL: postgres://hypercore:hypercore@postgres:5432/hypercore
@@ -130,6 +142,7 @@ services:
   cometbft-1:
     image: cometbft/cometbft:v0.38.5
     container_name: hypercore-5v-cometbft-1
+    restart: on-failure
     ports:
       - "26666:26656"
       - "26667:26657"
@@ -141,8 +154,10 @@ services:
       - ./infra/multinode/validator-1/config/priv_validator_key.json:/cometbft/config/priv_validator_key.json:ro
     command: start --proxy_app=tcp://node-1:26658
     depends_on:
-      - node-1
-      - cometbft-0
+      node-1:
+        condition: service_healthy
+      cometbft-0:
+        condition: service_started
     networks:
       - hypercore-5v
 
@@ -154,10 +169,15 @@ services:
       context: .
       dockerfile: infra/docker/Dockerfile.node
     container_name: hypercore-5v-node-2
+    command: ["start", "--enable-persistence"]
+    restart: on-failure
+    stop_grace_period: 15s
     ports:
       - "26678:26658"
       - "8565:8545"
       - "3020:3000"
+    volumes:
+      - node2_data:/data
     environment:
       RUST_LOG: info,hypercore=debug
       DATABASE_URL: postgres://hypercore:hypercore@postgres:5432/hypercore
@@ -181,6 +201,7 @@ services:
   cometbft-2:
     image: cometbft/cometbft:v0.38.5
     container_name: hypercore-5v-cometbft-2
+    restart: on-failure
     ports:
       - "26676:26656"
       - "26677:26657"
@@ -192,8 +213,10 @@ services:
       - ./infra/multinode/validator-2/config/priv_validator_key.json:/cometbft/config/priv_validator_key.json:ro
     command: start --proxy_app=tcp://node-2:26658
     depends_on:
-      - node-2
-      - cometbft-0
+      node-2:
+        condition: service_healthy
+      cometbft-0:
+        condition: service_started
     networks:
       - hypercore-5v
 
@@ -205,10 +228,15 @@ services:
       context: .
       dockerfile: infra/docker/Dockerfile.node
     container_name: hypercore-5v-node-3
+    command: ["start", "--enable-persistence"]
+    restart: on-failure
+    stop_grace_period: 15s
     ports:
       - "26688:26658"
       - "8575:8545"
       - "3030:3000"
+    volumes:
+      - node3_data:/data
     environment:
       RUST_LOG: info,hypercore=debug
       DATABASE_URL: postgres://hypercore:hypercore@postgres:5432/hypercore
@@ -232,6 +260,7 @@ services:
   cometbft-3:
     image: cometbft/cometbft:v0.38.5
     container_name: hypercore-5v-cometbft-3
+    restart: on-failure
     ports:
       - "26686:26656"
       - "26687:26657"
@@ -243,8 +272,10 @@ services:
       - ./infra/multinode/validator-3/config/priv_validator_key.json:/cometbft/config/priv_validator_key.json:ro
     command: start --proxy_app=tcp://node-3:26658
     depends_on:
-      - node-3
-      - cometbft-0
+      node-3:
+        condition: service_healthy
+      cometbft-0:
+        condition: service_started
     networks:
       - hypercore-5v
 
@@ -256,10 +287,15 @@ services:
       context: .
       dockerfile: infra/docker/Dockerfile.node
     container_name: hypercore-5v-node-4
+    command: ["start", "--enable-persistence"]
+    restart: on-failure
+    stop_grace_period: 15s
     ports:
       - "26698:26658"
       - "8585:8545"
       - "3040:3000"
+    volumes:
+      - node4_data:/data
     environment:
       RUST_LOG: info,hypercore=debug
       DATABASE_URL: postgres://hypercore:hypercore@postgres:5432/hypercore
@@ -283,6 +319,7 @@ services:
   cometbft-4:
     image: cometbft/cometbft:v0.38.5
     container_name: hypercore-5v-cometbft-4
+    restart: on-failure
     ports:
       - "26696:26656"
       - "26697:26657"
@@ -294,8 +331,10 @@ services:
       - ./infra/multinode/validator-4/config/priv_validator_key.json:/cometbft/config/priv_validator_key.json:ro
     command: start --proxy_app=tcp://node-4:26658
     depends_on:
-      - node-4
-      - cometbft-0
+      node-4:
+        condition: service_healthy
+      cometbft-0:
+        condition: service_started
     networks:
       - hypercore-5v
 
@@ -305,3 +344,8 @@ networks:
 
 volumes:
   postgres_data_5v:
+  node0_data:
+  node1_data:
+  node2_data:
+  node3_data:
+  node4_data:

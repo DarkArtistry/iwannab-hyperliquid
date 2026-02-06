@@ -17,12 +17,12 @@ Prioritized list of outstanding work items organized by criticality and phase.
 │                    HyperCore Project Status                         │
 ├─────────────────────────────────────────────────────────────────────┤
 │  Overall Completion: 100% (MVP + Multi-Validator Ready)             │
-│  Test Coverage: 752+ tests (all passing)                            │
-│    - 531 Rust unit tests                                            │
+│  Test Coverage: 823 tests (all passing)                            │
+│    - 556 Rust unit tests                                            │
 │    - 49 Solidity contract tests                                     │
-│    - 144 E2E integration tests                                      │
-│    - 6 Multi-validator E2E (3-node, scripts/e2e-multinode.sh)       │
-│    - 22 Comprehensive E2E (5-node, scripts/e2e-multinode-full.sh)   │
+│    - 151 E2E integration tests                                      │
+│    - 15 Multi-validator E2E (3-node, scripts/e2e-multinode.sh)      │
+│    - 52 Comprehensive E2E (5-node, scripts/e2e-multinode-full.sh)   │
 │                                                                     │
 │  ✅ READY NOW:        Single-node MVP deployment                    │
 │  ✅ READY NOW:        Multi-node testnet (consensus fixes applied)  │
@@ -556,12 +556,12 @@ Fixed all critical determinism and state commitment issues identified in the con
 ### Current Test Status
 | Category | Count | Status |
 |----------|-------|--------|
-| Rust Unit Tests | 531 | ✅ All passing |
+| Rust Unit Tests | 556 | ✅ All passing |
 | Solidity Contract Tests | 49 | ✅ All passing |
-| E2E Integration Tests | 144 | ✅ All passing |
-| Multi-Validator E2E (3-node) | 6 | ✅ All passing |
-| Multi-Node Full E2E (5-node) | 22 | ✅ Comprehensive |
-| **Total** | **752+** | **All passing** |
+| E2E Integration Tests | 151 | ✅ All passing |
+| Multi-Validator E2E (3-node) | 15 | ✅ All passing |
+| Multi-Node Full E2E (5-node) | 52 | ✅ All passing |
+| **Total** | **823** | **All passing** |
 
 ### Next Priority Tasks
 
@@ -633,41 +633,41 @@ Fixed all critical determinism and state commitment issues identified in the con
 
 ### Test Commands
 ```bash
-make test-quick          # Rust + Solidity only (580 tests, no Docker)
-make test-all            # All tests (752+ tests, requires Docker)
-make test-e2e            # E2E single-node only (144 tests, requires Docker)
-make test-multinode      # 3-node multi-validator E2E (6 tests, requires Docker)
-make test-multinode-full # 5-node comprehensive E2E (22 tests, requires Docker)
+make test-quick          # Rust + Solidity only (605 tests, no Docker)
+make test-all            # All tests (823 tests, requires Docker)
+make test-e2e            # E2E single-node only (151 tests, requires Docker)
+make test-multinode      # 3-node multi-validator E2E (15 tests, requires Docker)
+make test-multinode-full # 5-node comprehensive E2E (52 tests, requires Docker)
 ```
 
-### Rust Unit Test Breakdown (347 tests)
+### Rust Unit Test Breakdown (556 tests)
 | Crate | Tests | Key Coverage |
 |-------|-------|--------------|
-| `hypercore-chain` | 54 | Merkle proofs, state proofs, consensus, block producer |
-| `hypercore-engine` | 105 | Matching, risk, funding, liquidation, reduce-only |
-| `hypercore-primitives` | 59 | Decimal, EIP-712, events, unified state |
-| `hypercore-gateway` | 66 | Rate limiting (11), validation (30), handlers |
-| `hypercore-evm` | 23 | Executor, precompiles, state |
-| `hypercore-persistence` | 36 | RocksDB, state save/restore, JSON export/import |
-| Other | 4 | Indexer, misc |
+| `hypercore-chain` | 203+ | Merkle proofs, state proofs, consensus, attestation, BFT |
+| `hypercore-engine` | 107+ | Matching, risk, funding, liquidation, reduce-only |
+| `hypercore-primitives` | 61+ | Decimal (bincode/JSON), EIP-712, events, unified state |
+| `hypercore-gateway` | 81+ | Rate limiting, validation, handlers |
+| `hypercore-evm` | 23+ | Executor, precompiles, state roots |
+| `hypercore-persistence` | 51+ | RocksDB, state save/restore, JSON export/import |
+| Other | 30+ | Indexer, misc |
 
-### E2E Integration Test Breakdown (144 tests)
+### E2E Integration Test Breakdown (151 tests)
 | Category | Tests | Coverage |
 |----------|-------|----------|
 | Connection & Health | 4 | Gateway/EVM reachability |
 | Market Data | 7 | Orderbook, prices, candles |
 | Account State | 5 | Balances, positions, history |
-| Order Lifecycle | 9 | Place, cancel, batch operations |
-| Matching Engine | 5 | Cross-account matching |
-| Position Management | 3 | Position tracking |
-| EVM Integration | 27 | JSON-RPC, precompiles |
-| Spot Trading | 13 | HIP-1 token operations |
+| Order Lifecycle | 10 | Place, cancel, batch, CLOID, leverage |
+| Matching Engine | 4 | Cross-account matching, price improvement |
+| Position Management | 3 | Position tracking, margin |
+| EVM Integration | 25 | JSON-RPC, auto-creation, transfers |
+| Advanced EVM | 9 | Contract deployment, storage |
+| Token Standards | 11 | ERC-20/721/1155, event logs |
+| Spot Trading | 12 | HIP-1 token operations |
 | Unified State | 18 | View transfers, invariants |
-| Risk & Margin | 13 | Leverage, fills, balances |
-| Advanced Scenarios | 13 | Error handling, edge cases |
 | Stress Tests | 3 | Concurrent operations |
-| Token Standards | 8 | ERC-20, token metadata |
-| Advanced EVM | 7 | Contract interactions |
+| Advanced Scenarios | 18 | Error handling, funding, edge cases |
+| Risk & Margin | 13 | Leverage, fills, balances |
 | State Proofs | 9 | Merkle proofs, client verification |
 
 ### Identified Coverage Gaps (Phase 7 TODOs)
@@ -1340,7 +1340,7 @@ impl AppState {
 - Hash computation matches exactly between TypeScript SDK and Rust backend
 - USD transfers, orders, and all other actions work with proper signatures
 
-**Current E2E Status:** ✅ 135/135 tests passing
+**Current E2E Status:** ✅ 151/151 tests passing
 
 ### ✅ P2: Query Handlers - COMPLETED
 
@@ -1823,11 +1823,13 @@ cargo build -p hypercore-node --features persistence
 hypercore start --enable-persistence --data-dir ./data/chain
 ```
 
-**Test Status (Updated January 2026):**
-- 216 Rust unit tests passing (86 engine + 130 other crates)
-- 135 E2E integration tests passing (13 risk/margin tests)
+**Test Status (Updated February 2026):**
+- 556 Rust unit tests passing (all crates with cometbft feature)
+- 151 E2E integration tests passing (15 categories)
+- 52 Multi-node E2E tests passing (5-validator BFT)
+- 15 Multi-validator E2E tests passing (3-node)
 - 49 Solidity contract tests passing
-- **Total: 400 tests across all categories**
+- **Total: 823 tests across all categories — ALL PASSING**
 - All tests run with production-like EIP-712 signature verification
 
 **Key Test Files:**

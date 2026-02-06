@@ -62,6 +62,28 @@ export function skipTest(
 }
 
 /**
+ * Assert that an error message contains at least one of the expected substrings.
+ * Uses case-insensitive matching.
+ *
+ * @param message - The actual error message to check
+ * @param expectedSubstrings - Array of substrings; at least one must match
+ * @param context - Description of what was being tested (for error output)
+ */
+export function assertErrorContains(
+  message: string,
+  expectedSubstrings: string[],
+  context: string
+): void {
+  const lower = message.toLowerCase();
+  const matched = expectedSubstrings.some((sub) => lower.includes(sub.toLowerCase()));
+  if (!matched) {
+    throw new Error(
+      `${context}: error message "${message}" did not contain any of [${expectedSubstrings.join(', ')}]`
+    );
+  }
+}
+
+/**
  * Sleep for a specified duration
  *
  * @param ms - Milliseconds to sleep

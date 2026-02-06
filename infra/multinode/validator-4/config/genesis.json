@@ -1,5 +1,5 @@
 {
-  "genesis_time": "2026-02-02T13:23:25.000000000Z",
+  "genesis_time": "2026-02-06T06:58:49.000000000Z",
   "chain_id": "hypercore-5v-test",
   "initial_height": "1",
   "consensus_params": {
@@ -24,46 +24,46 @@
   },
   "validators": [
     {
-      "address": "5A609D81420A6517AF6F3D646B9B3EC489B752C9",
+      "address": "3D354904A35B7562981E0739BD4112DDEAB14ABE",
       "pub_key": {
         "type": "tendermint/PubKeyEd25519",
-        "value": "Y38vsMQ//d4T9y3DrQJNG5Ip4o4+RegZd/r/gtajpgo="
+        "value": "w0RRP+dQOmPftefJVVlCdnEZasvYvn9cLQ5S4sUMMF0="
       },
       "power": "10",
       "name": "validator-0"
     },
     {
-      "address": "79C78363DE2611894205AAE034EA11E637391DD2",
+      "address": "F2A853ACBF739857A15F29AFFCC11EF84B7B529B",
       "pub_key": {
         "type": "tendermint/PubKeyEd25519",
-        "value": "P79zMZU7UjRTdP4j7rlSNW5NbDNVcv5NsFPMujPnr2M="
+        "value": "vBvTFm4bksravUSquKSdoTh8BV/bQ7+46WQr7RhEORw="
       },
       "power": "10",
       "name": "validator-1"
     },
     {
-      "address": "9B8598DEC69F17CCA14C5C47C548341772EBC74A",
+      "address": "2968A76ACF27206E54DD6390F702FF25C4CEC0C6",
       "pub_key": {
         "type": "tendermint/PubKeyEd25519",
-        "value": "L6BNXtCcPsnq9H72xyb3zbbeJ9xf6n7oJd/bDLrruvI="
+        "value": "tMuytBdvS0+FMTiu4OhZPb9MlJhjyGk2+Q4mOHYvSQo="
       },
       "power": "10",
       "name": "validator-2"
     },
     {
-      "address": "DA8D567CCF97AF83B0B223EBE62D95DEA97DEFB7",
+      "address": "78DEC9E39F60799E0C8F36D664C858105D02D995",
       "pub_key": {
         "type": "tendermint/PubKeyEd25519",
-        "value": "v5OVofAmxuPmmRztMaEfVDeTcGLgbX7oJhPP5545ml0="
+        "value": "r85gPdqEchkbPuZ6gpRxOmwKes/IM9f4mqqHNp0RuVE="
       },
       "power": "10",
       "name": "validator-3"
     },
     {
-      "address": "36ECF6CB031A1890F4A9D00DA6E3262F9101E639",
+      "address": "C6B96796A7F4657EE6E1CA9DA3C546A8FA443396",
       "pub_key": {
         "type": "tendermint/PubKeyEd25519",
-        "value": "r92F4xtMXP66DOuyG31JzwwenbslYewE5tfBRuY2MwA="
+        "value": "2k3kDOD+gYFPm6YgK1EQPgrk3RhHRtXFGLBoFWFQZ3Q="
       },
       "power": "10",
       "name": "validator-4"
@@ -154,46 +154,46 @@
     ],
     "validators": [
     {
-      "address": "5A609D81420A6517AF6F3D646B9B3EC489B752C9",
+      "address": "3D354904A35B7562981E0739BD4112DDEAB14ABE",
       "pub_key": {
         "type": "tendermint/PubKeyEd25519",
-        "value": "Y38vsMQ//d4T9y3DrQJNG5Ip4o4+RegZd/r/gtajpgo="
+        "value": "w0RRP+dQOmPftefJVVlCdnEZasvYvn9cLQ5S4sUMMF0="
       },
       "power": "10",
       "name": "validator-0"
     },
     {
-      "address": "79C78363DE2611894205AAE034EA11E637391DD2",
+      "address": "F2A853ACBF739857A15F29AFFCC11EF84B7B529B",
       "pub_key": {
         "type": "tendermint/PubKeyEd25519",
-        "value": "P79zMZU7UjRTdP4j7rlSNW5NbDNVcv5NsFPMujPnr2M="
+        "value": "vBvTFm4bksravUSquKSdoTh8BV/bQ7+46WQr7RhEORw="
       },
       "power": "10",
       "name": "validator-1"
     },
     {
-      "address": "9B8598DEC69F17CCA14C5C47C548341772EBC74A",
+      "address": "2968A76ACF27206E54DD6390F702FF25C4CEC0C6",
       "pub_key": {
         "type": "tendermint/PubKeyEd25519",
-        "value": "L6BNXtCcPsnq9H72xyb3zbbeJ9xf6n7oJd/bDLrruvI="
+        "value": "tMuytBdvS0+FMTiu4OhZPb9MlJhjyGk2+Q4mOHYvSQo="
       },
       "power": "10",
       "name": "validator-2"
     },
     {
-      "address": "DA8D567CCF97AF83B0B223EBE62D95DEA97DEFB7",
+      "address": "78DEC9E39F60799E0C8F36D664C858105D02D995",
       "pub_key": {
         "type": "tendermint/PubKeyEd25519",
-        "value": "v5OVofAmxuPmmRztMaEfVDeTcGLgbX7oJhPP5545ml0="
+        "value": "r85gPdqEchkbPuZ6gpRxOmwKes/IM9f4mqqHNp0RuVE="
       },
       "power": "10",
       "name": "validator-3"
     },
     {
-      "address": "36ECF6CB031A1890F4A9D00DA6E3262F9101E639",
+      "address": "C6B96796A7F4657EE6E1CA9DA3C546A8FA443396",
       "pub_key": {
         "type": "tendermint/PubKeyEd25519",
-        "value": "r92F4xtMXP66DOuyG31JzwwenbslYewE5tfBRuY2MwA="
+        "value": "2k3kDOD+gYFPm6YgK1EQPgrk3RhHRtXFGLBoFWFQZ3Q="
       },
       "power": "10",
       "name": "validator-4"

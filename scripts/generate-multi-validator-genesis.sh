@@ -314,6 +314,7 @@ cors_allowed_origins = ["*"]
 [p2p]
 laddr = "tcp://0.0.0.0:$INTERNAL_P2P_PORT"
 persistent_peers = "$PERSISTENT_PEERS"
+addr_book_file = "data/addrbook.json"
 addr_book_strict = false
 allow_duplicate_ip = true
 

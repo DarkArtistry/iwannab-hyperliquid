@@ -111,16 +111,23 @@ export async function runEVMTests(ctx: TestContext): Promise<void> {
   await runTest(ctx, 'eth_getBalance', 'evm', 'Check native token balance for test accounts', async () => {
     logProgress(`Checking Alice balance...`);
     const aliceBalance = await publicClient.getBalance({ address: TEST_ACCOUNTS.ALICE.address });
+    if (typeof aliceBalance !== 'bigint') throw new Error(`Expected bigint, got ${typeof aliceBalance}`);
+    if (aliceBalance < 0n) throw new Error(`Balance should be non-negative, got ${aliceBalance}`);
+    // Genesis funds go to core_view, not evm_view, so EVM balance starts at 0
+    // EVM balance becomes non-zero after view transfers (tested in unified state tests)
     logProgress(`Alice balance: ${formatEther(aliceBalance)} ETH`);
 
     logProgress(`Checking Bob balance...`);
     const bobBalance = await publicClient.getBalance({ address: TEST_ACCOUNTS.BOB.address });
+    if (typeof bobBalance !== 'bigint') throw new Error(`Expected bigint, got ${typeof bobBalance}`);
+    if (bobBalance < 0n) throw new Error(`Balance should be non-negative, got ${bobBalance}`);
     logProgress(`Bob balance: ${formatEther(bobBalance)} ETH`);
   });
 
   await runTest(ctx, 'eth_getTransactionCount', 'evm', 'Query nonce for test accounts', async () => {
     logProgress(`Fetching Alice nonce...`);
     const nonce = await publicClient.getTransactionCount({ address: TEST_ACCOUNTS.ALICE.address });
+    if (typeof nonce !== 'number') throw new Error(`Expected number for nonce, got ${typeof nonce}`);
     logProgress(`Alice nonce: ${nonce}`);
   });
 
@@ -140,12 +147,38 @@ export async function runEVMTests(ctx: TestContext): Promise<void> {
       address: TEST_ACCOUNTS.ALICE.address,
       slot: '0x0',
     });
+    if (storage === undefined || storage === null) throw new Error('Storage query returned null/undefined');
+    if (typeof storage !== 'string' || !storage.startsWith('0x')) {
+      throw new Error(`Expected hex string starting with 0x, got: ${storage}`);
+    }
     logProgress(`Storage value: ${storage}`);
   });
 
   // ============================================================================
   // Transaction Methods
   // ============================================================================
+
+  // Trigger EVM account auto-creation by sending a zero-value transaction.
+  // In dev mode (!enforce_gas_fees), execute_tx auto-creates accounts with 10^20 wei balance.
+  // This must happen before any value transfer tests since estimation (simulate_tx) does NOT
+  // auto-create accounts to avoid AppHash divergence.
+  await runTest(ctx, 'Initialize EVM account', 'evm', 'Trigger account auto-creation via zero-value transaction', async () => {
+    logProgress('Sending zero-value self-transfer to trigger account auto-creation...');
+    const hash = await walletClient.sendTransaction({
+      to: TEST_ACCOUNTS.ALICE.address,
+      value: 0n,
+    });
+    logProgress(`Auto-creation tx hash: ${hash}`);
+
+    const receipt = await publicClient.waitForTransactionReceipt({ hash });
+    if (receipt.status !== 'success') throw new Error('Auto-creation transaction failed');
+
+    const balance = await publicClient.getBalance({ address: TEST_ACCOUNTS.ALICE.address });
+    logProgress(`Alice EVM balance after auto-creation: ${formatEther(balance)} ETH`);
+    if (balance <= 0n) {
+      throw new Error('EVM balance should be positive after account auto-creation');
+    }
+  });
 
   let txHash: `0x${string}` | null = null;
 
@@ -170,6 +203,15 @@ export async function runEVMTests(ctx: TestContext): Promise<void> {
     logProgress(`Fetching transaction ${txHash}...`);
     const tx = await publicClient.getTransaction({ hash: txHash });
     if (!tx) throw new Error('Transaction not found');
+    if (tx.from.toLowerCase() !== TEST_ACCOUNTS.ALICE.address.toLowerCase()) {
+      throw new Error(`Expected from=${TEST_ACCOUNTS.ALICE.address}, got ${tx.from}`);
+    }
+    if (!tx.to || tx.to.toLowerCase() !== TEST_ACCOUNTS.BOB.address.toLowerCase()) {
+      throw new Error(`Expected to=${TEST_ACCOUNTS.BOB.address}, got ${tx.to}`);
+    }
+    if (tx.value !== parseEther('0.001')) {
+      throw new Error(`Expected value=0.001 ETH, got ${formatEther(tx.value)} ETH`);
+    }
     logProgress(`From: ${tx.from}, To: ${tx.to}, Value: ${formatEther(tx.value)} ETH`);
   });
 
@@ -180,6 +222,9 @@ export async function runEVMTests(ctx: TestContext): Promise<void> {
     logProgress(`Fetching receipt for ${txHash}...`);
     const receipt = await publicClient.getTransactionReceipt({ hash: txHash });
     if (!receipt) throw new Error('Receipt not found');
+    if (receipt.status !== 'success') throw new Error(`Expected status=success, got ${receipt.status}`);
+    if (receipt.gasUsed <= 0n) throw new Error(`Expected gasUsed > 0, got ${receipt.gasUsed}`);
+    if (receipt.blockNumber < 1n) throw new Error(`Expected blockNumber >= 1, got ${receipt.blockNumber}`);
     logProgress(`Status: ${receipt.status}, Gas used: ${receipt.gasUsed}, Block: ${receipt.blockNumber}`);
   });
 
@@ -202,6 +247,9 @@ export async function runEVMTests(ctx: TestContext): Promise<void> {
     logProgress('Fetching latest block...');
     const block = await publicClient.getBlock({ blockTag: 'latest' });
     if (!block) throw new Error('Block not found');
+    if (block.number < 1n) throw new Error(`Expected block number >= 1, got ${block.number}`);
+    if (!block.hash) throw new Error('Block missing hash');
+    if (block.timestamp <= 0n) throw new Error(`Expected positive timestamp, got ${block.timestamp}`);
     logProgress(`Block ${block.number}: hash=${block.hash?.slice(0, 18)}..., timestamp=${block.timestamp}`);
   });
 
@@ -209,6 +257,8 @@ export async function runEVMTests(ctx: TestContext): Promise<void> {
     logProgress('Fetching block 1...');
     const block = await publicClient.getBlock({ blockNumber: 1n });
     if (!block) throw new Error('Block 1 not found');
+    if (block.number !== 1n) throw new Error(`Expected block number 1, got ${block.number}`);
+    if (block.gasLimit <= 0n) throw new Error(`Expected positive gasLimit, got ${block.gasLimit}`);
     logProgress(`Block 1: gasLimit=${block.gasLimit}, timestamp=${block.timestamp}`);
   });
 
@@ -220,6 +270,8 @@ export async function runEVMTests(ctx: TestContext): Promise<void> {
     logProgress(`Fetching block by hash: ${latest.hash.slice(0, 18)}...`);
     const block = await publicClient.getBlock({ blockHash: latest.hash });
     if (!block) throw new Error('Block not found by hash');
+    if (block.hash !== latest.hash) throw new Error(`Hash mismatch: queried ${latest.hash}, got ${block.hash}`);
+    if (block.number !== latest.number) throw new Error(`Block number mismatch: expected ${latest.number}, got ${block.number}`);
     logProgress(`Block ${block.number} fetched successfully by hash`);
   });
 
@@ -279,6 +331,7 @@ export async function runEVMTests(ctx: TestContext): Promise<void> {
     });
     const data = (await response.json()) as { result?: string; error?: { message: string } };
     if (data.error) throw new Error(data.error.message);
+    if (!data.result) throw new Error('Missing result for eth_maxPriorityFeePerGas');
     logProgress(`Max priority fee: ${data.result}`);
   });
 
@@ -291,7 +344,9 @@ export async function runEVMTests(ctx: TestContext): Promise<void> {
     });
     const data = (await response.json()) as { result?: { baseFeePerGas: string[] }; error?: { message: string } };
     if (data.error) throw new Error(data.error.message);
-    logProgress(`Fee history: oldestBlock=${data.result?.baseFeePerGas?.length || 0} entries`);
+    if (!data.result) throw new Error('Missing result for eth_feeHistory');
+    if (!data.result.baseFeePerGas) throw new Error('Missing baseFeePerGas in fee history');
+    logProgress(`Fee history: oldestBlock=${data.result.baseFeePerGas.length} entries`);
   });
 
   // ============================================================================
@@ -348,6 +403,7 @@ export async function runEVMTests(ctx: TestContext): Promise<void> {
     });
     const data = (await response.json()) as { result?: string; error?: { message: string } };
     if (data.error) throw new Error(data.error.message);
+    if (data.result === undefined || data.result === null) throw new Error('Missing result for net_peerCount');
     logProgress(`Peer count: ${data.result}`);
   });
 
@@ -364,12 +420,31 @@ export async function runEVMTests(ctx: TestContext): Promise<void> {
     });
     const data = (await response.json()) as { result?: string[]; error?: { message: string } };
     if (data.error) throw new Error(data.error.message);
-    logProgress(`Accounts: ${data.result?.length || 0} (expected 0 for signing-only RPC)`);
+    if (!Array.isArray(data.result)) throw new Error(`Expected array for eth_accounts, got ${typeof data.result}`);
+    if (data.result.length !== 0) throw new Error(`Expected 0 unlocked accounts for signing-only RPC, got ${data.result.length}`);
+    logProgress(`Accounts: ${data.result.length} (expected 0 for signing-only RPC)`);
   });
 
-  await runTest(ctx, 'eth_getLogs (empty filter)', 'evm', 'Query logs with empty filter', async () => {
+  await runTest(ctx, 'eth_getLogs', 'evm', 'Query logs with empty filter and verify structure', async () => {
     logProgress('Fetching logs...');
     const logs = await publicClient.getLogs({});
-    logProgress(`Found ${logs.length} logs`);
+    if (!Array.isArray(logs)) throw new Error(`Expected array for getLogs, got ${typeof logs}`);
+    logProgress(`Found ${logs.length} log(s)`);
+
+    // If logs exist (e.g. from contract tests that ran before), verify structure
+    for (const log of logs) {
+      if (!log.address || typeof log.address !== 'string') {
+        throw new Error(`Log missing or invalid address field: ${JSON.stringify(log)}`);
+      }
+      if (log.blockNumber === undefined || log.blockNumber === null) {
+        throw new Error(`Log missing blockNumber field: ${JSON.stringify(log)}`);
+      }
+      if (!log.transactionHash || typeof log.transactionHash !== 'string') {
+        throw new Error(`Log missing or invalid transactionHash field: ${JSON.stringify(log)}`);
+      }
+    }
+    if (logs.length > 0) {
+      logProgress(`Verified ${logs.length} log(s) have required fields (address, blockNumber, transactionHash)`);
+    }
   });
 }

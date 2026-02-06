@@ -74,6 +74,8 @@ export async function runTokenStandardsTests(ctx: TestContext): Promise<void> {
     { inputs: [{ name: 'account', type: 'address' }], name: 'balanceOf', outputs: [{ type: 'uint256' }], stateMutability: 'view', type: 'function' },
     { inputs: [{ name: 'to', type: 'address' }, { name: 'amount', type: 'uint256' }], name: 'transfer', outputs: [{ type: 'bool' }], stateMutability: 'nonpayable', type: 'function' },
     { inputs: [{ name: 'spender', type: 'address' }, { name: 'amount', type: 'uint256' }], name: 'approve', outputs: [{ type: 'bool' }], stateMutability: 'nonpayable', type: 'function' },
+    { anonymous: false, inputs: [{ indexed: true, name: 'from', type: 'address' }, { indexed: true, name: 'to', type: 'address' }, { indexed: false, name: 'value', type: 'uint256' }], name: 'Transfer', type: 'event' },
+    { anonymous: false, inputs: [{ indexed: true, name: 'owner', type: 'address' }, { indexed: true, name: 'spender', type: 'address' }, { indexed: false, name: 'value', type: 'uint256' }], name: 'Approval', type: 'event' },
   ] as const;
 
   const ERC721_ABI = [
@@ -82,6 +84,7 @@ export async function runTokenStandardsTests(ctx: TestContext): Promise<void> {
     { inputs: [{ name: 'account', type: 'address' }], name: 'balanceOf', outputs: [{ type: 'uint256' }], stateMutability: 'view', type: 'function' },
     { inputs: [{ name: 'to', type: 'address' }], name: 'mint', outputs: [{ type: 'uint256' }], stateMutability: 'nonpayable', type: 'function' },
     { inputs: [{ name: 'tokenId', type: 'uint256' }], name: 'ownerOf', outputs: [{ type: 'address' }], stateMutability: 'view', type: 'function' },
+    { anonymous: false, inputs: [{ indexed: true, name: 'from', type: 'address' }, { indexed: true, name: 'to', type: 'address' }, { indexed: true, name: 'tokenId', type: 'uint256' }], name: 'Transfer', type: 'event' },
   ] as const;
 
   const ERC1155_ABI = [
@@ -128,6 +131,8 @@ export async function runTokenStandardsTests(ctx: TestContext): Promise<void> {
 
     logProgress(`Token: ${name} (${symbol}), ${decimals} decimals`);
     if (name !== 'Test Token') throw new Error(`Expected name "Test Token", got "${name}"`);
+    if (symbol !== 'TEST') throw new Error(`Expected symbol "TEST", got "${symbol}"`);
+    if (decimals !== 18) throw new Error(`Expected 18 decimals, got ${decimals}`);
   });
 
   await runTest(ctx, 'Check ERC20 balance', 'tokens', 'Verify deployer received initial supply', async () => {
@@ -168,6 +173,91 @@ export async function runTokenStandardsTests(ctx: TestContext): Promise<void> {
 
     logProgress(`Bob balance: ${bobBalance}`);
     if (bobBalance !== 1000000000000000000000n) throw new Error('Transfer amount mismatch');
+
+    // Verify Alice's balance decreased (catch mint-without-burn bugs)
+    const aliceBalance = await publicClient.readContract({
+      address: erc20Address,
+      abi: ERC20_ABI,
+      functionName: 'balanceOf',
+      args: [TEST_ACCOUNTS.ALICE.address],
+    });
+    const expectedAlice = 1000000000000000000000000n - 1000000000000000000000n;
+    logProgress(`Alice balance after transfer: ${aliceBalance}`);
+    if (aliceBalance !== expectedAlice) throw new Error(`Alice balance should be ${expectedAlice}, got ${aliceBalance}`);
+  });
+
+  // EVM Event Log Tests
+  const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+
+  await runTest(ctx, 'ERC20 Transfer event in receipt', 'tokens', 'Verify transfer receipt contains Transfer event log', async () => {
+    if (!erc20Address) throw new Error('ERC20 not deployed');
+
+    logProgress('Performing transfer for event verification...');
+    const hash = await walletClient.writeContract({
+      address: erc20Address,
+      abi: ERC20_ABI,
+      functionName: 'transfer',
+      args: [TEST_ACCOUNTS.BOB.address, 500000000000000000000n],
+    });
+
+    const receipt = await publicClient.waitForTransactionReceipt({ hash });
+    if (receipt.status !== 'success') throw new Error('Transfer failed');
+
+    logProgress(`Receipt has ${receipt.logs.length} log(s)`);
+    if (receipt.logs.length === 0) throw new Error('Receipt has no logs - EVM log storage may be broken');
+
+    // Find Transfer event by topic
+    const transferLog = receipt.logs.find(
+      (log) => log.topics[0]?.toLowerCase() === TRANSFER_TOPIC.toLowerCase()
+    );
+    if (!transferLog) throw new Error(`No Transfer event found in logs (topics: ${receipt.logs.map(l => l.topics[0]).join(', ')})`);
+
+    // Verify address matches contract
+    if (transferLog.address.toLowerCase() !== erc20Address.toLowerCase()) {
+      throw new Error(`Log address ${transferLog.address} != contract ${erc20Address}`);
+    }
+
+    // Verify indexed from/to topics (padded to 32 bytes)
+    const alicePadded = '0x000000000000000000000000' + TEST_ACCOUNTS.ALICE.address.slice(2).toLowerCase();
+    const bobPadded = '0x000000000000000000000000' + TEST_ACCOUNTS.BOB.address.slice(2).toLowerCase();
+
+    if (transferLog.topics[1]?.toLowerCase() !== alicePadded) {
+      throw new Error(`From topic ${transferLog.topics[1]} != expected ${alicePadded}`);
+    }
+    if (transferLog.topics[2]?.toLowerCase() !== bobPadded) {
+      throw new Error(`To topic ${transferLog.topics[2]} != expected ${bobPadded}`);
+    }
+
+    logProgress(`Transfer event verified: from=${transferLog.topics[1]?.slice(0, 20)}..., to=${transferLog.topics[2]?.slice(0, 20)}...`);
+  });
+
+  await runTest(ctx, 'eth_getLogs returns ERC20 events', 'tokens', 'Query logs by contract address and verify structure', async () => {
+    if (!erc20Address) throw new Error('ERC20 not deployed');
+
+    logProgress(`Querying logs for ERC20 contract ${erc20Address}...`);
+    const logs = await publicClient.getLogs({
+      address: erc20Address,
+    });
+
+    logProgress(`Found ${logs.length} log(s) for ERC20 contract`);
+    if (logs.length === 0) throw new Error('eth_getLogs returned no events for ERC20 contract');
+
+    // Verify at least one Transfer event
+    const transferLogs = logs.filter(
+      (log) => log.topics[0]?.toLowerCase() === TRANSFER_TOPIC.toLowerCase()
+    );
+    if (transferLogs.length === 0) throw new Error('No Transfer events found in eth_getLogs results');
+
+    // Verify log structure
+    for (const log of transferLogs) {
+      if (!log.address) throw new Error('Log missing address field');
+      if (!log.topics || log.topics.length === 0) throw new Error('Log missing topics');
+      if (log.data === undefined) throw new Error('Log missing data field');
+      if (log.blockNumber === undefined) throw new Error('Log missing blockNumber');
+      if (!log.transactionHash) throw new Error('Log missing transactionHash');
+    }
+
+    logProgress(`Verified ${transferLogs.length} Transfer event(s) with complete structure`);
   });
 
   // ERC721 Tests
@@ -216,7 +306,57 @@ export async function runTokenStandardsTests(ctx: TestContext): Promise<void> {
     });
 
     logProgress(`Alice NFT balance: ${balance}`);
-    if (balance < 1n) throw new Error('NFT not minted');
+    if (balance !== 1n) throw new Error(`Expected exactly 1 NFT, got ${balance}`);
+
+    // Verify ownership of the minted token (tokenId 0 is the first minted)
+    const owner = await publicClient.readContract({
+      address: erc721Address,
+      abi: ERC721_ABI,
+      functionName: 'ownerOf',
+      args: [0n],
+    });
+    logProgress(`Token 0 owner: ${owner}`);
+    if (owner.toLowerCase() !== TEST_ACCOUNTS.ALICE.address.toLowerCase()) {
+      throw new Error(`Expected owner ${TEST_ACCOUNTS.ALICE.address}, got ${owner}`);
+    }
+  });
+
+  await runTest(ctx, 'ERC721 Transfer event in receipt', 'tokens', 'Verify mint receipt contains Transfer event from 0x0', async () => {
+    if (!erc721Address) throw new Error('ERC721 not deployed');
+
+    logProgress('Minting another NFT for event verification...');
+    const hash = await walletClient.writeContract({
+      address: erc721Address,
+      abi: ERC721_ABI,
+      functionName: 'mint',
+      args: [TEST_ACCOUNTS.ALICE.address],
+    });
+
+    const receipt = await publicClient.waitForTransactionReceipt({ hash });
+    if (receipt.status !== 'success') throw new Error('Mint failed');
+
+    logProgress(`Mint receipt has ${receipt.logs.length} log(s)`);
+    if (receipt.logs.length === 0) throw new Error('Mint receipt has no logs');
+
+    // Find Transfer event
+    const transferLog = receipt.logs.find(
+      (log) => log.topics[0]?.toLowerCase() === TRANSFER_TOPIC.toLowerCase()
+    );
+    if (!transferLog) throw new Error('No Transfer event found in mint receipt');
+
+    // Verify from is zero address (mint)
+    const zeroPadded = '0x0000000000000000000000000000000000000000000000000000000000000000';
+    if (transferLog.topics[1]?.toLowerCase() !== zeroPadded) {
+      throw new Error(`Mint Transfer 'from' should be zero address, got ${transferLog.topics[1]}`);
+    }
+
+    // Verify to is Alice
+    const alicePadded = '0x000000000000000000000000' + TEST_ACCOUNTS.ALICE.address.slice(2).toLowerCase();
+    if (transferLog.topics[2]?.toLowerCase() !== alicePadded) {
+      throw new Error(`Mint Transfer 'to' should be Alice, got ${transferLog.topics[2]}`);
+    }
+
+    logProgress(`ERC721 mint Transfer event verified: from=0x0, to=Alice`);
   });
 
   // ERC1155 Tests
