@@ -59,6 +59,7 @@ htmlcov/
 # Build artifacts
 dist/
 build/
+.next/
 
 # Database
 *.db

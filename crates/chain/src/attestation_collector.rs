@@ -67,6 +67,7 @@ pub struct AttestationCollector {
     /// Known validators and their voting power
     validators: Arc<RwLock<HashMap<[u8; 32], u64>>>,
     /// Our validator's public key (if we are a validator)
+    #[allow(dead_code)]
     our_pubkey: Option<[u8; 32]>,
     /// Our last computed app_hash per height
     our_hashes: Arc<RwLock<BTreeMap<u64, [u8; 32]>>>,

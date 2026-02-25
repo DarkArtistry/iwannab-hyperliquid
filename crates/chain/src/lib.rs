@@ -52,7 +52,9 @@ pub mod app;
 pub mod attestation;
 pub mod attestation_collector;
 pub mod block_producer;
+pub mod consensus;
 pub mod divergence_handler;
+pub mod hyperbft;
 pub mod mempool;
 pub mod merkle;
 pub mod state;
@@ -77,10 +79,11 @@ mod tests;
 pub use abci::AbciService;
 pub use app::HyperCoreApp;
 pub use attestation::{StateAttestation, AttestationKeyPair};
+pub use consensus::{Consensus, ConsensusError, SingleNodeConsensus, HyperBftConsensus};
 pub use attestation_collector::{
     AttestationCollector, AttestationConfig, AttestationError, AttestationStats, DivergenceAlert,
 };
-pub use block_producer::{BlockProducer, BlockProducerConfig, BlockResult, PostCommitHandler};
+pub use block_producer::{BlockProducer, BlockProducerConfig, BlockResult, PipelinedBlockProducer, PipelineStage, PostCommitHandler};
 pub use divergence_handler::{DivergenceHandler, DivergenceConfig, DivergencePolicy, create_attestation_system};
 pub use mempool::{Mempool, SharedMempool};
 pub use merkle::{MerkleProof, MerkleTree, verify_proof, compute_leaf_hash, hash_entry};

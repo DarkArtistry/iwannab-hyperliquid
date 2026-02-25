@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+core-pinning = ["core_affinity"]
+
 [dependencies]
 hypercore-primitives = { workspace = true }
 
@@ -15,12 +19,21 @@ tracing = { workspace = true }
 parking_lot = { workspace = true }
 dashmap = { workspace = true }
 alloy-primitives = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+core_affinity = { workspace = true, optional = true }
+prometheus = { workspace = true }
+lazy_static = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
 criterion = { workspace = true }
 rstest = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
 
 [[bench]]
 name = "matching"
+harness = false
+
+[[bench]]
+name = "throughput"
 harness = false

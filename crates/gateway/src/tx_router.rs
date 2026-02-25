@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use hypercore_chain::HyperCoreApp;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tokio::sync::RwLock;
 
 /// Transaction router - determines how transactions are executed

@@ -11,7 +11,6 @@ use axum::{
     response::IntoResponse,
 };
 use futures::{SinkExt, StreamExt};
-use hypercore_primitives::{AccountAddress, MarketId};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, RwLock};
 
@@ -64,6 +63,8 @@ pub enum WsMessage {
     Candle { data: CandleUpdate },
     /// Pong response
     Pong,
+    /// Binary response (Phase C4)
+    BinaryResponse { data: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,8 +159,16 @@ pub enum WsRequest {
     Subscribe { subscription: WsSubscription },
     /// Unsubscribe from a channel
     Unsubscribe { subscription: WsSubscription },
+    /// Enable binary mode for all subscriptions
+    SetBinaryMode { enabled: bool },
     /// Ping
     Ping,
+}
+
+/// Internal message wrapper that tracks whether to send as text or binary
+enum ClientMsg {
+    Text(WsMessage),
+    Binary(WsMessage),
 }
 
 /// WebSocket connection manager
@@ -264,22 +273,36 @@ pub async fn ws_handler(
 
 /// Handle WebSocket connection
 async fn handle_socket(socket: WebSocket, app_state: AppState, ws_manager: SharedWsManager) {
+    hypercore_engine::metrics::WEBSOCKET_CONNECTIONS.inc();
     let (mut sender, mut receiver) = socket.split();
 
     // Track subscriptions
     let mut subscriptions: HashSet<String> = HashSet::new();
-    let mut broadcast_receivers: Vec<broadcast::Receiver<WsMessage>> = Vec::new();
+    let _broadcast_receivers: Vec<broadcast::Receiver<WsMessage>> = Vec::new();
+
+    // Whether to send binary-encoded messages instead of JSON
+    let mut binary_mode = false;
 
     // Spawn task to forward broadcast messages to client
-    let (client_tx, mut client_rx) = mpsc::channel::<WsMessage>(100);
+    let (client_tx, mut client_rx) = mpsc::channel::<ClientMsg>(100);
 
     let send_task = tokio::spawn(async move {
         while let Some(msg) = client_rx.recv().await {
-            let text = match serde_json::to_string(&msg) {
-                Ok(t) => t,
-                Err(_) => continue,
+            let result = match msg {
+                ClientMsg::Text(ws_msg) => {
+                    match serde_json::to_string(&ws_msg) {
+                        Ok(t) => sender.send(Message::Text(t)).await,
+                        Err(_) => continue,
+                    }
+                }
+                ClientMsg::Binary(ws_msg) => {
+                    match bincode::serialize(&ws_msg) {
+                        Ok(bytes) => sender.send(Message::Binary(bytes)).await,
+                        Err(_) => continue,
+                    }
+                }
             };
-            if sender.send(Message::Text(text)).await.is_err() {
+            if result.is_err() {
                 break;
             }
         }
@@ -289,10 +312,28 @@ async fn handle_socket(socket: WebSocket, app_state: AppState, ws_manager: Share
     while let Some(msg) = receiver.next().await {
         let msg = match msg {
             Ok(Message::Text(t)) => t,
+            Ok(Message::Binary(data)) => {
+                // Phase C4: Handle binary order submission
+                // First byte = message type: 0x01=PlaceOrder, 0x02=Cancel, 0x03=Batch
+                if data.is_empty() {
+                    continue;
+                }
+                match handle_binary_message(&data, &app_state).await {
+                    Ok(response) => {
+                        if let Ok(text) = serde_json::to_string(&response) {
+                            let _ = client_tx.send(ClientMsg::Text(WsMessage::BinaryResponse { data: text })).await;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = client_tx.send(ClientMsg::Text(WsMessage::Error { message: e })).await;
+                    }
+                }
+                continue;
+            }
             Ok(Message::Close(_)) => break,
-            Ok(Message::Ping(data)) => {
+            Ok(Message::Ping(_data)) => {
                 // Respond to ping with pong
-                let _ = client_tx.send(WsMessage::Pong).await;
+                let _ = client_tx.send(ClientMsg::Text(WsMessage::Pong)).await;
                 continue;
             }
             _ => continue,
@@ -303,9 +344,9 @@ async fn handle_socket(socket: WebSocket, app_state: AppState, ws_manager: Share
             Ok(r) => r,
             Err(e) => {
                 let _ = client_tx
-                    .send(WsMessage::Error {
+                    .send(ClientMsg::Text(WsMessage::Error {
                         message: format!("Invalid request: {}", e),
-                    })
+                    }))
                     .await;
                 continue;
             }
@@ -341,10 +382,16 @@ async fn handle_socket(socket: WebSocket, app_state: AppState, ws_manager: Share
 
                 // Spawn task to forward messages
                 let tx = client_tx.clone();
+                let is_binary = binary_mode;
                 tokio::spawn(async move {
                     let mut rx = rx;
                     while let Ok(msg) = rx.recv().await {
-                        if tx.send(msg).await.is_err() {
+                        let client_msg = if is_binary {
+                            ClientMsg::Binary(msg)
+                        } else {
+                            ClientMsg::Text(msg)
+                        };
+                        if tx.send(client_msg).await.is_err() {
                             break;
                         }
                     }
@@ -353,7 +400,7 @@ async fn handle_socket(socket: WebSocket, app_state: AppState, ws_manager: Share
                 subscriptions.insert(sub_key.clone());
 
                 let _ = client_tx
-                    .send(WsMessage::Subscribed { sub_type: sub_key })
+                    .send(ClientMsg::Text(WsMessage::Subscribed { sub_type: sub_key }))
                     .await;
             }
 
@@ -364,13 +411,21 @@ async fn handle_socket(socket: WebSocket, app_state: AppState, ws_manager: Share
                 // In production, we'd need more sophisticated tracking
             }
 
+            WsRequest::SetBinaryMode { enabled } => {
+                binary_mode = enabled;
+                let _ = client_tx.send(ClientMsg::Text(WsMessage::Subscribed {
+                    sub_type: format!("binaryMode:{}", enabled),
+                })).await;
+            }
+
             WsRequest::Ping => {
-                let _ = client_tx.send(WsMessage::Pong).await;
+                let _ = client_tx.send(ClientMsg::Text(WsMessage::Pong)).await;
             }
         }
     }
 
     // Clean up
+    hypercore_engine::metrics::WEBSOCKET_CONNECTIONS.dec();
     send_task.abort();
 }
 
@@ -384,6 +439,55 @@ fn subscription_key(sub: &WsSubscription) -> String {
         WsSubscription::UserFills { user } => format!("userFills:{}", user),
         WsSubscription::UserPositions { user } => format!("userPositions:{}", user),
         WsSubscription::Candles { coin, interval } => format!("candles:{}:{}", coin, interval),
+    }
+}
+
+/// Handle binary WebSocket messages for order submission (Phase C4)
+///
+/// Message format:
+/// - Byte 0: message type (0x01=PlaceOrder, 0x02=Cancel, 0x03=Batch)
+/// - Bytes 1..N: bincode-encoded transaction
+async fn handle_binary_message(
+    data: &[u8],
+    app_state: &AppState,
+) -> Result<serde_json::Value, String> {
+    use hypercore_chain::tx::Transaction;
+
+    if data.len() < 2 {
+        return Err("Binary message too short".to_string());
+    }
+
+    let msg_type = data[0];
+    let payload = &data[1..];
+
+    match msg_type {
+        0x01 | 0x02 | 0x03 => {
+            // All types use the same Transaction deserialization
+            let tx = Transaction::from_binary(payload)
+                .map_err(|e| format!("Binary decode error: {}", e))?;
+
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+
+            let mut app = app_state.app.write().await;
+            match app.execute_tx(&tx, timestamp) {
+                Ok(result) => Ok(serde_json::json!({
+                    "status": "ok",
+                    "type": match msg_type {
+                        0x01 => "placeOrder",
+                        0x02 => "cancel",
+                        0x03 => "batch",
+                        _ => "unknown",
+                    },
+                    "success": result.success,
+                    "gasUsed": result.gas_used,
+                })),
+                Err(e) => Err(format!("Transaction failed: {}", e)),
+            }
+        }
+        _ => Err(format!("Unknown binary message type: 0x{:02x}", msg_type)),
     }
 }
 
@@ -407,5 +511,65 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("allMids"));
         assert!(json.contains("BTC-PERP"));
+    }
+
+    #[test]
+    fn test_binary_ws_message_serialization() {
+        let msg = WsMessage::AllMids {
+            data: HashMap::from([("BTC-PERP".to_string(), "50000.0".to_string())]),
+        };
+        // Test bincode serialization succeeds (outbound path)
+        let binary = bincode::serialize(&msg).unwrap();
+        assert!(!binary.is_empty(), "Binary serialization should produce non-empty output");
+
+        // Test round-trip with bincode using the sub-structure directly,
+        // since bincode does not support internally tagged enums (serde tag = "channel")
+        // for deserialization. Clients deserialize using variant index.
+        let data: HashMap<String, String> =
+            HashMap::from([("BTC-PERP".to_string(), "50000.0".to_string())]);
+        let binary_data = bincode::serialize(&data).unwrap();
+        let deserialized: HashMap<String, String> = bincode::deserialize(&binary_data).unwrap();
+        assert_eq!(deserialized.get("BTC-PERP").unwrap(), "50000.0");
+
+        // Verify that different message variants serialize to different bytes
+        let pong = WsMessage::Pong;
+        let pong_binary = bincode::serialize(&pong).unwrap();
+        assert_ne!(binary, pong_binary, "Different variants should serialize differently");
+    }
+
+    #[test]
+    fn test_binary_vs_json_size() {
+        // Use a larger L2Book message where binary encoding shines
+        let msg = WsMessage::L2Book {
+            data: L2BookUpdate {
+                coin: "BTC-PERP".to_string(),
+                time: 1234567890000,
+                levels: (
+                    (0..10)
+                        .map(|i| L2Level {
+                            px: format!("{}.00", 65000 - i),
+                            sz: format!("{}.0000", i + 1),
+                            n: (i + 1) as u32 * 2,
+                        })
+                        .collect(),
+                    (0..10)
+                        .map(|i| L2Level {
+                            px: format!("{}.00", 65001 + i),
+                            sz: format!("{}.0000", i + 1),
+                            n: (i + 1) as u32 * 3,
+                        })
+                        .collect(),
+                ),
+            },
+        };
+        let json_size = serde_json::to_string(&msg).unwrap().len();
+        let binary_size = bincode::serialize(&msg).unwrap().len();
+        // Binary should be smaller than JSON for structured data with field names
+        assert!(
+            binary_size < json_size,
+            "Binary {} should be smaller than JSON {}",
+            binary_size,
+            json_size
+        );
     }
 }

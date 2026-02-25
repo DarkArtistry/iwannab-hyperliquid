@@ -2,11 +2,11 @@
 
 use crate::orderbook::OrderBook;
 use hypercore_primitives::{
-    AccountAddress, AccountState, Decimal, Fill, FundingPayment, Market, MarketId, MarketState,
-    Order, OrderId, Position, SignedAmount, Timestamp,
+    AccountAddress, AccountState, Decimal, Fill, FundingPayment, MarginMode, Market, MarketId,
+    MarketState, Order, OrderId, Position, SignedAmount, Timestamp, TriggerDirection,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Block metadata for history queries
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,6 +45,14 @@ pub struct EngineState {
     funding_history: HashMap<AccountAddress, Vec<FundingPayment>>,
     /// Funding rate history per market
     market_funding_history: HashMap<MarketId, Vec<(Timestamp, SignedAmount)>>,
+    /// Margin mode per account
+    margin_mode: HashMap<AccountAddress, MarginMode>,
+    /// Trigger orders with direction Above: market_id -> BTreeMap<trigger_price_raw, Vec<Order>>
+    trigger_orders_above: HashMap<MarketId, BTreeMap<i128, Vec<Order>>>,
+    /// Trigger orders with direction Below: market_id -> BTreeMap<trigger_price_raw, Vec<Order>>
+    trigger_orders_below: HashMap<MarketId, BTreeMap<i128, Vec<Order>>>,
+    /// Index for trigger order lookup: order_id -> (market_id, direction, trigger_price_raw)
+    trigger_order_index: HashMap<OrderId, (MarketId, TriggerDirection, i128)>,
     /// Current block height
     block_height: u64,
     /// Block metadata (hash, timestamp, tx_count)
@@ -68,6 +76,10 @@ impl EngineState {
             recent_trades: HashMap::new(),
             funding_history: HashMap::new(),
             market_funding_history: HashMap::new(),
+            margin_mode: HashMap::new(),
+            trigger_orders_above: HashMap::new(),
+            trigger_orders_below: HashMap::new(),
+            trigger_order_index: HashMap::new(),
             block_height: 0,
             block_metadata: HashMap::new(),
         }
@@ -171,6 +183,18 @@ impl EngineState {
             .entry(address)
             .or_default()
             .insert(market_id, leverage);
+    }
+
+    // Margin mode operations
+
+    /// Get margin mode for account
+    pub fn get_margin_mode(&self, address: AccountAddress) -> MarginMode {
+        self.margin_mode.get(&address).copied().unwrap_or_default()
+    }
+
+    /// Set margin mode for account
+    pub fn set_margin_mode(&mut self, address: AccountAddress, mode: MarginMode) {
+        self.margin_mode.insert(address, mode);
     }
 
     // Market operations
@@ -321,6 +345,176 @@ impl EngineState {
             true
         } else {
             false
+        }
+    }
+
+    // Trigger order operations
+
+    /// Store a trigger order (TP/SL) for later activation
+    pub fn add_trigger_order(&mut self, order: Order) {
+        let trigger_price = match order.trigger_price {
+            Some(tp) => tp,
+            None => return,
+        };
+        let direction = match order.trigger_direction {
+            Some(d) => d,
+            None => return,
+        };
+
+        let market_id = order.market_id;
+        let order_id = order.id;
+        let price_raw = trigger_price.raw();
+
+        match direction {
+            TriggerDirection::Above => {
+                self.trigger_orders_above
+                    .entry(market_id)
+                    .or_default()
+                    .entry(price_raw)
+                    .or_default()
+                    .push(order);
+            }
+            TriggerDirection::Below => {
+                self.trigger_orders_below
+                    .entry(market_id)
+                    .or_default()
+                    .entry(price_raw)
+                    .or_default()
+                    .push(order);
+            }
+        }
+
+        self.trigger_order_index
+            .insert(order_id, (market_id, direction, price_raw));
+    }
+
+    /// Remove a trigger order by ID
+    pub fn remove_trigger_order(&mut self, order_id: OrderId) -> Option<Order> {
+        let (market_id, direction, price_raw) = self.trigger_order_index.remove(&order_id)?;
+
+        let map = match direction {
+            TriggerDirection::Above => self.trigger_orders_above.get_mut(&market_id)?,
+            TriggerDirection::Below => self.trigger_orders_below.get_mut(&market_id)?,
+        };
+
+        let orders = map.get_mut(&price_raw)?;
+        let idx = orders.iter().position(|o| o.id == order_id)?;
+        let order = orders.remove(idx);
+
+        if orders.is_empty() {
+            map.remove(&price_raw);
+        }
+
+        Some(order)
+    }
+
+    /// Get and remove all trigger orders with direction Above where trigger_price <= mark_price
+    pub fn get_triggered_orders_above(
+        &mut self,
+        market_id: MarketId,
+        mark_price: Decimal,
+    ) -> Vec<Order> {
+        let mut result = Vec::new();
+        let mark_raw = mark_price.raw();
+
+        if let Some(map) = self.trigger_orders_above.get_mut(&market_id) {
+            let triggered_keys: Vec<i128> = map.range(..=mark_raw).map(|(k, _)| *k).collect();
+
+            for key in triggered_keys {
+                if let Some(orders) = map.remove(&key) {
+                    for order in &orders {
+                        self.trigger_order_index.remove(&order.id);
+                    }
+                    result.extend(orders);
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Get and remove all trigger orders with direction Below where trigger_price >= mark_price
+    pub fn get_triggered_orders_below(
+        &mut self,
+        market_id: MarketId,
+        mark_price: Decimal,
+    ) -> Vec<Order> {
+        let mut result = Vec::new();
+        let mark_raw = mark_price.raw();
+
+        if let Some(map) = self.trigger_orders_below.get_mut(&market_id) {
+            let triggered_keys: Vec<i128> = map.range(mark_raw..).map(|(k, _)| *k).collect();
+
+            for key in triggered_keys {
+                if let Some(orders) = map.remove(&key) {
+                    for order in &orders {
+                        self.trigger_order_index.remove(&order.id);
+                    }
+                    result.extend(orders);
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Get all trigger orders for a specific user
+    pub fn get_user_trigger_orders(&self, address: AccountAddress) -> Vec<&Order> {
+        let mut result = Vec::new();
+
+        for map in self.trigger_orders_above.values() {
+            for orders in map.values() {
+                for order in orders {
+                    if order.owner == address {
+                        result.push(order);
+                    }
+                }
+            }
+        }
+
+        for map in self.trigger_orders_below.values() {
+            for orders in map.values() {
+                for order in orders {
+                    if order.owner == address {
+                        result.push(order);
+                    }
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Cancel all trigger orders for an account in a specific market
+    pub fn cancel_trigger_orders_for_position(
+        &mut self,
+        account: AccountAddress,
+        market_id: MarketId,
+    ) {
+        let mut to_remove = Vec::new();
+
+        if let Some(map) = self.trigger_orders_above.get(&market_id) {
+            for orders in map.values() {
+                for order in orders {
+                    if order.owner == account {
+                        to_remove.push(order.id);
+                    }
+                }
+            }
+        }
+
+        if let Some(map) = self.trigger_orders_below.get(&market_id) {
+            for orders in map.values() {
+                for order in orders {
+                    if order.owner == account {
+                        to_remove.push(order.id);
+                    }
+                }
+            }
+        }
+
+        for order_id in to_remove {
+            self.remove_trigger_order(order_id);
         }
     }
 
@@ -500,6 +694,82 @@ impl EngineState {
         ids
     }
 
+    /// Look up a market ID by its symbol name (e.g., "BTC-PERP")
+    pub fn get_market_id_by_name(&self, symbol: &str) -> Option<MarketId> {
+        self.markets.iter()
+            .find(|(_, market)| market.config.symbol == symbol)
+            .map(|(id, _)| *id)
+    }
+
+    /// Update mark price using EWMA (Exponential Weighted Moving Average)
+    ///
+    /// Instead of naively setting mark_price = last_trade_price, we use:
+    ///   new_mark = decay * old_mark + (1 - decay) * trade_price
+    ///
+    /// This smooths out individual trade noise and provides a more stable
+    /// mark price for funding rate calculations and liquidation checks.
+    pub fn update_mark_price(&mut self, market_id: MarketId, trade_price: Decimal) {
+        if let Some(market) = self.markets.get_mut(&market_id) {
+            let old_mark = market.state.mark_price;
+            if old_mark.is_zero() {
+                // First trade — initialize directly
+                market.state.mark_price = trade_price;
+            } else {
+                // EWMA: new = 0.9 * old + 0.1 * trade
+                // Both prices must be in the same decimal scale
+                let trade = trade_price.to_decimals(old_mark.decimals());
+                let decay_num = Decimal::from_raw(9, 1); // 0.9
+                let complement_num = Decimal::from_raw(1, 1); // 0.1
+                let smoothed = old_mark * decay_num + trade * complement_num;
+                market.state.mark_price = smoothed;
+            }
+        }
+    }
+
+    /// Compute impact mid price for a market
+    ///
+    /// Walks the orderbook on both sides up to `impact_notional` worth of depth,
+    /// then returns median(impact_bid, impact_ask, current_mark_price).
+    /// This is used for more robust mark price determination.
+    pub fn compute_impact_mid(&self, market_id: MarketId, impact_notional: Decimal) -> Option<Decimal> {
+        let book = self.orderbooks.get(&market_id)?;
+        let market = self.markets.get(&market_id)?;
+
+        let impact_bid = book.impact_price_buy(impact_notional)?;
+        let impact_ask = book.impact_price_sell(impact_notional)?;
+
+        let impact_mid = (impact_bid + impact_ask).div_int(2);
+        let mark = market.state.mark_price;
+
+        // median of three values
+        let median = if (impact_mid >= impact_bid && impact_mid <= mark)
+            || (impact_mid <= impact_bid && impact_mid >= mark)
+        {
+            impact_mid
+        } else if (mark >= impact_mid && mark <= impact_bid)
+            || (mark <= impact_mid && mark >= impact_bid)
+        {
+            mark
+        } else {
+            impact_bid
+        };
+
+        Some(median)
+    }
+
+    /// Get mid prices for all markets that have both a bid and an ask
+    pub fn get_all_mid_prices(&self) -> Vec<(MarketId, Decimal)> {
+        let mut result: Vec<_> = self.markets.iter()
+            .filter_map(|(id, _)| {
+                self.orderbooks.get(id)
+                    .and_then(|book| book.mid_price())
+                    .map(|mid| (*id, mid))
+            })
+            .collect();
+        result.sort_by_key(|(id, _)| *id);
+        result
+    }
+
     // === Persistence helper methods ===
 
     /// Get all positions across all accounts (for persistence)
@@ -599,6 +869,12 @@ pub struct EngineStateSnapshot {
     pub orders: Vec<Order>,
     pub insurance_fund: SignedAmount,
     pub next_order_id: OrderId,
+    /// Margin mode per account (default: empty for backwards compatibility)
+    #[serde(default)]
+    pub margin_modes: Vec<(AccountAddress, MarginMode)>,
+    /// Trigger orders (TP/SL) awaiting activation
+    #[serde(default)]
+    pub trigger_orders: Vec<Order>,
 }
 
 impl From<&EngineState> for EngineStateSnapshot {
@@ -629,6 +905,21 @@ impl From<&EngineState> for EngineStateSnapshot {
             .flat_map(|m| m.values().cloned())
             .collect();
 
+        let margin_modes: Vec<_> = state.margin_mode.iter().map(|(k, v)| (*k, *v)).collect();
+
+        // Collect all trigger orders from both above and below maps
+        let mut trigger_orders = Vec::new();
+        for map in state.trigger_orders_above.values() {
+            for orders in map.values() {
+                trigger_orders.extend(orders.iter().cloned());
+            }
+        }
+        for map in state.trigger_orders_below.values() {
+            for orders in map.values() {
+                trigger_orders.extend(orders.iter().cloned());
+            }
+        }
+
         Self {
             accounts,
             positions,
@@ -637,6 +928,8 @@ impl From<&EngineState> for EngineStateSnapshot {
             orders,
             insurance_fund: state.insurance_fund,
             next_order_id: state.next_order_id,
+            margin_modes,
+            trigger_orders,
         }
     }
 }
@@ -663,6 +956,10 @@ impl EngineState {
         self.orderbooks.clear();
         self.orders.clear();
         self.account_orders.clear();
+        self.margin_mode.clear();
+        self.trigger_orders_above.clear();
+        self.trigger_orders_below.clear();
+        self.trigger_order_index.clear();
 
         // Restore from snapshot
         for (addr, account) in snapshot.accounts {
@@ -686,6 +983,14 @@ impl EngineState {
 
         for order in snapshot.orders {
             self.add_order(order);
+        }
+
+        for (addr, mode) in snapshot.margin_modes {
+            self.margin_mode.insert(addr, mode);
+        }
+
+        for trigger_order in snapshot.trigger_orders {
+            self.add_trigger_order(trigger_order);
         }
 
         self.insurance_fund = snapshot.insurance_fund;
@@ -718,6 +1023,14 @@ impl EngineState {
 
         for order in snapshot.orders {
             state.add_order(order);
+        }
+
+        for (addr, mode) in snapshot.margin_modes {
+            state.margin_mode.insert(addr, mode);
+        }
+
+        for trigger_order in snapshot.trigger_orders {
+            state.add_trigger_order(trigger_order);
         }
 
         state.insurance_fund = snapshot.insurance_fund;
@@ -813,6 +1126,77 @@ mod tests {
     }
 
     #[test]
+    fn test_get_market_id_by_name() {
+        let mut state = EngineState::new();
+
+        let btc = Market::new(MarketConfig::btc_perp(), Decimal::price("65000"), 0);
+        let eth = Market::new(MarketConfig::eth_perp(), Decimal::price("3500"), 0);
+        state.add_market(btc);
+        state.add_market(eth);
+
+        assert_eq!(state.get_market_id_by_name("BTC-PERP"), Some(0));
+        assert_eq!(state.get_market_id_by_name("ETH-PERP"), Some(1));
+        assert_eq!(state.get_market_id_by_name("SOL-PERP"), None);
+    }
+
+    #[test]
+    fn test_get_all_mid_prices() {
+        use hypercore_primitives::{OrderRequest, OrderSide, OrderType};
+
+        let mut state = EngineState::new();
+        let account = Address::repeat_byte(1);
+
+        let btc = Market::new(MarketConfig::btc_perp(), Decimal::price("65000"), 0);
+        state.add_market(btc);
+
+        // No orders — mid price should be empty
+        assert!(state.get_all_mid_prices().is_empty());
+
+        // Add a bid and an ask
+        let bid = Order::new(
+            state.next_order_id(),
+            account,
+            OrderRequest {
+                market_id: 0,
+                side: OrderSide::Buy,
+                price: Decimal::price("64000"),
+                size: Decimal::size("1.0"),
+                order_type: OrderType::default(),
+                reduce_only: false,
+                client_order_id: None,
+                trigger_price: None,
+                trigger_direction: None,
+            },
+            1000,
+        );
+        state.add_order(bid);
+
+        let ask = Order::new(
+            state.next_order_id(),
+            account,
+            OrderRequest {
+                market_id: 0,
+                side: OrderSide::Sell,
+                price: Decimal::price("66000"),
+                size: Decimal::size("1.0"),
+                order_type: OrderType::default(),
+                reduce_only: false,
+                client_order_id: None,
+                trigger_price: None,
+                trigger_direction: None,
+            },
+            1001,
+        );
+        state.add_order(ask);
+
+        let mid_prices = state.get_all_mid_prices();
+        assert_eq!(mid_prices.len(), 1);
+        assert_eq!(mid_prices[0].0, 0); // market_id
+        // Mid price = (64000 + 66000) / 2 = 65000
+        assert_eq!(mid_prices[0].1, Decimal::price("65000"));
+    }
+
+    #[test]
     fn test_restore_order_populates_all_stores() {
         use hypercore_primitives::{OrderRequest, OrderSide, OrderType};
 
@@ -836,6 +1220,8 @@ mod tests {
                 order_type: OrderType::default(),
                 reduce_only: false,
                 client_order_id: None,
+                trigger_price: None,
+                trigger_direction: None,
             },
             1000,
         );

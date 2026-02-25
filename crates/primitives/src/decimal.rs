@@ -356,16 +356,6 @@ impl Decimal {
         self.to_decimals(target_decimals)
     }
 
-    /// Convert to big-endian bytes
-    pub fn to_be_bytes(&self) -> Vec<u8> {
-        self.value.to_be_bytes().to_vec()
-    }
-
-    /// Convert to big-endian bytes (signed)
-    pub fn to_be_bytes_signed(&self) -> Vec<u8> {
-        self.value.to_be_bytes().to_vec()
-    }
-
     /// Create a price value (8 decimals)
     pub fn price(s: &str) -> Self {
         Self::from_str_exact(s, Self::PRICE_DECIMALS)
@@ -388,6 +378,31 @@ impl Decimal {
     pub fn rate(s: &str) -> Self {
         Self::from_str_exact(s, Self::RATE_DECIMALS)
             .expect("invalid rate string")
+    }
+
+    /// Batch price comparison (Phase E4: SIMD-ready)
+    ///
+    /// Compares this price against multiple prices at once.
+    /// Returns a bitmask where bit i is set if self >= prices[i].
+    /// Currently uses scalar implementation; will use SIMD when available.
+    pub fn batch_compare_ge(&self, prices: &[Decimal]) -> u64 {
+        let mut mask: u64 = 0;
+        let self_val = self.to_decimals(Self::PRICE_DECIMALS).value;
+        for (i, price) in prices.iter().enumerate().take(64) {
+            let other_val = price.to_decimals(Self::PRICE_DECIMALS).value;
+            if self_val >= other_val {
+                mask |= 1 << i;
+            }
+        }
+        mask
+    }
+
+    /// Batch addition (Phase E4: SIMD-ready)
+    ///
+    /// Adds a value to multiple decimals at once.
+    /// Currently uses scalar implementation.
+    pub fn batch_add(values: &[Decimal], addend: Decimal) -> Vec<Decimal> {
+        values.iter().map(|v| *v + addend).collect()
     }
 }
 

@@ -56,3 +56,9 @@ export { runRiskTests } from './risk.js';
 
 // 16. State Proof Tests (Phase 3C)
 export { runStateProofTests } from './state-proofs.js';
+
+// 17. Liquidation Tests (Phase 8B)
+export { runLiquidationTests } from './liquidation.js';
+
+// 18. EVM Precompile Tests (Phase 8C)
+export { runEvmPrecompileTests } from './evm-precompile.js';

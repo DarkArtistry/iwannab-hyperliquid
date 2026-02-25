@@ -14,3 +14,5 @@ pub mod consensus;
 pub mod security;
 pub mod stress;
 pub mod multi_node_integration;
+pub mod evm_integration;
+pub mod chain_integration;

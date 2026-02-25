@@ -9,7 +9,7 @@ cors_allowed_origins = ["*"]
 
 [p2p]
 laddr = "tcp://0.0.0.0:26656"
-persistent_peers = "eef41000df0f2744c39f7aa86106be326bd7202a@cometbft-0:26656,569feeac2d5e892dcff80b0018c30aed6c00681d@cometbft-1:26656,c3d780e9babbd9c57cc3510d9f072dee97283953@cometbft-2:26656,22b871962f5aa6ab7cae946a07771558698878e5@cometbft-4:26656"
+persistent_peers = "e7daf540b000abe9a224028d7ac328af9e165bf4@cometbft-0:26656,956926a4f8a618830a0d168a308dc4d14de79e4e@cometbft-1:26656,9c02fb36e0c21d235f2d177b44a5be96dd0b3489@cometbft-2:26656,a8cff4a2389070e3063fa595446b091ec71eaefe@cometbft-4:26656"
 addr_book_file = "data/addrbook.json"
 addr_book_strict = false
 allow_duplicate_ip = true

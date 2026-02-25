@@ -1,6 +1,6 @@
 //! Core type definitions
 
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{Address, B256};
 use k256::ecdsa::{RecoveryId, Signature as K256Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};

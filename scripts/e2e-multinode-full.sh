@@ -338,6 +338,8 @@ run_tests() {
     print_section "Phase 4 Results"
     echo -e "  ${GREEN}Passed:${NC} $passed"
     echo -e "  ${RED}Failed:${NC} $failed"
+    # Machine-readable marker for parent scripts (e.g., make test-all)
+    echo "__TESTS_TOTAL=$((passed + failed))"
 
     if [ "$failed" -gt 0 ]; then
         return 1

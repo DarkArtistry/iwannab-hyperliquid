@@ -66,7 +66,7 @@ async fn test_1000_txs_per_block() {
     let hash = app.commit();
 
     let elapsed = start.elapsed();
-    assert!(hash != [0u8; 32]);
+    assert_ne!(hash, [0u8; 32], "Committed block should produce non-zero hash");
     println!("1000 txs processed in {:?}", elapsed);
 }
 
@@ -86,7 +86,7 @@ async fn test_5000_txs_per_block() {
     let hash = app.commit();
 
     let elapsed = start.elapsed();
-    assert!(hash != [0u8; 32]);
+    assert_ne!(hash, [0u8; 32], "Committed block should produce non-zero hash");
     println!("5000 txs processed in {:?}", elapsed);
 }
 
@@ -106,7 +106,7 @@ async fn test_10000_txs_per_block() {
     let hash = app.commit();
 
     let elapsed = start.elapsed();
-    assert!(hash != [0u8; 32]);
+    assert_ne!(hash, [0u8; 32], "Committed block should produce non-zero hash");
     println!("10000 txs processed in {:?}", elapsed);
 }
 

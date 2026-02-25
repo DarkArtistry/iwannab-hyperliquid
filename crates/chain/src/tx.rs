@@ -4,11 +4,11 @@
 //! to ensure consistency with the gateway crate's implementation.
 
 use hypercore_primitives::{
-    AccountAddress, Decimal, MarketId, OrderId, OrderRequest, OrderSide, OrderType, Signature,
-    TimeInForce,
+    AccountAddress, Decimal, MarginMode, MarketId, OrderId, OrderRequest, OrderSide, OrderType,
+    Signature, TimeInForce, TriggerDirection,
     eip712::{
         compute_domain_separator, encode_array, encode_bool, encode_string,
-        encode_uint64, encode_uint8, encode_address_bytes, type_hash, DEFAULT_CHAIN_ID,
+        encode_uint64, encode_uint8, encode_address_bytes, DEFAULT_CHAIN_ID,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -50,6 +50,16 @@ impl Transaction {
             self.hash = Some(h);
             h
         }
+    }
+
+    /// Serialize transaction to compact binary format using bincode (Phase C3)
+    pub fn to_binary(&self) -> Result<Vec<u8>, TransactionError> {
+        bincode::serialize(self).map_err(|e| TransactionError::SerializationError(e.to_string()))
+    }
+
+    /// Deserialize transaction from compact binary format (Phase C3)
+    pub fn from_binary(bytes: &[u8]) -> Result<Self, TransactionError> {
+        bincode::deserialize(bytes).map_err(|e| TransactionError::SerializationError(e.to_string()))
     }
 
     /// Recover signer address from signature
@@ -129,6 +139,15 @@ pub enum TransactionType {
         token: u8,
         amount: String,
         to_evm: bool,
+    },
+    /// Set margin mode (isolated or cross)
+    SetMarginMode {
+        mode: MarginMode,
+    },
+    /// Cancel a trigger order (TP/SL) by order ID
+    CancelTrigger {
+        asset: MarketId,
+        order_id: OrderId,
     },
 }
 
@@ -291,7 +310,7 @@ impl TransactionType {
                 hasher.update(encode_uint64(nonce));
                 Ok(hasher.finalize().into())
             }
-            TransactionType::SpotCancelAll { market } => {
+            TransactionType::SpotCancelAll { market: _ } => {
                 let type_hash = Keccak256::digest(
                     b"Action(string type,uint64 nonce)"
                 );
@@ -311,6 +330,30 @@ impl TransactionType {
                 hasher.update(encode_uint8(*token));
                 hasher.update(encode_string(amount));
                 hasher.update(encode_bool(*to_evm));
+                hasher.update(encode_uint64(nonce));
+                Ok(hasher.finalize().into())
+            }
+            TransactionType::SetMarginMode { mode } => {
+                let type_hash = Keccak256::digest(
+                    b"Action(string type,bool isCross,uint64 nonce)"
+                );
+                let is_cross = matches!(mode, MarginMode::Cross);
+                let mut hasher = Keccak256::new();
+                hasher.update(type_hash);
+                hasher.update(encode_string("setMarginMode"));
+                hasher.update(encode_bool(is_cross));
+                hasher.update(encode_uint64(nonce));
+                Ok(hasher.finalize().into())
+            }
+            TransactionType::CancelTrigger { asset, order_id } => {
+                let type_hash = Keccak256::digest(
+                    b"Action(string type,uint8 asset,uint64 orderId,uint64 nonce)"
+                );
+                let mut hasher = Keccak256::new();
+                hasher.update(type_hash);
+                hasher.update(encode_string("cancelTrigger"));
+                hasher.update(encode_uint8(*asset));
+                hasher.update(encode_uint64(*order_id));
                 hasher.update(encode_uint64(nonce));
                 Ok(hasher.finalize().into())
             }
@@ -389,6 +432,24 @@ impl OrderWire {
             .map_err(|_| TransactionError::InvalidSize)?;
         let order_type = self.t.to_order_type()?;
 
+        // Extract trigger fields from OrderTypeWire::Trigger variant
+        let (trigger_price, trigger_direction) = match &self.t {
+            OrderTypeWire::Trigger { trigger } => {
+                let tp = Decimal::from_str(&trigger.trigger_px)
+                    .map_err(|_| TransactionError::InvalidPrice)?;
+                let dir = match trigger.tpsl.as_str() {
+                    "tp" => TriggerDirection::Above,
+                    "sl" => TriggerDirection::Below,
+                    _ => {
+                        // Infer direction from side: buy triggers below, sell triggers above
+                        if self.b { TriggerDirection::Below } else { TriggerDirection::Above }
+                    }
+                };
+                (Some(tp), Some(dir))
+            }
+            _ => (None, None),
+        };
+
         Ok(OrderRequest {
             market_id: self.a,
             side: if self.b { OrderSide::Buy } else { OrderSide::Sell },
@@ -397,6 +458,8 @@ impl OrderWire {
             order_type,
             reduce_only: self.r,
             client_order_id: self.c.clone(),
+            trigger_price,
+            trigger_direction,
         })
     }
 }
@@ -549,8 +612,8 @@ pub enum TransactionError {
     InvalidSize,
     #[error("Invalid time in force")]
     InvalidTimeInForce,
-    #[error("Serialization error")]
-    SerializationError,
+    #[error("Serialization error: {0}")]
+    SerializationError(String),
     #[error("Unknown market: {0}")]
     UnknownMarket(MarketId),
     #[error("Insufficient balance")]
@@ -597,21 +660,21 @@ fn recover_address(message_hash: &[u8; 32], signature: &Signature) -> Result<Acc
     Ok(AccountAddress::from(address))
 }
 
-fn hex_to_bytes(hex: &str) -> Result<[u8; 32], ()> {
+fn _hex_to_bytes(hex: &str) -> Result<[u8; 32], ()> {
     let hex = hex.strip_prefix("0x").unwrap_or(hex);
     if hex.len() != 64 {
         return Err(());
     }
     let mut bytes = [0u8; 32];
     for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
-        let high = hex_char_to_nibble(chunk[0])?;
-        let low = hex_char_to_nibble(chunk[1])?;
+        let high = _hex_char_to_nibble(chunk[0])?;
+        let low = _hex_char_to_nibble(chunk[1])?;
         bytes[i] = (high << 4) | low;
     }
     Ok(bytes)
 }
 
-fn hex_char_to_nibble(c: u8) -> Result<u8, ()> {
+fn _hex_char_to_nibble(c: u8) -> Result<u8, ()> {
     match c {
         b'0'..=b'9' => Ok(c - b'0'),
         b'a'..=b'f' => Ok(c - b'a' + 10),

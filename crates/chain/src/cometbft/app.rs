@@ -28,7 +28,11 @@ use sha3::{Digest, Keccak256};
 #[cfg(feature = "persistence")]
 use hypercore_persistence::{RocksDbBackend, StatePersister};
 #[cfg(feature = "persistence")]
+use hypercore_persistence::{SnapshotManager, SnapshotMetadata, SnapshotRestore};
+#[cfg(feature = "persistence")]
 use crate::persistence_integration::extract_state;
+#[cfg(feature = "persistence")]
+use crate::persistence_integration::{restore_state, restore_perp_engine_state};
 
 /// CometBFT Application wrapper
 ///
@@ -63,6 +67,12 @@ struct CometBftAppInner {
     /// This ensures persistence happens AFTER CometBFT commits, not before.
     #[cfg(feature = "persistence")]
     pending_persistence: Option<hypercore_persistence::PersistedState>,
+    /// Snapshot manager for creating and serving ABCI state sync snapshots
+    #[cfg(feature = "persistence")]
+    snapshot_manager: Option<Arc<parking_lot::Mutex<SnapshotManager>>>,
+    /// Snapshot restore helper for receiving state sync snapshots
+    #[cfg(feature = "persistence")]
+    snapshot_restore: Option<parking_lot::Mutex<SnapshotRestore>>,
 }
 
 impl CometBftApp {
@@ -81,6 +91,10 @@ impl CometBftApp {
                 persistence: None,
                 #[cfg(feature = "persistence")]
                 pending_persistence: None,
+                #[cfg(feature = "persistence")]
+                snapshot_manager: None,
+                #[cfg(feature = "persistence")]
+                snapshot_restore: None,
             })),
         }
     }
@@ -119,6 +133,27 @@ impl CometBftApp {
     #[cfg(feature = "persistence")]
     pub fn with_persistence(self, db: Arc<RocksDbBackend>) -> Self {
         self.inner.write().persistence = Some(db);
+        self
+    }
+
+    /// Set the snapshot manager for ABCI state sync
+    ///
+    /// When set, the ABCI app can serve snapshots to new nodes via ListSnapshots /
+    /// LoadSnapshotChunk, and accept snapshots from peers via OfferSnapshot /
+    /// ApplySnapshotChunk. Periodic snapshot creation is triggered in Commit().
+    #[cfg(feature = "persistence")]
+    pub fn with_snapshot_manager(self, manager: SnapshotManager, restore_dir: std::path::PathBuf) -> Self {
+        let mut inner = self.inner.write();
+        inner.snapshot_manager = Some(Arc::new(parking_lot::Mutex::new(manager)));
+        match SnapshotRestore::new(&restore_dir) {
+            Ok(restore) => {
+                inner.snapshot_restore = Some(parking_lot::Mutex::new(restore));
+            }
+            Err(e) => {
+                tracing::warn!("Failed to create snapshot restore helper: {}", e);
+            }
+        }
+        drop(inner);
         self
     }
 
@@ -828,39 +863,224 @@ impl Application for CometBftApp {
                 }
             }
         }
+        // Create periodic snapshots for state sync
+        #[cfg(feature = "persistence")]
+        {
+            let inner = self.inner.read();
+            if let Some(ref manager) = inner.snapshot_manager {
+                let height = inner.app.current_height();
+                let mut mgr = manager.lock();
+                if mgr.should_create_snapshot(height) {
+                    if let Err(e) = mgr.create_snapshot(height) {
+                        tracing::warn!("Failed to create snapshot at height {}: {}", height, e);
+                    }
+                }
+            }
+        }
         ResponseCommit {
             retain_height: 0,
         }
     }
 
-    /// ListSnapshots - list available state snapshots
+    /// ListSnapshots - list available state snapshots for state sync
     fn list_snapshots(&self) -> ResponseListSnapshots {
-        // State sync not implemented yet
+        #[cfg(feature = "persistence")]
+        {
+            let inner = self.inner.read();
+            if let Some(ref manager) = inner.snapshot_manager {
+                let mgr = manager.lock();
+                let snapshots = mgr.list_snapshots()
+                    .into_iter()
+                    .map(|meta| tendermint_proto::abci::Snapshot {
+                        height: meta.height,
+                        format: meta.format,
+                        chunks: meta.chunks,
+                        hash: meta.hash.to_vec().into(),
+                        metadata: meta.metadata.as_bytes().to_vec().into(),
+                    })
+                    .collect();
+                return ResponseListSnapshots { snapshots };
+            }
+        }
         ResponseListSnapshots {
             snapshots: Vec::new(),
         }
     }
 
-    /// OfferSnapshot - offer snapshot for state sync
-    fn offer_snapshot(&self, _request: RequestOfferSnapshot) -> ResponseOfferSnapshot {
-        // Reject = 3 in the proto
+    /// OfferSnapshot - decide whether to accept a snapshot from a peer
+    fn offer_snapshot(&self, request: RequestOfferSnapshot) -> ResponseOfferSnapshot {
+        #[cfg(feature = "persistence")]
+        {
+            let inner = self.inner.read();
+            if let Some(ref restore) = inner.snapshot_restore {
+                if let Some(ref snapshot) = request.snapshot {
+                    let mut hash = [0u8; 32];
+                    if snapshot.hash.len() == 32 {
+                        hash.copy_from_slice(&snapshot.hash);
+                    }
+                    let metadata = SnapshotMetadata::new(
+                        snapshot.height,
+                        snapshot.format,
+                        snapshot.chunks,
+                        hash,
+                    );
+                    let mut restore_guard = restore.lock();
+                    match restore_guard.offer_snapshot(metadata) {
+                        Ok(true) => {
+                            tracing::info!(
+                                "Accepted snapshot at height {} ({} chunks)",
+                                snapshot.height, snapshot.chunks
+                            );
+                            return ResponseOfferSnapshot { result: 1 }; // ACCEPT
+                        }
+                        Ok(false) => {
+                            tracing::info!("Rejected snapshot at height {} (incompatible format)", snapshot.height);
+                            return ResponseOfferSnapshot { result: 2 }; // ABORT
+                        }
+                        Err(e) => {
+                            tracing::warn!("Error processing snapshot offer: {}", e);
+                            return ResponseOfferSnapshot { result: 3 }; // REJECT
+                        }
+                    }
+                }
+            }
+        }
         ResponseOfferSnapshot {
             result: 3, // REJECT
         }
     }
 
-    /// LoadSnapshotChunk - load snapshot chunk
-    fn load_snapshot_chunk(&self, _request: RequestLoadSnapshotChunk) -> ResponseLoadSnapshotChunk {
+    /// LoadSnapshotChunk - serve a chunk of our snapshot to a syncing peer
+    fn load_snapshot_chunk(&self, request: RequestLoadSnapshotChunk) -> ResponseLoadSnapshotChunk {
+        #[cfg(feature = "persistence")]
+        {
+            let inner = self.inner.read();
+            if let Some(ref manager) = inner.snapshot_manager {
+                let mgr = manager.lock();
+                match mgr.load_chunk(request.height, request.chunk) {
+                    Ok(chunk) => {
+                        tracing::debug!(
+                            "Serving snapshot chunk {} for height {}: {} bytes",
+                            request.chunk, request.height, chunk.len()
+                        );
+                        return ResponseLoadSnapshotChunk {
+                            chunk: chunk.into(),
+                        };
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to load snapshot chunk {} for height {}: {}",
+                            request.chunk, request.height, e
+                        );
+                    }
+                }
+            }
+        }
         ResponseLoadSnapshotChunk {
             chunk: Vec::new().into(),
         }
     }
 
-    /// ApplySnapshotChunk - apply snapshot chunk
-    fn apply_snapshot_chunk(&self, _request: RequestApplySnapshotChunk) -> ResponseApplySnapshotChunk {
-        // Reject = 5 in the proto
+    /// ApplySnapshotChunk - receive a chunk from a peer and restore state when complete
+    fn apply_snapshot_chunk(&self, request: RequestApplySnapshotChunk) -> ResponseApplySnapshotChunk {
+        #[cfg(feature = "persistence")]
+        {
+            let inner = self.inner.read();
+            if let Some(ref restore) = inner.snapshot_restore {
+                let mut restore_guard = restore.lock();
+                match restore_guard.apply_chunk(request.index, request.chunk.to_vec()) {
+                    Ok(true) => {
+                        // More chunks needed
+                        let (received, total) = restore_guard.progress();
+                        tracing::debug!(
+                            "Applied snapshot chunk {}/{}", received, total
+                        );
+                        return ResponseApplySnapshotChunk {
+                            result: 1, // ACCEPT
+                            refetch_chunks: Vec::new(),
+                            reject_senders: Vec::new(),
+                        };
+                    }
+                    Ok(false) => {
+                        // All chunks received — finalize
+                        tracing::info!("All snapshot chunks received, finalizing...");
+                        match restore_guard.finalize() {
+                            Ok(persisted_state) => {
+                                tracing::info!(
+                                    "Snapshot restored: height={}, {} balances, {} positions",
+                                    persisted_state.height,
+                                    persisted_state.core.balances.len(),
+                                    persisted_state.perp.positions.len(),
+                                );
+                                // Drop restore_guard and inner before acquiring write lock
+                                drop(restore_guard);
+                                drop(inner);
+
+                                // Restore state into the running app
+                                let mut inner = self.inner.write();
+                                let unified_state = &inner.app.state.unified_state;
+                                let engine = &inner.app.state.engine;
+                                let spot_engine = inner.app.state.spot_engine.as_ref().map(|s| s as &_);
+
+                                match restore_state(
+                                    &persisted_state,
+                                    unified_state,
+                                    engine,
+                                    spot_engine,
+                                ) {
+                                    Ok((height, timestamp, app_hash)) => {
+                                        // Restore chain-level state
+                                        inner.app.state.restore_chain_state(height, timestamp, app_hash);
+
+                                        // Restore perp engine if available
+                                        if let Some(ref perp) = inner.app.state.perp_engine {
+                                            restore_perp_engine_state(&persisted_state, perp);
+                                        }
+
+                                        tracing::info!(
+                                            "State sync complete: height={}, app_hash={}",
+                                            height, hex::encode(&app_hash[..8])
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("Failed to restore state from snapshot: {}", e);
+                                        return ResponseApplySnapshotChunk {
+                                            result: 3, // REJECT
+                                            refetch_chunks: Vec::new(),
+                                            reject_senders: Vec::new(),
+                                        };
+                                    }
+                                }
+
+                                return ResponseApplySnapshotChunk {
+                                    result: 1, // ACCEPT
+                                    refetch_chunks: Vec::new(),
+                                    reject_senders: Vec::new(),
+                                };
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to finalize snapshot: {}", e);
+                                return ResponseApplySnapshotChunk {
+                                    result: 3, // REJECT
+                                    refetch_chunks: Vec::new(),
+                                    reject_senders: Vec::new(),
+                                };
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to apply snapshot chunk: {}", e);
+                        return ResponseApplySnapshotChunk {
+                            result: 2, // RETRY
+                            refetch_chunks: vec![request.index],
+                            reject_senders: Vec::new(),
+                        };
+                    }
+                }
+            }
+        }
         ResponseApplySnapshotChunk {
-            result: 5, // REJECT
+            result: 3, // REJECT (no snapshot restore configured)
             refetch_chunks: Vec::new(),
             reject_senders: Vec::new(),
         }
@@ -958,5 +1178,47 @@ mod tests {
         let response = cometbft_app.info(request);
         assert_eq!(response.data, "HyperCore");
         assert_eq!(response.last_block_height, 0);
+    }
+
+    #[test]
+    fn test_list_snapshots_returns_empty_without_manager() {
+        let app = HyperCoreApp::new();
+        let cometbft_app = CometBftApp::new(app);
+
+        let response = cometbft_app.list_snapshots();
+        assert!(response.snapshots.is_empty());
+    }
+
+    #[test]
+    fn test_offer_snapshot_rejects_without_restore() {
+        let app = HyperCoreApp::new();
+        let cometbft_app = CometBftApp::new(app);
+
+        let request = RequestOfferSnapshot {
+            snapshot: Some(tendermint_proto::abci::Snapshot {
+                height: 1000,
+                format: 1,
+                chunks: 3,
+                hash: vec![0u8; 32].into(),
+                metadata: Vec::new().into(),
+            }),
+            app_hash: Vec::new().into(),
+        };
+        let response = cometbft_app.offer_snapshot(request);
+        assert_eq!(response.result, 3); // REJECT (no restore configured)
+    }
+
+    #[test]
+    fn test_apply_snapshot_chunk_rejects_without_restore() {
+        let app = HyperCoreApp::new();
+        let cometbft_app = CometBftApp::new(app);
+
+        let request = RequestApplySnapshotChunk {
+            index: 0,
+            chunk: vec![1, 2, 3].into(),
+            sender: String::new(),
+        };
+        let response = cometbft_app.apply_snapshot_chunk(request);
+        assert_eq!(response.result, 3); // REJECT (no restore configured)
     }
 }

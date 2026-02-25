@@ -9,6 +9,16 @@ pub type OrderId = u64;
 /// Client-provided order identifier
 pub type ClientOrderId = String;
 
+/// Margin mode for an account
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum MarginMode {
+    /// Each position has independent margin (default)
+    #[default]
+    Isolated,
+    /// All positions share margin across the account
+    Cross,
+}
+
 /// Order side
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -94,6 +104,15 @@ pub enum OrderStatus {
     Rejected,
 }
 
+/// Trigger direction for TP/SL orders
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TriggerDirection {
+    /// Trigger when mark price goes above trigger price
+    Above,
+    /// Trigger when mark price goes below trigger price
+    Below,
+}
+
 /// Cancel reason
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CancelReason {
@@ -136,6 +155,12 @@ pub struct OrderRequest {
     pub reduce_only: bool,
     /// Client order ID (optional)
     pub client_order_id: Option<ClientOrderId>,
+    /// Trigger price for TP/SL orders (None for regular orders)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_price: Option<Decimal>,
+    /// Trigger direction (Above/Below) for TP/SL orders
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_direction: Option<TriggerDirection>,
 }
 
 /// Order stored in the orderbook
@@ -167,6 +192,15 @@ pub struct Order {
     pub timestamp: Timestamp,
     /// Current status
     pub status: OrderStatus,
+    /// Trigger price for TP/SL orders (None for regular orders)
+    #[serde(default)]
+    pub trigger_price: Option<Decimal>,
+    /// Trigger direction (Above/Below) for TP/SL orders
+    #[serde(default)]
+    pub trigger_direction: Option<TriggerDirection>,
+    /// Whether this trigger order has been activated
+    #[serde(default)]
+    pub is_triggered: bool,
 }
 
 impl Order {
@@ -193,12 +227,20 @@ impl Order {
             client_order_id: request.client_order_id,
             timestamp,
             status: OrderStatus::Open,
+            trigger_price: request.trigger_price,
+            trigger_direction: request.trigger_direction,
+            is_triggered: false,
         }
     }
 
     /// Check if order is fully filled
     pub fn is_filled(&self) -> bool {
         self.remaining_size.is_zero()
+    }
+
+    /// Check if order is resting on the book (open or partially filled)
+    pub fn is_resting(&self) -> bool {
+        self.status == OrderStatus::Open || self.status == OrderStatus::PartiallyFilled
     }
 
     /// Check if order should rest on book
@@ -319,6 +361,61 @@ mod tests {
     }
 
     #[test]
+    fn test_order_is_resting() {
+        let mut order = Order::new(
+            1,
+            Address::ZERO,
+            OrderRequest {
+                market_id: 0,
+                side: OrderSide::Buy,
+                price: Decimal::price("100"),
+                size: Decimal::size("10"),
+                order_type: OrderType::default(),
+                reduce_only: false,
+                client_order_id: None,
+                trigger_price: None,
+                trigger_direction: None,
+            },
+            1000,
+        );
+
+        // Open order should be resting
+        assert_eq!(order.status, OrderStatus::Open);
+        assert!(order.is_resting());
+
+        // Partially filled should be resting
+        order.fill(Decimal::size("3"));
+        assert_eq!(order.status, OrderStatus::PartiallyFilled);
+        assert!(order.is_resting());
+
+        // Fully filled should NOT be resting
+        order.fill(Decimal::size("7"));
+        assert_eq!(order.status, OrderStatus::Filled);
+        assert!(!order.is_resting());
+
+        // Canceled should NOT be resting
+        let mut order2 = Order::new(
+            2,
+            Address::ZERO,
+            OrderRequest {
+                market_id: 0,
+                side: OrderSide::Buy,
+                price: Decimal::price("100"),
+                size: Decimal::size("10"),
+                order_type: OrderType::default(),
+                reduce_only: false,
+                client_order_id: None,
+                trigger_price: None,
+                trigger_direction: None,
+            },
+            1000,
+        );
+        order2.cancel();
+        assert_eq!(order2.status, OrderStatus::Canceled);
+        assert!(!order2.is_resting());
+    }
+
+    #[test]
     fn test_order_fill() {
         let mut order = Order::new(
             1,
@@ -331,6 +428,8 @@ mod tests {
                 order_type: OrderType::default(),
                 reduce_only: false,
                 client_order_id: None,
+                trigger_price: None,
+                trigger_direction: None,
             },
             1000,
         );

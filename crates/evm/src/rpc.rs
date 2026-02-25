@@ -14,7 +14,7 @@ use jsonrpsee::types::error::{ErrorCode, ErrorObject};
 use revm::primitives::{Address, Bytes, B256, U256};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
-use tracing::{info, debug, error};
+use tracing::{info, debug};
 
 use crate::executor::{EvmExecutor, EvmTransaction};
 
@@ -1029,7 +1029,7 @@ fn base64_encode(input: &[u8]) -> String {
 /// Supports legacy, EIP-2930, and EIP-1559 transaction types.
 /// Recovers the sender address from the embedded ECDSA signature.
 pub fn decode_raw_transaction(raw: &[u8]) -> anyhow::Result<EvmTransaction> {
-    use alloy_rlp::Decodable;
+    
 
     if raw.is_empty() {
         return Err(anyhow::anyhow!("Empty transaction data"));
@@ -1054,8 +1054,6 @@ pub fn decode_raw_transaction(raw: &[u8]) -> anyhow::Result<EvmTransaction> {
 
 /// Decode a legacy transaction
 fn decode_legacy_transaction(raw: &[u8]) -> anyhow::Result<EvmTransaction> {
-    use alloy_rlp::Decodable;
-
     let mut buf = raw;
 
     // Decode RLP header
@@ -1101,7 +1099,7 @@ fn decode_legacy_transaction(raw: &[u8]) -> anyhow::Result<EvmTransaction> {
 
 /// Decode EIP-1559 transaction
 fn decode_eip1559_transaction(raw: &[u8]) -> anyhow::Result<EvmTransaction> {
-    use alloy_rlp::{Decodable, Encodable};
+    use alloy_rlp::Decodable;
 
     let mut buf = raw;
 
@@ -1315,7 +1313,7 @@ fn recover_signer_eip1559(unsigned_tx: &[u8], v: u64, r: U256, s: U256) -> anyho
 
 /// Calculate contract address from sender and nonce
 fn calculate_contract_address(sender: &Address, nonce: u64) -> Address {
-    use alloy_rlp::Encodable;
+    
     use sha3::{Digest, Keccak256};
 
     // RLP encode [sender, nonce]

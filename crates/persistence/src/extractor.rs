@@ -4,15 +4,13 @@
 //! components and convert them to serializable PersistedState format.
 
 use crate::state::{
-    AccountEntry, BalanceEntry, BlockMetaEntry, ChainState, CloidEntry, CoreState,
-    EvmAccountEntry, EvmBlockHashEntry, EvmCodeEntry, EvmStateData, EvmStorageEntry,
+    BalanceEntry, BlockMetaEntry, CloidEntry,
+    EvmAccountEntry, EvmBlockHashEntry, EvmCodeEntry, EvmStorageEntry,
     LeverageEntry, MarketEntry, NonceEntry, OrderEntry, PersistedState, PositionEntry,
-    ReservedEntry, SpotMarketEntry, SpotState, SpotTokenEntry, UnifiedBalanceData,
-    SCHEMA_VERSION,
+    ReservedEntry, SpotMarketEntry, SpotTokenEntry, UnifiedBalanceData,
 };
 use hypercore_primitives::{
-    AccountAddress, Decimal, MarketId, Order, OrderId, Position, TokenIndex,
-    UnifiedBalance, UnifiedState,
+    AccountAddress, MarketId, Order, OrderId, Position, TokenIndex, UnifiedState,
 };
 use std::collections::HashMap;
 

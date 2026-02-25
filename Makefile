@@ -1,4 +1,5 @@
 # HyperCore Makefile
+SHELL := /bin/bash
 .PHONY: all build test clean devnet devnet-down seed fmt lint docs \
 	test-multinode test-multinode-keep test-multinode-full \
 	test-all all-tests docker-build-node
@@ -62,77 +63,88 @@ test-proptest:
 
 # Quick test: Rust + Solidity only (no Docker required)
 test-quick:
-	@echo "=========================================="
-	@echo "  Quick Tests (Rust + Solidity - No Docker)"
-	@echo "=========================================="
-	@echo ""
-	@echo ">>> [1/2] Rust Unit Tests (556 tests)"
-	@echo "------------------------------------------"
-	@cargo test --workspace --features cometbft 2>&1 | tail -30
-	@echo ""
-	@echo ">>> [2/2] Solidity Contract Tests (49 tests)"
-	@echo "------------------------------------------"
-	@cd contracts && forge test --summary
-	@echo ""
-	@echo "=========================================="
-	@echo "  QUICK TESTS COMPLETE (605 tests)"
-	@echo "=========================================="
+	@set -eo pipefail; \
+	RESULTS_DIR=$$(mktemp -d); \
+	trap 'rm -rf $$RESULTS_DIR' EXIT; \
+	echo "=========================================="; \
+	echo "  Quick Tests (Rust + Solidity - No Docker)"; \
+	echo "=========================================="; \
+	echo ""; \
+	echo ">>> [1/2] Rust Unit Tests"; \
+	echo "------------------------------------------"; \
+	cargo test --workspace --features cometbft 2>&1 | tee "$$RESULTS_DIR/rust.log" | tail -30; \
+	RUST_COUNT=$$(grep "^test result:" "$$RESULTS_DIR/rust.log" | awk '{sum += $$4} END {print sum+0}' || true); \
+	echo ""; \
+	echo ">>> [2/2] Solidity Contract Tests"; \
+	echo "------------------------------------------"; \
+	(cd contracts && forge test --summary) 2>&1 | tee "$$RESULTS_DIR/sol.log"; \
+	SOL_COUNT=$$(grep "tests passed" "$$RESULTS_DIR/sol.log" | tail -1 | grep -oE '[0-9]+ tests passed' | awk '{print $$1+0}' || echo "0"); \
+	echo ""; \
+	TOTAL=$$((RUST_COUNT + SOL_COUNT)); \
+	echo "=========================================="; \
+	printf "  QUICK TESTS COMPLETE (%d tests)\n" "$$TOTAL"; \
+	echo "=========================================="
 
 # Run ALL tests (Rust + Solidity + E2E + Multi-Node)
 # Builds Docker image ONCE, then reuses it for all E2E/multinode tests.
+# Test counts are captured dynamically from each runner's output.
 test-all:
-	@echo "=========================================="
-	@echo "  Running ALL Tests"
-	@echo "=========================================="
-	@echo ""
-	@echo "Test Suite Breakdown:"
-	@echo "  - Rust Unit Tests:           556 tests"
-	@echo "  - Solidity Contracts:         49 tests"
-	@echo "  - E2E Integration:           151 tests"
-	@echo "  - Multi-Node E2E (3-node):    15 tests"
-	@echo "  - Multi-Node Full (5-node):   52 tests"
-	@echo "  - Total:                     823 tests"
-	@echo ""
-	@echo ">>> [1/6] Rust Unit Tests (cargo test)"
-	@echo "------------------------------------------"
-	cargo test --workspace --features cometbft -- --nocapture
-	@echo ""
-	@echo ">>> [2/6] Solidity Contract Tests (forge test)"
-	@echo "------------------------------------------"
-	cd contracts && forge test -vvv
-	@echo ""
-	@echo ">>> [3/6] Building Docker Image (one-time build)"
-	@echo "------------------------------------------"
-	docker build -f infra/docker/Dockerfile.node -t hypercore-node .
-	@echo ""
-	@echo ">>> [4/6] E2E Integration Tests (single-node)"
-	@echo "------------------------------------------"
-	./scripts/e2e-test.sh --verbose
-	@echo ""
-	@echo ">>> [5/6] Multi-Validator E2E Tests (3-node cluster)"
-	@echo "------------------------------------------"
-	./scripts/e2e-multinode.sh --verbose --no-build
-	@echo ""
-	@echo ">>> [6/6] Comprehensive 5-Validator E2E Tests"
-	@echo "------------------------------------------"
-	./scripts/e2e-multinode-full.sh --verbose --no-build
-	@echo ""
-	@echo "=========================================="
-	@echo "  Test Results Summary"
-	@echo "=========================================="
-	@echo ""
-	@echo "  [1/6] Rust Unit Tests:            556 tests"
-	@echo "  [2/6] Solidity Contract Tests:      49 tests"
-	@echo "  [3/6] Docker Image Build:           OK"
-	@echo "  [4/6] E2E Integration (single):    151 tests"
-	@echo "  [5/6] Multi-Node E2E (3-node):      15 tests"
-	@echo "  [6/6] Multi-Node Full (5-node):     52 tests"
-	@echo "  ────────────────────────────────────────"
-	@echo "  Total:                             823 tests"
-	@echo ""
-	@echo "=========================================="
-	@echo "  ALL TESTS COMPLETE (823 tests)"
-	@echo "=========================================="
+	@set -eo pipefail; \
+	RESULTS_DIR=$$(mktemp -d); \
+	trap 'rm -rf $$RESULTS_DIR' EXIT; \
+	echo "=========================================="; \
+	echo "  Running ALL Tests"; \
+	echo "=========================================="; \
+	echo ""; \
+	echo ">>> [1/6] Rust Unit Tests (cargo test)"; \
+	echo "------------------------------------------"; \
+	cargo test --workspace --features cometbft -- --nocapture 2>&1 | tee "$$RESULTS_DIR/rust.log"; \
+	RUST_COUNT=$$(grep "^test result:" "$$RESULTS_DIR/rust.log" | awk '{sum += $$4} END {print sum+0}' || true); \
+	echo ""; \
+	echo ">>> [2/6] Solidity Contract Tests (forge test)"; \
+	echo "------------------------------------------"; \
+	(cd contracts && forge test -vvv) 2>&1 | tee "$$RESULTS_DIR/sol.log"; \
+	SOL_COUNT=$$(grep "tests passed" "$$RESULTS_DIR/sol.log" | tail -1 | grep -oE '[0-9]+ tests passed' | awk '{print $$1+0}' || echo "0"); \
+	echo ""; \
+	echo ">>> [3/6] Building Docker Image (one-time build)"; \
+	echo "------------------------------------------"; \
+	docker build -f infra/docker/Dockerfile.node -t hypercore-node .; \
+	echo ""; \
+	echo ">>> [4/6] E2E Integration Tests (single-node)"; \
+	echo "------------------------------------------"; \
+	./scripts/e2e-test.sh --verbose 2>&1 | tee "$$RESULTS_DIR/e2e.log"; \
+	E2E_COUNT=$$(grep -o '__TESTS_TOTAL=[0-9]*' "$$RESULTS_DIR/e2e.log" | tail -1 | cut -d= -f2 || echo "0"); \
+	E2E_COUNT=$${E2E_COUNT:-0}; \
+	echo ""; \
+	echo ">>> [5/6] Multi-Validator E2E Tests (3-node cluster)"; \
+	echo "------------------------------------------"; \
+	./scripts/e2e-multinode.sh --verbose --no-build 2>&1 | tee "$$RESULTS_DIR/mn.log"; \
+	MN_COUNT=$$(grep -o '__TESTS_TOTAL=[0-9]*' "$$RESULTS_DIR/mn.log" | tail -1 | cut -d= -f2 || echo "0"); \
+	MN_COUNT=$${MN_COUNT:-0}; \
+	echo ""; \
+	echo ">>> [6/6] Comprehensive 5-Validator E2E Tests"; \
+	echo "------------------------------------------"; \
+	./scripts/e2e-multinode-full.sh --verbose --no-build 2>&1 | tee "$$RESULTS_DIR/mnf.log"; \
+	MNF_COUNT=$$(grep -o '__TESTS_TOTAL=[0-9]*' "$$RESULTS_DIR/mnf.log" | tail -1 | cut -d= -f2 || echo "0"); \
+	MNF_COUNT=$${MNF_COUNT:-0}; \
+	echo ""; \
+	TOTAL=$$((RUST_COUNT + SOL_COUNT + E2E_COUNT + MN_COUNT + MNF_COUNT)); \
+	echo "=========================================="; \
+	echo "  Test Results Summary"; \
+	echo "=========================================="; \
+	echo ""; \
+	printf "  [1/6] Rust Unit Tests:          %4d tests\n" "$$RUST_COUNT"; \
+	printf "  [2/6] Solidity Contract Tests:  %4d tests\n" "$$SOL_COUNT"; \
+	echo   "  [3/6] Docker Image Build:             OK"; \
+	printf "  [4/6] E2E Integration (single): %4d tests\n" "$$E2E_COUNT"; \
+	printf "  [5/6] Multi-Node E2E (3-node):  %4d tests\n" "$$MN_COUNT"; \
+	printf "  [6/6] Multi-Node Full (5-node): %4d tests\n" "$$MNF_COUNT"; \
+	echo   "  ────────────────────────────────────────"; \
+	printf "  Total:                          %4d tests\n" "$$TOTAL"; \
+	echo ""; \
+	echo "=========================================="; \
+	echo "  ALL TESTS COMPLETE ($$TOTAL tests)"; \
+	echo "=========================================="
 
 # Alias for test-all
 all-tests: test-all
@@ -283,21 +295,21 @@ help:
 	@echo "  make build-node      - Build node with CometBFT support"
 	@echo "  make build-contracts - Build Solidity contracts"
 	@echo ""
-	@echo "Test (823 total tests):"
-	@echo "  make test              - Run Rust unit tests (556 tests, includes cometbft)"
-	@echo "  make test-quick        - Run Rust + Solidity (605 tests, no Docker)"
-	@echo "  make test-all          - Run ALL tests (823 tests, requires Docker)"
+	@echo "Test:"
+	@echo "  make test              - Run Rust unit tests (includes cometbft)"
+	@echo "  make test-quick        - Run Rust + Solidity (no Docker)"
+	@echo "  make test-all          - Run ALL tests (requires Docker, dynamic counts)"
 	@echo "  make all-tests         - Alias for test-all"
 	@echo "  make test-engine       - Run engine tests only"
 	@echo "  make test-chain        - Run chain/consensus tests only"
 	@echo "  make test-gateway      - Run gateway tests only"
-	@echo "  make test-primitives   - Run primitives tests only (61 tests)"
-	@echo "  make test-persistence  - Run persistence tests (51 tests)"
-	@echo "  make test-contracts    - Run Solidity tests (49 tests)"
-	@echo "  make test-e2e          - Run E2E integration tests (151 tests)"
+	@echo "  make test-primitives   - Run primitives tests only"
+	@echo "  make test-persistence  - Run persistence tests"
+	@echo "  make test-contracts    - Run Solidity tests"
+	@echo "  make test-e2e          - Run E2E integration tests"
 	@echo "  make test-e2e-quick    - Run E2E with existing services"
-	@echo "  make test-multinode    - Run 3-node multi-validator E2E (15 tests)"
-	@echo "  make test-multinode-full - Run 5-node comprehensive E2E (52 tests)"
+	@echo "  make test-multinode    - Run 3-node multi-validator E2E"
+	@echo "  make test-multinode-full - Run 5-node comprehensive E2E"
 	@echo "  make test-sdk          - Run SDK integration tests"
 	@echo "  make test-export-import - Run export/import CLI tests"
 	@echo ""

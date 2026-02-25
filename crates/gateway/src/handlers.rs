@@ -24,6 +24,18 @@ use tokio::sync::RwLock;
 use crate::api::{ExchangeAction, ExchangeRequest, InfoRequest};
 use crate::server::AppState;
 
+/// Fast JSON deserialization using simd-json when available (Phase C1)
+#[cfg(feature = "simd-json")]
+pub fn fast_json_deserialize<T: serde::de::DeserializeOwned>(bytes: &mut [u8]) -> Result<T, serde_json::Error> {
+    use serde::de::Error as _;
+    simd_json::from_slice(bytes).map_err(|e| serde_json::Error::custom(e.to_string()))
+}
+
+#[cfg(not(feature = "simd-json"))]
+pub fn fast_json_deserialize<T: serde::de::DeserializeOwned>(bytes: &mut [u8]) -> Result<T, serde_json::Error> {
+    serde_json::from_slice(bytes)
+}
+
 /// Handler for POST /info endpoint
 pub async fn handle_info(
     State(state): State<AppState>,
@@ -42,6 +54,112 @@ pub async fn handle_info(
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": e.to_string()})),
+        ),
+    }
+}
+
+/// Handler for POST /exchange/batch endpoint
+///
+/// Accepts an array of ExchangeRequest objects and processes them all in sequence.
+/// Returns an array of results, one per request.
+/// This amortizes HTTP/TLS overhead when submitting multiple independent actions.
+pub async fn handle_exchange_batch(
+    State(state): State<AppState>,
+    Json(requests): Json<Vec<ExchangeRequest>>,
+) -> impl IntoResponse {
+    use rayon::prelude::*;
+
+    // Phase B2: Verify all signatures in parallel using rayon
+    let verified: Vec<Result<(AccountAddress, ExchangeRequest), serde_json::Value>> = requests
+        .into_par_iter()
+        .map(|request| {
+            if let Err(e) = state.validator.validate_exchange_request(&request) {
+                return Err(json!({"error": format!("Validation error: {}", e)}));
+            }
+            match verify_signature(&request) {
+                Ok(sender) => Ok((sender, request)),
+                Err(e) => Err(json!({"error": e.to_string()})),
+            }
+        })
+        .collect();
+
+    // Process sequentially (state mutations must be ordered)
+    let mut results = Vec::with_capacity(verified.len());
+    for item in verified {
+        match item {
+            Ok((sender, request)) => {
+                match process_exchange_request_presigned(&state.engine, &state.spot_engine, &state.app, &state.tx_router, sender, request).await {
+                    Ok(response) => results.push(response),
+                    Err(e) => results.push(json!({"error": e.to_string()})),
+                }
+            }
+            Err(error_json) => results.push(error_json),
+        }
+    }
+
+    (StatusCode::OK, Json(json!(results)))
+}
+
+/// Handler for POST /exchange/binary endpoint (Phase C3)
+///
+/// Accepts raw binary-encoded transactions for minimal bandwidth usage.
+/// ~83 bytes per order vs ~500 bytes JSON (6x less bandwidth).
+pub async fn handle_exchange_binary(
+    State(state): State<AppState>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    use hypercore_chain::tx::Transaction;
+
+    // Deserialize from bincode
+    let tx: Transaction = match Transaction::from_binary(&body) {
+        Ok(tx) => tx,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("Binary decode error: {}", e)})),
+            );
+        }
+    };
+
+    // Recover sender from signature
+    let _sender = match tx.recover_signer() {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("Signature error: {}", e)})),
+            );
+        }
+    };
+
+    // Execute via app
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+
+    let mut app = state.app.write().await;
+    match app.execute_tx(&tx, timestamp) {
+        Ok(result) => {
+            let statuses = extract_order_statuses(&result.events);
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "status": "ok",
+                    "response": {
+                        "type": "binary",
+                        "data": {
+                            "success": result.success,
+                            "statuses": statuses,
+                            "gasUsed": result.gas_used
+                        }
+                    }
+                })),
+            )
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("Transaction failed: {}", e)})),
         ),
     }
 }
@@ -215,11 +333,17 @@ async fn process_info_request(
             let positions = if let Some(ref pe) = perp_engine_ref {
                 let perp = pe.read().await;
                 perp.state.get_all_positions(address).iter().map(|(market_id, pos)| {
+                    let leverage_val = perp.state.get_leverage(address, *market_id);
                     json!({
                         "position": {
-                            "asset": market_id,
+                            "coin": coin_name_from_market_id(*market_id),
                             "szi": pos.size.to_string_trimmed(),
-                            "entryPx": pos.entry_price().map(|p| p.to_string_trimmed()).unwrap_or_default(),
+                            "entryPx": pos.entry_price().map(|p| p.to_string_trimmed()).unwrap_or("0".to_string()),
+                            "unrealizedPnl": "0",
+                            "leverage": leverage_val,
+                            "liquidationPx": serde_json::Value::Null,
+                            "marginUsed": "0",
+                            "returnOnEquity": "0",
                         }
                     })
                 }).collect::<Vec<_>>()
@@ -290,6 +414,9 @@ async fn process_info_request(
                     "time": f.timestamp,
                     "fee": Decimal::from_raw(f.taker_fee as i128, 6).to_string_trimmed(),
                     "oid": f.taker_order_id,
+                    "tid": f.taker_order_id,
+                    "crossed": true,
+                    "closedPnl": "0",
                 })).collect();
                 return Ok(json!(fills_json));
             }
@@ -303,6 +430,9 @@ async fn process_info_request(
                 "time": f.timestamp,
                 "fee": Decimal::from_raw(f.taker_fee as i128, 6).to_string_trimmed(),
                 "oid": f.taker_order_id,
+                "tid": f.taker_order_id,
+                "crossed": true,
+                "closedPnl": "0",
             })).collect();
             Ok(json!(fills_json))
         }
@@ -344,7 +474,7 @@ async fn process_info_request(
                     "px": Decimal::from_raw(t.price as i128, 8).to_string_trimmed(),
                     "sz": Decimal::from_raw(t.size as i128, 6).to_string_trimmed(),
                     "time": t.timestamp,
-                    "tid": t.taker_order_id,
+                    "hash": format!("{:x}", t.taker_order_id),
                 })).collect();
                 return Ok(json!(trades_json));
             }
@@ -356,19 +486,94 @@ async fn process_info_request(
                 "px": Decimal::from_raw(t.price as i128, 8).to_string_trimmed(),
                 "sz": Decimal::from_raw(t.size as i128, 6).to_string_trimmed(),
                 "time": t.timestamp,
-                "tid": t.taker_order_id,
+                "hash": format!("{:x}", t.taker_order_id),
             })).collect();
             Ok(json!(trades_json))
         }
 
-        InfoRequest::CandleSnapshot { coin, interval, .. } => {
-            // Candles require aggregation from trades - return empty for now
-            // A proper implementation would aggregate recent trades into OHLCV buckets
-            let _market_id = market_id_from_coin(&coin);
-            let _interval = interval;
-            // Candle aggregation is complex and typically done by a separate indexer
-            // For now, return empty array - real implementation would query indexed data
-            Ok(json!([]))
+        InfoRequest::CandleSnapshot { coin, interval, start_time, end_time } => {
+            let market_id = market_id_from_coin(&coin);
+            let interval_ms = match interval.as_str() {
+                "1m" => 60_000u64,
+                "5m" => 300_000,
+                "15m" => 900_000,
+                "1h" => 3_600_000,
+                "4h" => 14_400_000,
+                "1d" => 86_400_000,
+                _ => return Err(HandlerError::InvalidParameter(format!("Unknown interval: {}", interval))),
+            };
+
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let start = start_time.unwrap_or(now.saturating_sub(86_400_000));
+            let end = end_time.unwrap_or(now);
+
+            // Get trades from perp engine (up to 500 per market)
+            let trades = if let Some(ref pe) = perp_engine_ref {
+                let perp = pe.read().await;
+                perp.state
+                    .get_recent_trades(market_id, Some(500))
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            } else {
+                engine
+                    .get_recent_trades(market_id, Some(500))
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+
+            // Aggregate trades into OHLCV buckets
+            let mut buckets: std::collections::BTreeMap<u64, (i128, i128, i128, i128, u128, u32)> =
+                std::collections::BTreeMap::new();
+
+            for trade in &trades {
+                if trade.timestamp < start || trade.timestamp > end {
+                    continue;
+                }
+                let bucket_start = (trade.timestamp / interval_ms) * interval_ms;
+                let price = trade.price as i128;
+                let size = trade.size;
+
+                let entry = buckets.entry(bucket_start).or_insert_with(|| {
+                    (price, price, price, price, 0u128, 0u32)
+                });
+                // high
+                if price > entry.1 {
+                    entry.1 = price;
+                }
+                // low
+                if price < entry.2 {
+                    entry.2 = price;
+                }
+                // close (last trade in bucket)
+                entry.3 = price;
+                // volume
+                entry.4 += size;
+                // trade count
+                entry.5 += 1;
+            }
+
+            let candles: Vec<Value> = buckets
+                .iter()
+                .map(|(bucket_start, (open, high, low, close, vol, n))| {
+                    json!({
+                        "t": bucket_start,
+                        "T": bucket_start + interval_ms - 1,
+                        "o": Decimal::from_raw(*open, 8).to_string_trimmed(),
+                        "h": Decimal::from_raw(*high, 8).to_string_trimmed(),
+                        "l": Decimal::from_raw(*low, 8).to_string_trimmed(),
+                        "c": Decimal::from_raw(*close, 8).to_string_trimmed(),
+                        "v": Decimal::from_raw(*vol as i128, 6).to_string_trimmed(),
+                        "n": n,
+                    })
+                })
+                .collect();
+
+            Ok(json!(candles))
         }
 
         // Spot requests are handled above
@@ -705,6 +910,23 @@ async fn process_exchange_request(
     // Verify signature and extract sender address
     let sender = verify_signature(&request)?;
 
+    // Delegate to presigned handler
+    process_exchange_request_presigned(_engine, spot_engine, app, tx_router, sender, request).await
+}
+
+/// Process an exchange request with a pre-verified sender address (Phase B2)
+///
+/// This is identical to process_exchange_request but skips signature verification,
+/// allowing batch handlers to verify all signatures in parallel using rayon
+/// before processing state mutations sequentially.
+async fn process_exchange_request_presigned(
+    _engine: &Arc<RwLock<EngineState>>,
+    spot_engine: &Arc<RwLock<SpotEngine>>,
+    app: &Arc<RwLock<HyperCoreApp>>,
+    tx_router: &crate::tx_router::TxRouter,
+    sender: AccountAddress,
+    request: ExchangeRequest,
+) -> Result<Value, HandlerError> {
     // Handle spot-specific actions and view transfers
     match &request.action {
         ExchangeAction::SpotOrder { .. }
@@ -743,7 +965,7 @@ async fn process_exchange_request(
 /// Execute perp action through the ABCI app layer
 async fn execute_perp_action_via_app(
     app: &Arc<RwLock<HyperCoreApp>>,
-    sender: AccountAddress,
+    _sender: AccountAddress,
     request: &ExchangeRequest,
     timestamp: u64,
 ) -> Result<Value, HandlerError> {
@@ -854,7 +1076,7 @@ async fn execute_perp_action_via_app(
 /// other validators, consensus ordering, and execution via FinalizeBlock.
 async fn broadcast_perp_action_via_cometbft(
     rpc_client: &crate::tx_router::CometBftRpcClient,
-    sender: AccountAddress,
+    _sender: AccountAddress,
     request: &ExchangeRequest,
 ) -> Result<Value, HandlerError> {
     use hypercore_chain::tx::{Transaction, TransactionType, OrderWire, CancelWire, CancelByCloidWire};
@@ -966,7 +1188,7 @@ async fn broadcast_perp_action_via_cometbft(
 /// SpotCancelAll → SpotCancelAll, ViewTransfer → ViewTransfer TransactionTypes.
 async fn broadcast_spot_action_via_cometbft(
     rpc_client: &crate::tx_router::CometBftRpcClient,
-    sender: AccountAddress,
+    _sender: AccountAddress,
     request: &ExchangeRequest,
 ) -> Result<Value, HandlerError> {
     use hypercore_chain::tx::{Transaction, TransactionType, OrderWire, CancelWire};
@@ -1191,6 +1413,8 @@ async fn process_spot_exchange_request(
                     order_type,
                     reduce_only: false, // Not applicable for spot
                     client_order_id: order_wire.c.clone(),
+                    trigger_price: None,
+                    trigger_direction: None,
                 };
 
                 match engine.place_order(sender, market_id, request, now) {
@@ -1449,24 +1673,25 @@ fn parse_address(s: &str) -> Result<AccountAddress, HandlerError> {
     Ok(AccountAddress::from(addr))
 }
 
-/// Convert market ID to coin name
+/// Convert market ID to coin name (must match market symbol in genesis)
 fn coin_name_from_market_id(market_id: u8) -> &'static str {
     match market_id {
-        0 => "BTC",
-        1 => "ETH",
-        2 => "SOL",
-        3 => "AVAX",
-        4 => "MATIC",
-        5 => "ARB",
-        6 => "OP",
-        7 => "DOGE",
+        0 => "BTC-PERP",
+        1 => "ETH-PERP",
+        2 => "SOL-PERP",
+        3 => "AVAX-PERP",
+        4 => "MATIC-PERP",
+        5 => "ARB-PERP",
+        6 => "OP-PERP",
+        7 => "DOGE-PERP",
         _ => "UNKNOWN",
     }
 }
 
-/// Convert coin name to market ID
+/// Convert coin name to market ID (handles both "BTC" and "BTC-PERP" formats)
 fn market_id_from_coin(coin: &str) -> u8 {
-    match coin.to_uppercase().as_str() {
+    let base = coin.to_uppercase().replace("-PERP", "");
+    match base.as_str() {
         "BTC" => 0,
         "ETH" => 1,
         "SOL" => 2,

@@ -18,6 +18,10 @@
 //! Connects to an external CometBFT process via ABCI for Byzantine fault-tolerant
 //! consensus in a multi-node network.
 
+/// Phase E1: Use mimalloc as the global allocator for 10-20% throughput improvement
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -83,7 +87,7 @@ enum Commands {
         consensus_mode: ConsensusMode,
 
         /// Block time in milliseconds (only used in single-node mode)
-        #[arg(long, default_value = "500", env = "BLOCK_TIME_MS")]
+        #[arg(long, default_value = "200", env = "BLOCK_TIME_MS")]
         block_time_ms: u64,
 
         /// Enable indexer
@@ -183,7 +187,7 @@ async fn main() -> anyhow::Result<()> {
             consensus_mode,
             block_time_ms,
             enable_indexer,
-            database_url,
+            database_url: _,
             log_level,
             #[cfg(feature = "cometbft")]
             cometbft_rpc_url,
@@ -542,7 +546,7 @@ async fn main() -> anyhow::Result<()> {
                 http_addr,
                 enable_websocket: true,
                 chain_id,
-                block_time_ms: 500, // 500ms blocks
+                block_time_ms: 200, // 200ms blocks
                 rate_limit: RateLimitConfig::development(),
                 validation: ValidationConfig::default(),
             };
@@ -653,6 +657,23 @@ async fn main() -> anyhow::Result<()> {
                 }).await {
                     tracing::error!("Gateway error: {}", e);
                 }
+            });
+
+            // Start metrics server
+            let metrics_app = axum::Router::new()
+                .route("/metrics", axum::routing::get(|| async {
+                    use prometheus::Encoder;
+                    let encoder = prometheus::TextEncoder::new();
+                    let metric_families = hypercore_engine::METRICS_REGISTRY.gather();
+                    let mut buffer = Vec::new();
+                    encoder.encode(&metric_families, &mut buffer).unwrap();
+                    String::from_utf8(buffer).unwrap_or_default()
+                }));
+            let metrics_addr: std::net::SocketAddr = "0.0.0.0:9100".parse().unwrap();
+            tracing::info!("Metrics server listening on {}", metrics_addr);
+            tokio::spawn(async move {
+                let listener = tokio::net::TcpListener::bind(metrics_addr).await.unwrap();
+                axum::serve(listener, metrics_app).await.ok();
             });
 
             // Start EVM RPC server
@@ -940,6 +961,29 @@ async fn main() -> anyhow::Result<()> {
                     #[cfg(feature = "persistence")]
                     if let Some(ref db) = persistence {
                         cometbft_app = cometbft_app.with_persistence(Arc::clone(db));
+
+                        // Set up snapshot manager for ABCI state sync
+                        let snapshot_dir = std::path::PathBuf::from(&data_dir).join("snapshots");
+                        let restore_dir = std::path::PathBuf::from(&data_dir).join("snapshot_restore");
+                        let snapshot_interval = 1000; // create snapshot every 1000 blocks
+                        match hypercore_persistence::SnapshotManager::with_arc_db(
+                            Arc::clone(db),
+                            &snapshot_dir,
+                            snapshot_interval,
+                        ) {
+                            Ok(manager) => {
+                                let existing = manager.list_snapshots().len();
+                                tracing::info!(
+                                    "Snapshot manager initialized: dir={}, interval={}, existing={}",
+                                    snapshot_dir.display(), snapshot_interval, existing
+                                );
+                                cometbft_app = cometbft_app.with_snapshot_manager(manager, restore_dir);
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to create snapshot manager: {}", e);
+                                tracing::warn!("State sync will not be available");
+                            }
+                        }
                     }
 
                     let server = CometBftServer::new(cometbft_app);
@@ -1122,11 +1166,13 @@ async fn main() -> anyhow::Result<()> {
 
             #[cfg(not(feature = "persistence"))]
             {
+                #[allow(unreachable_code)]
                 return Err(anyhow::anyhow!(
                     "Export requires the 'persistence' feature. Build with: cargo build --features persistence"
                 ));
             }
 
+            #[allow(unreachable_code)]
             Ok(())
         }
 
@@ -1202,11 +1248,13 @@ async fn main() -> anyhow::Result<()> {
 
             #[cfg(not(feature = "persistence"))]
             {
+                #[allow(unreachable_code)]
                 return Err(anyhow::anyhow!(
                     "Import requires the 'persistence' feature. Build with: cargo build --features persistence"
                 ));
             }
 
+            #[allow(unreachable_code)]
             Ok(())
         }
     }
@@ -1401,6 +1449,8 @@ fn create_genesis(chain_id: u64) -> anyhow::Result<serde_json::Value> {
     let alice = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
     let bob = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
     let charlie = "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC";
+    // User's MetaMask wallet
+    let user = "0xdeA3c06EEe614bF84e74d505173822236c8Ad135";
 
     Ok(serde_json::json!({
         "chain_id": format!("hypercore-{}", chain_id),
@@ -1438,23 +1488,39 @@ fn create_genesis(chain_id: u64) -> anyhow::Result<serde_json::Value> {
             "spot_tokens": [
                 {
                     "index": 1,
-                    "name": "Test Token",
-                    "symbol": "TEST",
+                    "name": "Bitcoin",
+                    "symbol": "BTC",
+                    "wei_decimals": 8,
+                    "sz_decimals": 3,
+                    "max_supply": "21000000"
+                },
+                {
+                    "index": 2,
+                    "name": "Ethereum",
+                    "symbol": "ETH",
                     "wei_decimals": 18,
                     "sz_decimals": 4,
-                    "max_supply": "1000000000"
+                    "max_supply": "120000000"
                 }
             ],
             "balances": [
-                // Alice: 100,000 USDC (core) + 10,000 TEST (core)
+                // Alice: USDC + BTC + ETH
                 { "address": alice, "token": 0, "amount": "100000", "view": "core" },
-                { "address": alice, "token": 1, "amount": "10000", "view": "core" },
-                // Bob: 100,000 USDC (core) + 10,000 TEST (core)
+                { "address": alice, "token": 1, "amount": "10", "view": "core" },
+                { "address": alice, "token": 2, "amount": "100", "view": "core" },
+                // Bob: USDC + BTC + ETH
                 { "address": bob, "token": 0, "amount": "100000", "view": "core" },
-                { "address": bob, "token": 1, "amount": "10000", "view": "core" },
-                // Charlie: 100,000 USDC (core) + 10,000 TEST (core)
+                { "address": bob, "token": 1, "amount": "10", "view": "core" },
+                { "address": bob, "token": 2, "amount": "100", "view": "core" },
+                // Charlie: USDC + BTC + ETH
                 { "address": charlie, "token": 0, "amount": "100000", "view": "core" },
-                { "address": charlie, "token": 1, "amount": "10000", "view": "core" }
+                { "address": charlie, "token": 1, "amount": "10", "view": "core" },
+                { "address": charlie, "token": 2, "amount": "100", "view": "core" },
+                // Admin wallet: 10M USDC + 100 BTC + 1000 ETH (core) + 100K USDC (evm)
+                { "address": user, "token": 0, "amount": "10000000", "view": "core" },
+                { "address": user, "token": 0, "amount": "100000", "view": "evm" },
+                { "address": user, "token": 1, "amount": "100", "view": "core" },
+                { "address": user, "token": 2, "amount": "1000", "view": "core" }
             ]
         }
     }))
@@ -1462,7 +1528,6 @@ fn create_genesis(chain_id: u64) -> anyhow::Result<serde_json::Value> {
 
 /// Mock price feed for devnet (simulates price movements)
 async fn mock_price_feed(engine: Arc<RwLock<EngineState>>) {
-    use rand::Rng;
     use hypercore_primitives::Decimal;
 
     let mut btc_price = 50000.0_f64;

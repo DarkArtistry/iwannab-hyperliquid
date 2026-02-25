@@ -13,11 +13,10 @@ use revm::primitives::{
 };
 use revm::interpreter::analysis::to_analysed;
 use revm::{Database, DatabaseCommit, Evm};
-use sha3::{Digest, Keccak256};
 use tokio::sync::RwLock;
 use tracing::debug;
 
-use crate::precompiles::{HyperCorePrecompiles, PrecompileAddress};
+use crate::precompiles::HyperCorePrecompiles;
 use crate::state::EvmState;
 
 /// CoreWriter contract address
@@ -201,6 +200,7 @@ pub struct EvmExecutor {
     /// EVM database
     db: HyperEvmDb,
     /// HyperCore engine state reference (for precompiles)
+    #[allow(dead_code)]
     engine: Arc<RwLock<EngineState>>,
     /// HyperCore precompiles
     precompiles: HyperCorePrecompiles,
@@ -599,6 +599,7 @@ impl EvmExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha3::{Digest, Keccak256};
 
     #[test]
     fn test_executor_creation() {

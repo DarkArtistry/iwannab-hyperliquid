@@ -14,7 +14,6 @@ use rocksdb::{
     ColumnFamilyDescriptor, Options,
     WriteBatch as RocksWriteBatch, WriteOptions, DB,
 };
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
@@ -22,7 +21,6 @@ use tracing::{debug, error, info, warn};
 /// RocksDB-based persistence backend
 pub struct RocksDbBackend {
     db: Arc<DB>,
-    cf_handles: HashMap<ColumnFamily, String>,
     config: PersistenceConfig,
 }
 
@@ -38,9 +36,14 @@ impl RocksDbBackend {
         opts
     }
 
-    /// Get column family handle name
-    fn cf_name(&self, cf: ColumnFamily) -> &str {
-        self.cf_handles.get(&cf).map(|s| s.as_str()).unwrap_or("default")
+    /// Create write options optimized for throughput (Phase E3)
+    /// Uses sync=false with WAL=true for durability without waiting for fsync.
+    /// Data is safe in WAL even if process crashes, but may be lost on power failure.
+    fn fast_write_options() -> WriteOptions {
+        let mut opts = WriteOptions::default();
+        opts.set_sync(false);       // Don't wait for fsync
+        opts.disable_wal(false);    // Keep WAL for crash safety
+        opts
     }
 
     /// Initialize schema version if not set
@@ -126,15 +129,8 @@ impl PersistenceBackend for RocksDbBackend {
             DB::open_cf_descriptors(&opts, path, create_descriptors())?
         };
 
-        // Build CF handle map
-        let mut cf_handles = HashMap::new();
-        for cf in ColumnFamily::all() {
-            cf_handles.insert(*cf, cf.name().to_string());
-        }
-
         let backend = Self {
             db: Arc::new(db),
-            cf_handles,
             config: config.clone(),
         };
 
@@ -300,6 +296,22 @@ impl PersistenceBackend for RocksDbBackend {
 }
 
 impl RocksDbBackend {
+    /// Write with fast options (Phase E3: non-blocking writes)
+    pub fn put_fast(&self, cf_name: &str, key: &[u8], value: &[u8]) -> Result<()> {
+        let cf = self.db.cf_handle(cf_name)
+            .ok_or_else(|| PersistenceError::ColumnFamilyNotFound(cf_name.to_string()))?;
+        let opts = Self::fast_write_options();
+        self.db.put_cf_opt(&cf, key, value, &opts)
+            .map_err(|e| PersistenceError::RocksDb(e))
+    }
+
+    /// Batch write with fast options (Phase E3)
+    pub fn write_batch_fast(&self, batch: RocksWriteBatch) -> Result<()> {
+        let opts = Self::fast_write_options();
+        self.db.write_opt(batch, &opts)
+            .map_err(|e| PersistenceError::RocksDb(e))
+    }
+
     /// Create a checkpoint of the database at the given path
     ///
     /// This creates a complete, consistent copy of the database that can be used

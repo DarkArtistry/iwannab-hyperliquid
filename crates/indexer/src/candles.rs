@@ -3,7 +3,7 @@
 //! Aggregates fills into candles at various intervals:
 //! - 1m, 5m, 15m, 1h, 4h, 1d
 
-use chrono::{DateTime, Duration, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Duration, TimeZone, Utc};
 use sqlx::PgPool;
 
 /// Supported candle intervals

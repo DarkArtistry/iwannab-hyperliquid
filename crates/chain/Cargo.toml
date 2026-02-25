@@ -17,12 +17,17 @@ hypercore-engine = { workspace = true }
 hypercore-evm = { workspace = true }
 hypercore-persistence = { workspace = true, optional = true }
 
+# Lock-free mempool queue (Phase B3)
+crossbeam-queue = "0.3"
+
 # Async runtime
 tokio = { workspace = true, features = ["sync", "time"] }
+async-trait = { workspace = true }
 
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
+bincode = { workspace = true }
 
 # Cryptography
 sha3 = { workspace = true }
@@ -53,3 +58,8 @@ futures = { workspace = true, optional = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 reqwest = { version = "0.12", features = ["json"] }
+criterion = { workspace = true }
+
+[[bench]]
+name = "block_production"
+harness = false

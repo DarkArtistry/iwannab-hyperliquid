@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use hypercore_engine::{Engine, EngineConfig, EngineState, EngineStateSnapshot, SpotEngine, SpotEngineStateSnapshot};
+use hypercore_engine::{Engine, EngineState, EngineStateSnapshot, SpotEngine, SpotEngineStateSnapshot};
 use hypercore_evm::EvmExecutor;
 use hypercore_primitives::{
     AccountAddress, BlockHeight, Decimal, MarketId, OrderId,

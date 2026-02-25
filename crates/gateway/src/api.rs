@@ -1,6 +1,6 @@
 //! API request/response types
 
-use hypercore_primitives::{AccountAddress, Decimal, MarketId, OrderId, Signature, SpotMarketId, TokenIndex};
+use hypercore_primitives::{MarketId, OrderId, Signature, SpotMarketId, TokenIndex};
 use serde::{Deserialize, Serialize};
 
 /// Info API request types

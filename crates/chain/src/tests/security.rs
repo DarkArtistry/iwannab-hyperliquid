@@ -166,11 +166,11 @@ async fn test_nonce_prevents_replay_attack() {
     app.end_block();
     app.commit();
 
-    // Replay at later timestamp should handle the nonce appropriately
-    // - If nonce is too old, it should be rejected
-    // - If nonce tracking is stateful, it should be rejected
-    // The app should remain in a valid state either way
-    assert!(app.current_height() == 2, "App should continue processing blocks");
+    // Both executions should fail (Signature::zero() fails recovery), but
+    // the app should remain in a valid state and continue producing blocks
+    assert!(result1.is_err() || result2.is_err(),
+        "At least one execution should fail: replay or invalid signature");
+    assert_eq!(app.current_height(), 2, "App should continue processing blocks after failed txs");
 }
 
 #[tokio::test]
@@ -373,11 +373,14 @@ async fn test_state_cannot_be_corrupted_by_failed_tx() {
     app2.end_block();
     let hash_empty_block = app2.commit();
 
-    // State integrity should be maintained
-    // Failed transactions should not corrupt state differently
-    // Both apps should produce valid (non-zero) hashes
-    assert!(hash_after_bad_txs != [0u8; 32], "Should produce valid hash after bad txs");
-    assert!(hash_empty_block != [0u8; 32], "Should produce valid hash for empty block");
+    // State integrity: both should produce valid (non-zero) hashes
+    assert_ne!(hash_after_bad_txs, [0u8; 32], "Should produce valid hash after bad txs");
+    assert_ne!(hash_empty_block, [0u8; 32], "Should produce valid hash for empty block");
+
+    // Failed transactions should NOT change state — both apps should
+    // produce the same hash since all bad txs were rejected
+    assert_eq!(hash_after_bad_txs, hash_empty_block,
+        "100 failed txs should not corrupt state: hash with failed txs should equal empty block hash");
 }
 
 #[tokio::test]

@@ -11,19 +11,15 @@ use crate::{
     error::{PersistenceError, Result},
     keys::KeyEncoder,
     state::{
-        AccountEntry, BalanceEntry, BlockMetaEntry, ChainState, CloidEntry,
-        CoreState, EvmAccountEntry, EvmBlockHashEntry, EvmCodeEntry,
-        EvmStateData, EvmStorageEntry, LeverageEntry, MarketEntry, NonceEntry,
-        OrderEntry, PersistedState, PositionEntry, ReservedEntry, SpotMarketEntry,
-        SpotState, SpotTokenEntry, UnifiedBalanceData, SCHEMA_VERSION,
+        BalanceEntry, BlockMetaEntry, CloidEntry, EvmAccountEntry, EvmCodeEntry, EvmStorageEntry, LeverageEntry, MarketEntry, NonceEntry,
+        OrderEntry, PersistedState, PositionEntry, SpotMarketEntry, SpotTokenEntry, UnifiedBalanceData, SCHEMA_VERSION,
     },
-    PersistenceBackend, WriteBatch,
+    PersistenceBackend,
 };
 use hypercore_primitives::{
-    AccountAddress, Decimal, MarketId, Order, OrderId, Position, TokenIndex,
+    AccountAddress, Order, Position,
 };
-use std::collections::HashMap;
-use tracing::{debug, error, info, warn};
+use tracing::{info, warn};
 
 /// State persister for saving and loading blockchain state
 pub struct StatePersister<'a, B: PersistenceBackend> {
@@ -358,7 +354,7 @@ impl<'a, B: PersistenceBackend> StatePersister<'a, B> {
 
         // Load markets
         let markets = self.backend.prefix_scan(ColumnFamily::Markets, &[])?;
-        for (key, value) in markets {
+        for (_key, value) in markets {
             if let Ok(market) = serde_json::from_slice::<MarketEntry>(&value) {
                 state.core.markets.push(market);
             }
@@ -750,6 +746,9 @@ mod tests {
                 post_only: false,
                 client_order_id: Some("test-order-1".to_string()),
                 timestamp: 1706054400000,
+                trigger_price: None,
+                trigger_direction: None,
+                is_triggered: false,
             },
         });
 
@@ -1143,6 +1142,9 @@ mod tests {
                 post_only: false,
                 client_order_id: Some("test-🚀-order-\n\t\"special\"".to_string()),
                 timestamp: 1000,
+                trigger_price: None,
+                trigger_direction: None,
+                is_triggered: false,
             },
         });
 
@@ -1156,5 +1158,98 @@ mod tests {
             restored.core.orders[0].order.client_order_id,
             Some("test-🚀-order-\n\t\"special\"".to_string())
         );
+    }
+
+    // ========================================================================
+    // Persistence Roundtrip Value Assertion Tests (Tier 3)
+    // ========================================================================
+
+    #[test]
+    fn test_roundtrip_preserves_exact_field_values() {
+        // Verify that persist → load preserves exact field values,
+        // not just counts. This catches encoding bugs where data is
+        // silently corrupted (e.g., decimal precision loss, address
+        // byte-order swaps, position sign flips).
+        
+
+        let (backend, _temp_dir) = create_test_backend();
+        let persister = StatePersister::new(&backend);
+
+        let account = AccountAddress::from([0xAB; 20]);
+        let mut state = create_comprehensive_test_state();
+        state.height = 99999;
+        state.timestamp = 1706054400999;
+        state.app_hash = [0xDE; 32];
+
+        persister.persist_state(&state).expect("persist failed");
+        let loaded = persister.load_state().unwrap().unwrap();
+
+        // Verify exact metadata
+        assert_eq!(loaded.height, 99999);
+        assert_eq!(loaded.timestamp, 1706054400999);
+        assert_eq!(loaded.app_hash, [0xDE; 32]);
+
+        // Verify exact balance values (not just counts)
+        let orig_bal = &state.core.balances[0];
+        let load_bal = loaded.core.balances.iter()
+            .find(|b| b.account == orig_bal.account && b.token == orig_bal.token)
+            .expect("Balance entry should survive roundtrip");
+        assert_eq!(load_bal.balance.total, orig_bal.balance.total,
+            "Balance total must be preserved exactly");
+        assert_eq!(load_bal.balance.core_view, orig_bal.balance.core_view,
+            "Balance core_view must be preserved exactly");
+        assert_eq!(load_bal.balance.evm_view, orig_bal.balance.evm_view,
+            "Balance evm_view must be preserved exactly");
+
+        // Verify exact position values
+        let orig_pos = &state.core.positions[0];
+        let load_pos = loaded.core.positions.iter()
+            .find(|p| p.account == orig_pos.account && p.market == orig_pos.market)
+            .expect("Position entry should survive roundtrip");
+        assert_eq!(load_pos.position.size.raw_value(), orig_pos.position.size.raw_value(),
+            "Position size raw value must be preserved");
+        assert_eq!(load_pos.position.is_long(), orig_pos.position.is_long(),
+            "Position direction must be preserved");
+
+        // Verify exact leverage values
+        let orig_lev = &state.core.leverage[0];
+        let load_lev = loaded.core.leverage.iter()
+            .find(|l| l.account == orig_lev.account && l.market == orig_lev.market)
+            .expect("Leverage entry should survive roundtrip");
+        assert_eq!(load_lev.leverage, orig_lev.leverage,
+            "Leverage value must be preserved exactly");
+
+        // Verify exact order values
+        let orig_order = &state.core.orders[0];
+        let load_order = loaded.core.orders.iter()
+            .find(|o| o.order_id == orig_order.order_id)
+            .expect("Order entry should survive roundtrip");
+        assert_eq!(load_order.order.id, orig_order.order.id);
+        assert_eq!(load_order.order.owner, orig_order.order.owner);
+        assert_eq!(load_order.order.price.raw_value(), orig_order.order.price.raw_value(),
+            "Order price raw value must be preserved");
+        assert_eq!(load_order.order.remaining_size.raw_value(),
+            orig_order.order.remaining_size.raw_value(),
+            "Order remaining_size must be preserved");
+        assert_eq!(load_order.order.client_order_id, orig_order.order.client_order_id,
+            "Order CLOID must be preserved");
+        assert_eq!(load_order.order.timestamp, orig_order.order.timestamp);
+
+        // Verify exact nonce values
+        let orig_nonce = &state.chain.nonces[0];
+        let load_nonce = loaded.chain.nonces.iter()
+            .find(|n| n.account == orig_nonce.account)
+            .expect("Nonce entry should survive roundtrip");
+        assert_eq!(load_nonce.nonce, orig_nonce.nonce,
+            "Nonce value must be preserved exactly");
+
+        // Verify spot token metadata
+        let orig_token = &state.spot.tokens[0];
+        let load_token = loaded.spot.tokens.iter()
+            .find(|t| t.index == orig_token.index)
+            .expect("Spot token should survive roundtrip");
+        assert_eq!(load_token.symbol, orig_token.symbol);
+        assert_eq!(load_token.name, orig_token.name);
+        assert_eq!(load_token.wei_decimals, orig_token.wei_decimals);
     }
 }

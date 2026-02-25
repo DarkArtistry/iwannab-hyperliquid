@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use hypercore_engine::{EngineState, SpotEngine};
-use hypercore_primitives::{AccountAddress, Decimal, MarketId, SpotMarketId, TokenIndex};
+use hypercore_primitives::{AccountAddress, MarketId, SpotMarketId, TokenIndex};
 use revm::primitives::{Address, Bytes, PrecompileError, PrecompileErrors, PrecompileOutput, PrecompileResult};
 use tokio::sync::RwLock;
 

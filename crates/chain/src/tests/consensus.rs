@@ -73,7 +73,8 @@ async fn test_abci_end_block_processes_epoch_actions() {
     // In single-node mode, validator updates are typically empty
     // The method should complete without error
     // (In multi-node mode with dynamic validator sets, this would return updates)
-    assert!(validator_updates.len() <= 100, "Validator updates should be reasonable");
+    // In single-node mode with no dynamic validator set, updates should be empty
+    assert!(validator_updates.is_empty(), "Single-node end_block should produce no validator updates");
 }
 
 #[tokio::test]

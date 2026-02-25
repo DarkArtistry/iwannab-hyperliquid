@@ -33,6 +33,7 @@ pub struct Mempool {
 struct MempoolEntry {
     tx: Transaction,
     sender: AccountAddress,
+    #[allow(dead_code)]
     received_at: Instant,
 }
 
@@ -346,12 +347,15 @@ pub struct MempoolStats {
 /// Thread-safe mempool wrapper
 pub struct SharedMempool {
     inner: Arc<RwLock<Mempool>>,
+    /// Lock-free incoming queue for gateway threads (Phase B3)
+    incoming: Arc<crossbeam_queue::SegQueue<Transaction>>,
 }
 
 impl SharedMempool {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(Mempool::new())),
+            incoming: Arc::new(crossbeam_queue::SegQueue::new()),
         }
     }
 
@@ -369,6 +373,19 @@ impl SharedMempool {
 
     pub fn stats(&self) -> MempoolStats {
         self.inner.read().unwrap().stats()
+    }
+
+    /// Push to lock-free queue (gateway hot path - never blocks) (Phase B3)
+    pub fn push(&self, tx: Transaction) {
+        self.incoming.push(tx);
+    }
+
+    /// Drain incoming queue into indexed mempool (called by block producer only) (Phase B3)
+    pub fn drain_into_indexed(&self) {
+        let mut mempool = self.inner.write().unwrap();
+        while let Some(tx) = self.incoming.pop() {
+            let _ = mempool.add(tx); // Ignore errors for items that don't pass validation
+        }
     }
 
     /// Add transaction with explicit sender (for testing)
@@ -392,6 +409,7 @@ impl Clone for SharedMempool {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
+            incoming: Arc::clone(&self.incoming),
         }
     }
 }

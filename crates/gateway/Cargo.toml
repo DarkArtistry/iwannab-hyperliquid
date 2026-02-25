@@ -30,6 +30,7 @@ futures = { workspace = true }
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
+bincode = { workspace = true }
 
 # Crypto and hex
 alloy-primitives = { workspace = true }
@@ -46,9 +47,24 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+# Parallel signature verification (Phase B2)
+rayon = "1.8"
+
+# SIMD JSON parsing (Phase C1, optional)
+simd-json = { version = "0.13", optional = true }
+
 # CLI
 clap = { workspace = true }
 anyhow = { workspace = true }
 
+[features]
+default = []
+simd-json = ["dep:simd-json"]
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+criterion = { workspace = true }
+
+[[bench]]
+name = "signature"
+harness = false

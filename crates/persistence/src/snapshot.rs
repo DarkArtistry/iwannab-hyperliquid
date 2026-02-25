@@ -84,8 +84,8 @@ impl SnapshotMetadata {
 
 /// Snapshot manager for creating and serving snapshots
 pub struct SnapshotManager {
-    /// Database backend
-    db: RocksDbBackend,
+    /// Database backend (Arc-wrapped for sharing with ABCI app)
+    db: std::sync::Arc<RocksDbBackend>,
     /// Directory for storing snapshots
     snapshot_dir: PathBuf,
     /// Interval between snapshots (in blocks)
@@ -100,6 +100,15 @@ impl SnapshotManager {
     /// Create a new snapshot manager
     pub fn new<P: AsRef<Path>>(
         db: RocksDbBackend,
+        snapshot_dir: P,
+        snapshot_interval: u64,
+    ) -> Result<Self> {
+        Self::with_arc_db(std::sync::Arc::new(db), snapshot_dir, snapshot_interval)
+    }
+
+    /// Create a new snapshot manager with a shared database backend
+    pub fn with_arc_db<P: AsRef<Path>>(
+        db: std::sync::Arc<RocksDbBackend>,
         snapshot_dir: P,
         snapshot_interval: u64,
     ) -> Result<Self> {
@@ -289,6 +298,7 @@ impl SnapshotManager {
 /// Snapshot restore helper for receiving nodes
 pub struct SnapshotRestore {
     /// Directory for temporary snapshot storage
+    #[allow(dead_code)]
     restore_dir: PathBuf,
     /// Current snapshot being restored
     current_snapshot: Option<SnapshotMetadata>,

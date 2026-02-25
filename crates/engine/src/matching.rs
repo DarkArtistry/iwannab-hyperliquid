@@ -1,11 +1,13 @@
 //! Deterministic order matching engine
 
 use crate::orderbook::OrderBook;
+use crate::pool::VecPool;
 use hypercore_primitives::{
-    AccountAddress, CancelReason, Decimal, Error, Fill, MarketId, Order, OrderSide, OrderStatus,
-    Position, RawAmount, RawPrice, Result, TimeInForce, Timestamp,
+    AccountAddress, CancelReason, Error, Fill, MarketId, Order, OrderSide, OrderStatus,
+    Position, RawAmount, RawPrice, Result, Timestamp,
 };
 use std::collections::HashMap;
+use std::time::Instant;
 
 /// Matching engine handling order execution
 pub struct MatchingEngine {
@@ -13,6 +15,8 @@ pub struct MatchingEngine {
     orderbooks: HashMap<MarketId, OrderBook>,
     /// Next order ID counter
     next_order_id: u64,
+    /// Pool of reusable Vec<Fill> to reduce allocation pressure on the hot path
+    pub fills_pool: VecPool<Fill>,
 }
 
 impl MatchingEngine {
@@ -21,6 +25,7 @@ impl MatchingEngine {
         Self {
             orderbooks: HashMap::new(),
             next_order_id: 1,
+            fills_pool: VecPool::new(32),
         }
     }
 
@@ -51,7 +56,8 @@ impl MatchingEngine {
     where
         F: Fn(AccountAddress) -> Option<Position>,
     {
-        let mut fills = Vec::new();
+        let start = Instant::now();
+        let mut fills = self.fills_pool.get();
         let timestamp = order.timestamp;
 
         // Match against opposite side of book
@@ -66,6 +72,9 @@ impl MatchingEngine {
 
         // Handle unfilled portion based on order type
         Self::handle_unfilled(&mut order, book, &fills)?;
+
+        crate::metrics::MATCH_LATENCY_US.observe(start.elapsed().as_micros() as f64);
+        crate::metrics::FILLS_TOTAL.inc_by(fills.len() as u64);
 
         Ok((order, fills))
     }
@@ -82,12 +91,13 @@ impl MatchingEngine {
     where
         F: Fn(AccountAddress) -> Option<Position>,
     {
+        let start = Instant::now();
         let book = self
             .orderbooks
             .get_mut(&market_id)
             .ok_or(Error::MarketNotFound(market_id))?;
 
-        let mut fills = Vec::new();
+        let mut fills = self.fills_pool.get();
         let timestamp = order.timestamp;
         let mut order = order;
 
@@ -104,10 +114,14 @@ impl MatchingEngine {
         // Handle unfilled portion based on order type
         Self::handle_unfilled(&mut order, book, &fills)?;
 
+        crate::metrics::MATCH_LATENCY_US.observe(start.elapsed().as_micros() as f64);
+        crate::metrics::FILLS_TOTAL.inc_by(fills.len() as u64);
+
         Ok((order, fills))
     }
 
     /// Match a buy order against asks (static method)
+    #[inline(always)]
     fn match_against_asks<F>(
         order: &mut Order,
         book: &mut OrderBook,
@@ -178,6 +192,7 @@ impl MatchingEngine {
     }
 
     /// Match a sell order against bids (static method)
+    #[inline(always)]
     fn match_against_bids<F>(
         order: &mut Order,
         book: &mut OrderBook,
@@ -247,6 +262,7 @@ impl MatchingEngine {
     }
 
     /// Handle unfilled portion of order (static method)
+    #[inline(always)]
     fn handle_unfilled(
         order: &mut Order,
         book: &mut OrderBook,
@@ -294,6 +310,14 @@ impl MatchingEngine {
         self.next_order_id += 1;
         id
     }
+
+    /// Return a fills Vec to the pool for reuse
+    ///
+    /// Call this after fills have been fully processed to recycle the
+    /// allocation back into the pool, avoiding repeated malloc/free cycles.
+    pub fn return_fills(&self, fills: Vec<Fill>) {
+        self.fills_pool.put(fills);
+    }
 }
 
 impl Default for MatchingEngine {
@@ -314,7 +338,7 @@ pub struct MatchResult {
 mod tests {
     use super::*;
     use alloy_primitives::Address;
-    use hypercore_primitives::{OrderRequest, OrderType};
+    use hypercore_primitives::{Decimal, OrderRequest, OrderType};
 
     fn make_order(
         id: u64,
@@ -335,6 +359,8 @@ mod tests {
                 order_type: OrderType::default(),
                 reduce_only: false,
                 client_order_id: None,
+                trigger_price: None,
+                trigger_direction: None,
             },
             timestamp,
         )
@@ -493,5 +519,38 @@ mod tests {
         assert_eq!(fills[0].maker_order_id, 1);
         assert_eq!(fills[1].maker_order_id, 2);
         assert_eq!(fills[2].maker_order_id, 3);
+    }
+
+    #[test]
+    fn test_fills_pool_reuse() {
+        let mut engine = MatchingEngine::new();
+        engine.add_orderbook(0);
+
+        // First trade - allocates fills vec from pool
+        {
+            let book = engine.get_orderbook_mut(0).unwrap();
+            let ask = make_order(1, Address::repeat_byte(1), OrderSide::Sell, "100", "1.0", 1000);
+            book.insert(ask);
+        }
+        let buy = make_order(2, Address::repeat_byte(2), OrderSide::Buy, "100", "1.0", 1001);
+        let (_, fills) = engine.process_order_by_market(buy, 0, |_| None).unwrap();
+        assert_eq!(fills.len(), 1);
+
+        // Return fills to pool
+        let cap = fills.capacity();
+        engine.return_fills(fills);
+        assert_eq!(engine.fills_pool.cached_count(), 1);
+
+        // Second trade - should reuse vec from pool
+        {
+            let book = engine.get_orderbook_mut(0).unwrap();
+            let ask = make_order(3, Address::repeat_byte(1), OrderSide::Sell, "100", "1.0", 1002);
+            book.insert(ask);
+        }
+        let buy = make_order(4, Address::repeat_byte(2), OrderSide::Buy, "100", "1.0", 1003);
+        let (_, fills2) = engine.process_order_by_market(buy, 0, |_| None).unwrap();
+        assert_eq!(fills2.len(), 1);
+        // The reused vec should have at least the same capacity
+        assert!(fills2.capacity() >= cap);
     }
 }

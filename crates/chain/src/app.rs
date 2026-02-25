@@ -4,18 +4,16 @@
 //! Perpetual order execution now goes through the full Engine orchestrator with
 //! matching, risk checks, and position management.
 
-use hypercore_engine::{Engine, EngineState};
 use hypercore_primitives::{
-    AccountAddress, BlockEvent, BlockHeight, CancelReason, Decimal, Fill, FillEvent,
-    FundingAppliedEvent, LeverageUpdatedEvent, LiquidationEvent, MarketId, OrderCanceledEvent,
-    OrderId, OrderPlacedEvent, OrderRequest, OrderSide, OrderType, PositionUpdatedEvent,
-    SharedUnifiedState, Timestamp, UsdTransferEvent, new_shared_unified_state,
+    AccountAddress, BlockEvent, BlockHeight, Decimal, FillEvent,
+    FundingAppliedEvent, LiquidationEvent, MarketId,
+    OrderId, OrderPlacedEvent, OrderSide,
+    SharedUnifiedState, Timestamp,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::state::{AppState, BlockMeta, SharedEngine, SharedEngineState, SharedSpotEngine};
+use crate::state::{AppState, BlockMeta, SharedEngineState, SharedSpotEngine};
 use crate::tx::{OrderWire, Transaction, TransactionType};
 
 /// Acquire a write lock on a tokio RwLock with retry.
@@ -322,6 +320,14 @@ impl HyperCoreApp {
             TransactionType::ViewTransfer { token, amount, to_evm } => {
                 self.execute_view_transfer_sync(sender, *token, amount, *to_evm)?
             }
+
+            TransactionType::SetMarginMode { mode } => {
+                self.execute_set_margin_mode_sync(sender, *mode)?
+            }
+
+            TransactionType::CancelTrigger { asset, order_id } => {
+                self.execute_cancel_trigger_sync(sender, *asset, *order_id)?
+            }
         };
 
         // Update nonces (supports both sequential and timestamp-based)
@@ -342,7 +348,7 @@ impl HyperCoreApp {
         orders: &[OrderWire],
         timestamp: Timestamp,
     ) -> Result<Vec<Event>, AppError> {
-        use hypercore_primitives::{Order, OrderId};
+        use hypercore_primitives::OrderId;
 
         let mut events = Vec::new();
         // Collect CLOIDs to register after releasing engine locks
@@ -941,6 +947,46 @@ impl HyperCoreApp {
                 .add_attribute("asset", &asset.to_string())
                 .add_attribute("leverage", &leverage.to_string())])
         }
+    }
+
+    /// Execute set margin mode (sync version)
+    fn execute_set_margin_mode_sync(
+        &mut self,
+        sender: AccountAddress,
+        mode: hypercore_primitives::MarginMode,
+    ) -> Result<Vec<Event>, AppError> {
+        if let Some(perp_engine) = &self.state.perp_engine {
+            let mut engine = acquire_write_with_retry(perp_engine, "Perp engine (set_margin_mode)")?;
+            engine
+                .set_margin_mode(sender, mode)
+                .map_err(|e| AppError::Internal(format!("Set margin mode failed: {}", e)))?;
+        }
+        Ok(vec![Event::new("set_margin_mode")
+            .add_attribute("sender", &format!("{:?}", sender))
+            .add_attribute("mode", &format!("{:?}", mode))])
+    }
+
+    /// Execute cancel trigger order (sync version)
+    fn execute_cancel_trigger_sync(
+        &mut self,
+        sender: AccountAddress,
+        _asset: hypercore_primitives::MarketId,
+        order_id: hypercore_primitives::OrderId,
+    ) -> Result<Vec<Event>, AppError> {
+        if let Some(perp_engine) = &self.state.perp_engine {
+            let mut engine =
+                acquire_write_with_retry(perp_engine, "Perp engine (cancel_trigger)")?;
+            let removed = engine.state.remove_trigger_order(order_id);
+            if removed.is_none() {
+                return Err(AppError::Internal(format!(
+                    "Trigger order {} not found",
+                    order_id
+                )));
+            }
+        }
+        Ok(vec![Event::new("cancel_trigger")
+            .add_attribute("sender", &format!("{:?}", sender))
+            .add_attribute("order_id", &format!("{}", order_id))])
     }
 
     /// Execute USD transfer (sync version)
@@ -1579,6 +1625,9 @@ pub enum AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use hypercore_engine::EngineState;
+    use hypercore_primitives::new_shared_unified_state;
 
     #[test]
     fn test_app_creation() {

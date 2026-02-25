@@ -200,6 +200,8 @@ print_summary() {
         echo -e "  ${RED}╚════════════════════════════════════════╝${NC}"
     fi
     echo ""
+    # Machine-readable marker for parent scripts (e.g., make test-all)
+    echo "__TESTS_TOTAL=$total"
 }
 
 # ============================================================================

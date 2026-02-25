@@ -157,7 +157,7 @@ pub struct WriteBatch {
     operations: Vec<BatchOperation>,
 }
 
-enum BatchOperation {
+pub(crate) enum BatchOperation {
     Put {
         cf: ColumnFamily,
         key: Vec<u8>,
@@ -196,7 +196,8 @@ impl WriteBatch {
     }
 
     /// Consume the batch and return the operations
-    pub fn into_operations(self) -> Vec<BatchOperation> {
+    #[allow(dead_code)]
+    pub(crate) fn into_operations(self) -> Vec<BatchOperation> {
         self.operations
     }
 }

@@ -17,8 +17,8 @@ pub use decimal::Decimal;
 pub use error::{Error, Result};
 pub use market::{Market, MarketConfig, MarketId, MarketMeta, MarketState, MarketStatus};
 pub use order::{
-    CancelReason, ClientOrderId, Order, OrderId, OrderKey, OrderRequest, OrderSide, OrderStatus,
-    OrderType, TimeInForce,
+    CancelReason, ClientOrderId, MarginMode, Order, OrderId, OrderKey, OrderRequest, OrderSide,
+    OrderStatus, OrderType, TimeInForce, TriggerDirection,
 };
 pub use position::{Position, PositionSummary};
 pub use spot::{

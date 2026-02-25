@@ -9,6 +9,7 @@
 //! - Event broadcasting for real-time WebSocket updates
 
 pub mod api;
+pub mod binary_protocol;
 pub mod eip712;
 pub mod event_broadcaster;
 pub mod handlers;
@@ -24,4 +25,5 @@ pub use rate_limit::{RateLimiter, RateLimitConfig};
 pub use server::{GatewayConfig, GatewayServer};
 pub use tx_router::{TxRouter, CometBftRpcClient, TxRouterError};
 pub use validation::{ValidationConfig, ValidationError, Validator};
+pub use binary_protocol::{BinaryMsgType, BinaryProtocolError};
 pub use websocket::{WsManager, WsMessage, WsSubscription};

@@ -201,7 +201,7 @@ impl EvmState {
         use sha3::{Digest, Keccak256};
 
         let digest = Keccak256::digest(&code);
-        let code_hash: B256 = B256::from_slice(digest.as_slice());
+        let code_hash: B256 = B256::from_slice(&digest[..]);
         self.code.insert(code_hash, code);
         self.get_or_create_account(address).code_hash = Some(code_hash);
     }

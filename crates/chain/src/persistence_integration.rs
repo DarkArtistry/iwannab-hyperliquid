@@ -68,7 +68,8 @@ pub fn extract_state(
     // Store in perp.* fields as the canonical source. Also mirror scalars to core.*
     // for backward compatibility.
     if let Some(perp) = perp_engine {
-        let perp_eng = perp.blocking_read();
+        let perp_eng = perp.try_read()
+            .expect("PerpEngine lock should be uncontested during state extraction");
 
         // Extract positions from perp_engine
         for (account, positions) in perp_eng.state.get_all_positions_global() {
@@ -135,7 +136,8 @@ pub fn extract_state(
         state.core.insurance_fund = insurance_fund;
     } else {
         // Fallback: extract from shared engine (for tests without perp_engine)
-        let eng = engine.blocking_read();
+        let eng = engine.try_read()
+            .expect("Engine lock should be uncontested during state extraction");
 
         for (account, positions) in eng.get_all_positions_global() {
             for (market_id, position) in positions {
@@ -194,7 +196,8 @@ pub fn extract_state(
 
     // Extract spot engine state
     if let Some(spot) = spot_engine {
-        let spot_eng = spot.blocking_read();
+        let spot_eng = spot.try_read()
+            .expect("SpotEngine lock should be uncontested during state extraction");
 
         // Extract spot tokens
         for token in spot_eng.state.get_all_tokens() {

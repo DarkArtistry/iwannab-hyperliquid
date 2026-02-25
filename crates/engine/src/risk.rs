@@ -143,6 +143,25 @@ impl RiskEngine {
         equity <= maintenance_margin.to_decimals(equity.decimals())
     }
 
+    /// Check if an account is liquidatable in cross-margin mode
+    ///
+    /// In cross-margin mode, all positions share the same margin pool.
+    /// The account is liquidatable when total equity falls below total maintenance margin.
+    pub fn is_account_liquidatable(
+        &self,
+        account: &AccountState,
+        all_positions: &[(Position, &Market)],
+    ) -> bool {
+        if all_positions.is_empty() {
+            return false;
+        }
+
+        let equity = self.calculate_equity(account, all_positions);
+        let maintenance = self.calculate_maintenance_margin(all_positions);
+
+        equity <= maintenance.to_decimals(equity.decimals())
+    }
+
     /// Check if an order can be placed with available margin
     pub fn check_order_margin(
         &self,
@@ -218,6 +237,52 @@ impl RiskEngine {
         }
 
         Some(equity / maintenance.to_decimals(equity.decimals()))
+    }
+
+    /// Batch compute unrealized PnL for multiple positions using SIMD-friendly batch_ops.
+    ///
+    /// Returns the sum of all unrealized PnL values across the given positions,
+    /// using vectorized batch computation for better cache locality.
+    pub fn batch_unrealized_pnl_total(
+        &self,
+        positions: &[(Position, &Market)],
+    ) -> Decimal {
+        if positions.is_empty() {
+            return Decimal::from_raw(0, Decimal::USDC_DECIMALS);
+        }
+
+        let price_scale: i128 = 10i128.pow(Decimal::PRICE_DECIMALS as u32);
+        let n = positions.len();
+
+        let mut entry_prices = Vec::with_capacity(n);
+        let mut mark_prices = Vec::with_capacity(n);
+        let mut sizes = Vec::with_capacity(n);
+
+        for (pos, market) in positions {
+            let entry = pos.entry_price()
+                .unwrap_or(market.state.mark_price)
+                .to_decimals(Decimal::PRICE_DECIMALS)
+                .raw();
+            let mark = market.state.mark_price.to_decimals(Decimal::PRICE_DECIMALS).raw();
+            let size = pos.size.to_decimals(Decimal::PRICE_DECIMALS).raw();
+
+            entry_prices.push(entry);
+            mark_prices.push(mark);
+            sizes.push(size);
+        }
+
+        let mut pnl_out = Vec::with_capacity(n);
+        crate::batch_ops::batch_unrealized_pnl(
+            &entry_prices,
+            &mark_prices,
+            &sizes,
+            price_scale,
+            &mut pnl_out,
+        );
+
+        let total: i128 = pnl_out.iter().sum();
+        Decimal::from_raw(total, Decimal::PRICE_DECIMALS)
+            .to_decimals(Decimal::USDC_DECIMALS)
     }
 }
 
@@ -659,6 +724,8 @@ mod tests {
             order_type: OrderType::Limit { tif: TimeInForce::Gtc },
             reduce_only: false,
             client_order_id: None,
+            trigger_price: None,
+            trigger_direction: None,
         };
 
         // 10x leverage: notional 6500, margin needed = 650
@@ -692,6 +759,8 @@ mod tests {
             order_type: OrderType::Limit { tif: TimeInForce::Gtc },
             reduce_only: false,
             client_order_id: None,
+            trigger_price: None,
+            trigger_direction: None,
         };
 
         // 10x leverage: notional 65000, margin needed = 6500

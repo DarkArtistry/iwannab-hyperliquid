@@ -21,6 +21,7 @@ This document provides a comprehensive analysis of the current implementation st
 **Phase 7C (Re-org Snapshot/Restore): 100% Complete** ✅
 **Phase 7D (EVM State Commitment): 100% Complete** ✅
 **Phase 7E (P2P Attestation Gossip): 100% Complete** ✅
+**Phase 8 (Funding, Liquidation, Testing): 100% Complete** ✅
 **Overall Completion: 100%** (MVP Ready | Multi-node testnet ready | Pending security audit)
 
 ### Status Update (February 2026)
@@ -30,8 +31,10 @@ Based on comprehensive deep-dive analysis of the codebase:
 | Component | Status | Notes |
 |-----------|--------|-------|
 | Core Trading Engine | ✅ 100% | Matching, risk, funding, liquidation |
+| **Funding Settlement** | ✅ 100% | **Phase 8A: Rates now applied to account balances** |
 | Unified State Model | ✅ 100% | Core/EVM views, invariants enforced |
 | EVM Integration | ✅ 100% | revm v19, precompiles, gas fees |
+| Gateway (HTTP + WebSocket) | ✅ 100% | REST API, EIP-712, WebSocket event broadcasting |
 | Consensus (Single-Node) | ✅ 100% | BlockProducer, instant finality |
 | Consensus (Multi-Node) | ✅ 100% | Fixed: AppHash complete, determinism verified |
 | State Commitment | ✅ 100% | Full Merkle tree for all state (balances, positions, orders, etc.) |
@@ -42,7 +45,7 @@ Based on comprehensive deep-dive analysis of the codebase:
 | Re-org Handling | ✅ 100% | Coordinated snapshot/restore for all 3 state layers |
 | EVM State Commitment | ✅ 100% | Optional EVM state in AppHash for consensus-critical EVM |
 | Multi-Validator | ✅ 100% | ValidatorRegistry, 3-node cluster, E2E tests |
-| Test Coverage | ✅ 100% | 823 tests (556 Rust, 49 Solidity, 151 E2E, 15+52 multi-node) |
+| Test Coverage | ✅ 100% | ~850+ tests (562 Rust, 49 Solidity, ~176 E2E, 15+52 multi-node) |
 
 ### Production Readiness
 
@@ -68,7 +71,7 @@ The AppHash now commits to ALL consensus-critical state:
 | CLOID mappings | `compute_cloid_root()` | ✅ **NEW** |
 | Scalars (insurance, order ID) | `compute_engine_scalars_hash()` | ✅ **NEW** |
 | Open Orders | `compute_orders_root()` | ✅ **IMPLEMENTED** |
-| EVM state | TODO | ⚠️ Not yet consensus-critical |
+| EVM state | ✅ | Included in AppHash via `set_evm_executor()` |
 
 ### ~~🔴 CRITICAL ISSUE: SystemTime::now()~~ ✅ FIXED (Jan 19, 2026)
 
@@ -95,7 +98,7 @@ With the above fixes, CometBFT + AppHash will detect any state divergence:
 - ✅ Determinism bugs fixed
 - ✅ Divergence causes AppHash mismatch → visible halt (correct behavior)
 
-**Remaining Work:** Add EVM state roots when EVM execution becomes consensus-critical.
+**Remaining Work:** ~~Add EVM state roots when EVM execution becomes consensus-critical.~~ ✅ Done — EVM state root included in AppHash via `set_evm_executor()`.
 
 ### ✅ Determinism Test Harness (Jan 19, 2026)
 
@@ -358,7 +361,7 @@ This project is inspired by and references several open-source projects:
 - ✅ **Multi-node consensus support** (via CometBFT mode)
 
 **Remaining:**
-- ⚠️ ABCI state sync snapshots (for fast new node bootstrap)
+- ✅ ABCI state sync snapshots (Phase 9A — wired into CometBFT ABCI methods)
 
 ### 5. Node Crate (`crates/node/`) - ✅ 100% Complete
 
@@ -837,7 +840,7 @@ fn compute_app_hash(&self) -> [u8; 32] {
 - `crates/chain/src/persistence_integration.rs` - extract_state/restore_state
 
 **Notes:**
-- ABCI state sync snapshots (for fast new node bootstrap) not yet implemented
+- ✅ ABCI state sync snapshots wired in Phase 9A (ListSnapshots, OfferSnapshot, LoadSnapshotChunk, ApplySnapshotChunk)
 
 ### Phase 5: Indexer & Historical Data ✅ COMPLETE
 
@@ -910,11 +913,13 @@ All items completed:
 - ✅ `crates/chain/src/app.rs` - Full HyperCoreApp with transaction execution
 - ✅ `crates/chain/src/cometbft/` - Full CometBFT ABCI integration
 
-**Remaining Stubs:**
+**~~Remaining Stubs:~~ ✅ All Implemented (Phase 9A)**
 ```rust
-// crates/chain/src/cometbft/app.rs - State sync methods
-// list_snapshots, offer_snapshot, load_snapshot_chunk, apply_snapshot_chunk
-// Return empty/reject (fast node bootstrap - not required for consensus)
+// crates/chain/src/cometbft/app.rs - State sync methods: FULLY WIRED
+// list_snapshots → Serves snapshots from SnapshotManager
+// offer_snapshot → Accepts compatible format via SnapshotRestore
+// load_snapshot_chunk → Serves chunks from disk
+// apply_snapshot_chunk → Receives chunks, finalizes restore, loads into running app
 ```
 
 ---

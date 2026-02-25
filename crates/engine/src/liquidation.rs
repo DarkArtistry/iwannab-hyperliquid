@@ -24,10 +24,10 @@ impl LiquidationEngine {
     /// Returns (liquidation_size, liquidation_price) if liquidation is needed
     pub fn process_liquidation(
         &self,
-        account: AccountAddress,
+        _account: AccountAddress,
         position: &Position,
         market: &Market,
-        timestamp: Timestamp,
+        _timestamp: Timestamp,
     ) -> Option<(Decimal, Decimal)> {
         if position.is_empty() {
             return None;

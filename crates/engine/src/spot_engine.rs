@@ -1112,6 +1112,8 @@ mod tests {
             order_type: OrderType::default(),
             reduce_only: false,
             client_order_id: None,
+            trigger_price: None,
+            trigger_direction: None,
         };
 
         let (bob_order, _) = engine.place_order(bob, market_id, sell_request, 2000).unwrap();
@@ -1126,6 +1128,8 @@ mod tests {
             order_type: OrderType::default(),
             reduce_only: false,
             client_order_id: None,
+            trigger_price: None,
+            trigger_direction: None,
         };
 
         let (alice_order, fills) = engine.place_order(alice, market_id, buy_request, 3000).unwrap();
@@ -1384,6 +1388,8 @@ mod tests {
             order_type: OrderType::default(),
             reduce_only: false,
             client_order_id: None,
+            trigger_price: None,
+            trigger_direction: None,
         };
 
         let result = engine.place_order(alice, market_id, buy_request, 2000);

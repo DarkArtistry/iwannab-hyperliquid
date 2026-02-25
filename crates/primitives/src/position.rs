@@ -1,6 +1,8 @@
 //! Position types and calculations
 
-use crate::{AccountAddress, Decimal, SignedAmount, Timestamp};
+#![allow(unexpected_cfgs)]
+
+use crate::Decimal;
 use serde::{Deserialize, Serialize};
 
 /// Position in a perpetual market
@@ -236,6 +238,7 @@ impl Position {
     /// * `entry_price` - Entry price as a string (e.g., "65000")
     /// * `realized_pnl` - Realized PnL as a string (e.g., "100")
     /// * `last_funding_index` - Last funding index as an integer
+    #[allow(unexpected_cfgs)]
     #[cfg(any(test, feature = "testing"))]
     pub fn new_for_test(
         is_long: bool,

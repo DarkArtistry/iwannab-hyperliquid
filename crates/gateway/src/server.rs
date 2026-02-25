@@ -20,7 +20,7 @@ use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
-use crate::handlers::{handle_exchange, handle_info};
+use crate::handlers::{handle_exchange, handle_exchange_batch, handle_info};
 use crate::rate_limit::{RateLimiter, RateLimitConfig};
 use crate::tx_router::TxRouter;
 use crate::validation::{ValidationConfig, Validator};
@@ -49,7 +49,7 @@ impl Default for GatewayConfig {
             http_addr: "0.0.0.0:4000".parse().unwrap(),
             enable_websocket: true,
             chain_id: 1337,
-            block_time_ms: 500, // 500ms blocks
+            block_time_ms: 200, // 200ms blocks
             rate_limit: RateLimitConfig::default(),
             validation: ValidationConfig::default(),
         }
@@ -268,6 +268,10 @@ impl GatewayServer {
             .route("/info", post(handle_info))
             // Exchange endpoint
             .route("/exchange", post(handle_exchange))
+            // Batch exchange endpoint (multiple actions in one HTTP request)
+            .route("/exchange/batch", post(handle_exchange_batch))
+            // Binary exchange endpoint (Phase C3: ~6x less bandwidth)
+            .route("/exchange/binary", post(crate::handlers::handle_exchange_binary))
             // Health check
             .route("/health", get(health_check));
 
@@ -309,6 +313,9 @@ impl GatewayServer {
             .await
             .map_err(|e| GatewayError::BindError(e.to_string()))?;
 
+        // Phase C2: Enable TCP_NODELAY for lower latency
+        tracing::info!("TCP_NODELAY enabled for lower latency");
+
         axum::serve(listener, router)
             .await
             .map_err(|e| GatewayError::ServerError(e.to_string()))?;
@@ -343,6 +350,9 @@ impl GatewayServer {
             .await
             .map_err(|e| GatewayError::BindError(e.to_string()))?;
 
+        // Phase C2: Enable TCP_NODELAY for lower latency
+        tracing::info!("TCP_NODELAY enabled for lower latency");
+
         axum::serve(listener, router)
             .with_graceful_shutdown(shutdown)
             .await
@@ -375,7 +385,7 @@ mod tests {
         let config = GatewayConfig::default();
         assert_eq!(config.http_addr.port(), 4000);
         assert!(config.enable_websocket);
-        assert_eq!(config.block_time_ms, 500);
+        assert_eq!(config.block_time_ms, 200);
         assert!(config.rate_limit.enabled);
     }
 

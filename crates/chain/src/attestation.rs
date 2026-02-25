@@ -237,6 +237,7 @@ impl AttestationKeyPair {
     }
 
     /// Get the signing key (for internal use)
+    #[allow(dead_code)]
     pub(crate) fn signing_key(&self) -> &SigningKey {
         &self.signing_key
     }

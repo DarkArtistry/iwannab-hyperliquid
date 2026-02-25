@@ -53,6 +53,7 @@ impl OrderBook {
     }
 
     /// Insert an order into the book
+    #[inline]
     pub fn insert(&mut self, order: Order) {
         let key = match order.side {
             OrderSide::Buy => OrderKey::bid(order.price, order.timestamp, order.id),
@@ -74,6 +75,7 @@ impl OrderBook {
     }
 
     /// Remove an order from the book
+    #[inline]
     pub fn remove(&mut self, order_id: OrderId) -> Option<Order> {
         let key = self.order_index.remove(&order_id)?;
 
@@ -113,21 +115,25 @@ impl OrderBook {
     }
 
     /// Get the best bid (highest buy price)
+    #[inline]
     pub fn best_bid(&self) -> Option<&Order> {
         self.bids.values().next()
     }
 
     /// Get the best ask (lowest sell price)
+    #[inline]
     pub fn best_ask(&self) -> Option<&Order> {
         self.asks.values().next()
     }
 
     /// Get the best bid price
+    #[inline]
     pub fn best_bid_price(&self) -> Option<Decimal> {
         self.best_bid
     }
 
     /// Get the best ask price
+    #[inline]
     pub fn best_ask_price(&self) -> Option<Decimal> {
         self.best_ask
     }
@@ -178,6 +184,67 @@ impl OrderBook {
         self.asks.values()
     }
 
+    /// Calculate impact price on the buy side (walking asks up to notional)
+    ///
+    /// Returns the volume-weighted average price to buy `notional` worth.
+    pub fn impact_price_buy(&self, notional: Decimal) -> Option<Decimal> {
+        if self.asks.is_empty() || notional.is_zero() {
+            return None;
+        }
+        let mut remaining = notional;
+        let mut total_size = Decimal::from_raw(0, Decimal::SIZE_DECIMALS);
+        let mut total_cost = Decimal::from_raw(0, Decimal::PRICE_DECIMALS + Decimal::SIZE_DECIMALS);
+
+        for order in self.asks.values() {
+            let order_notional = order.price * order.remaining_size;
+            if order_notional <= remaining {
+                total_size = total_size + order.remaining_size;
+                total_cost = total_cost + order_notional;
+                remaining = remaining - order_notional;
+            } else {
+                // Partial fill of this level
+                let partial_size = remaining / order.price;
+                total_size = total_size + partial_size;
+                total_cost = total_cost + remaining;
+                break;
+            }
+        }
+        if total_size.is_zero() {
+            return None;
+        }
+        Some(total_cost / total_size)
+    }
+
+    /// Calculate impact price on the sell side (walking bids down to notional)
+    ///
+    /// Returns the volume-weighted average price to sell `notional` worth.
+    pub fn impact_price_sell(&self, notional: Decimal) -> Option<Decimal> {
+        if self.bids.is_empty() || notional.is_zero() {
+            return None;
+        }
+        let mut remaining = notional;
+        let mut total_size = Decimal::from_raw(0, Decimal::SIZE_DECIMALS);
+        let mut total_cost = Decimal::from_raw(0, Decimal::PRICE_DECIMALS + Decimal::SIZE_DECIMALS);
+
+        for order in self.bids.values() {
+            let order_notional = order.price * order.remaining_size;
+            if order_notional <= remaining {
+                total_size = total_size + order.remaining_size;
+                total_cost = total_cost + order_notional;
+                remaining = remaining - order_notional;
+            } else {
+                let partial_size = remaining / order.price;
+                total_size = total_size + partial_size;
+                total_cost = total_cost + remaining;
+                break;
+            }
+        }
+        if total_size.is_zero() {
+            return None;
+        }
+        Some(total_cost / total_size)
+    }
+
     /// Get L2 book (aggregated by price level)
     pub fn get_l2(&self, depth: usize) -> (Vec<PriceLevel>, Vec<PriceLevel>) {
         let bids = self.aggregate_levels(&self.bids, depth, true);
@@ -222,7 +289,7 @@ impl OrderBook {
         &self,
         orders: &BTreeMap<OrderKey, Order>,
         depth: usize,
-        is_bid: bool,
+        _is_bid: bool,
     ) -> Vec<PriceLevel> {
         let mut levels: Vec<PriceLevel> = Vec::new();
         let mut current_price: Option<Decimal> = None;
@@ -320,6 +387,8 @@ mod tests {
                 order_type: OrderType::default(),
                 reduce_only: false,
                 client_order_id: None,
+                trigger_price: None,
+                trigger_direction: None,
             },
             timestamp,
         )

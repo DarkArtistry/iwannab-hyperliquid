@@ -39,6 +39,8 @@ import {
   runAdvancedTests,
   runRiskTests,
   runStateProofTests,
+  runLiquidationTests,
+  runEvmPrecompileTests,
 } from './tests/index.js';
 
 // ============================================================================
@@ -142,6 +144,8 @@ async function main(): Promise<void> {
     await runAdvancedTests(ctx);
     await runRiskTests(ctx);
     await runStateProofTests(ctx);
+    await runLiquidationTests(ctx);
+    await runEvmPrecompileTests(ctx);
   } catch (error) {
     log(`${colors.red}Fatal error during test execution:${colors.reset}`);
     log(`${colors.red}${error}${colors.reset}`);

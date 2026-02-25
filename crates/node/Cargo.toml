@@ -46,6 +46,16 @@ thiserror = { workspace = true }
 # Hex encoding
 hex = { workspace = true }
 
+# Performance (Phase E)
+mimalloc = { workspace = true }
+core_affinity = { workspace = true }
+
+# Metrics (Phase 5)
+prometheus = { workspace = true }
+
+# HTTP (for metrics server)
+axum = { workspace = true }
+
 # Random (for mock price feed)
 rand = "0.8"
 
