@@ -73,3 +73,7 @@ docker-compose.override.yml
 *.key
 secrets/
 credentials.json
+
+# CometBFT validator private keys
+**/priv_validator_key.json
+**/node_key.json
